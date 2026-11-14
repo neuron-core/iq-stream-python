@@ -59,7 +59,7 @@ class NativeConverter(BaseConverter):
             raise FrameTooLarge(self.fit.measure(data), self.fit.limit)
         return self._frames(self._encode(piece) for piece in pieces)
 
-    def _encode(self, chunk: StreamingChunk, result_text: str | None = None) -> str:
+    def _encode(self, chunk: StreamingChunk, result_text: str | None = None, *, arguments: bool = True) -> str:
         fields: dict[str, Any] = {
             "type": "chunk",
             "content": chunk.content,
@@ -79,12 +79,29 @@ class NativeConverter(BaseConverter):
         result = chunk.tool_call_result
         if result is not None:
             if result_text is None:
-                result_text = self.fit.truncate(
-                    self._result_content(result), lambda text: self._encode(chunk, text), self.max_tool_result_bytes
-                )
-            origin = result.origin.to_dict()
-            fields["tool_call_result"] = {"result": result_text, "origin": origin, "error": result.error}
+                result_text, arguments = self._fit_result(chunk)
+            origin = result.origin
+            fields["tool_call_result"] = {
+                "result": result_text,
+                "origin": {
+                    "tool_name": origin.tool_name,
+                    # Left out (null) when they alone would not fit: the tool call's own chunks carried them.
+                    "arguments": origin.arguments if arguments else None,
+                    "id": origin.id,
+                },
+                "error": result.error,
+            }
         return dumps(fields)
+
+    def _fit_result(self, chunk: StreamingChunk) -> tuple[str, bool]:
+        """The result's text, truncated to fit, and whether the call's arguments fit beside it."""
+        assert chunk.tool_call_result is not None
+        content = self._result_content(chunk.tool_call_result)
+        limit = self.max_tool_result_bytes
+        try:
+            return self.fit.truncate(content, lambda text: self._encode(chunk, text), limit), True
+        except FrameTooLarge:
+            return self.fit.truncate(content, lambda text: self._encode(chunk, text, arguments=False), limit), False
 
     def _split(
         self, chunk: StreamingChunk, with_text: Callable[[str], StreamingChunk], text: str
