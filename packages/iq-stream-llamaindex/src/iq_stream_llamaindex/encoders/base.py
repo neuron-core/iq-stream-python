@@ -115,7 +115,11 @@ def longest_string(value: Any, keep: frozenset[str] = frozenset()) -> int:
 def largest(fits_at: Callable[[int], bool], high: int) -> int:
     """The largest ``n`` in ``0..high`` for which ``fits_at(n)`` holds, or -1; ``fits_at`` must hold for every ``n``
     below one for which it holds."""
-    low, best = 0, -1
+    low, best, probe = 0, -1, 1
+    # Grow a bound first, so that cutting a long text into small frames builds frames near the size that fits.
+    while probe <= high and fits_at(probe):
+        best, low, probe = probe, probe + 1, probe * 2
+    high = min(high, probe - 1)
     while low <= high:
         middle = (low + high) // 2
         if fits_at(middle):

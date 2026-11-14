@@ -91,6 +91,7 @@ class PublishedStream:
             raise RuntimeError("A PublishedStream is entered once.")
         self._entered = True
         self._result = asyncio.ensure_future(self._handler.stop_event_result())
+        self._result.add_done_callback(_retrieve)
         self._events = self._handler.stream_events()
         try:
             self._send(self._encoded(lambda: self._encoder.start(self._handler.run_id), "the start"), "the start")
@@ -164,6 +165,9 @@ class PublishedStream:
     async def _finish(self) -> None:
         """The run's stream has ended: settle the result, persist, send the terminal frames, close."""
         handler = self._handler
+        if self._events is not None:
+            with contextlib.suppress(Exception):
+                await self._events.aclose()  # it holds the run's stream lock until closed
         if self._terminal is None and not handler.is_done():
             await handler.cancel_run()
         stop_event, error = await self._settle()
@@ -209,8 +213,8 @@ class PublishedStream:
         task = self._result
         await asyncio.wait((task,), timeout=SETTLE)
         if not task.done():
-            task.cancel()
-            await asyncio.wait((task,))
+            # Not cancelled: that would cancel the handler's own result task, which it awaits.
+            return None, RuntimeError("The run did not end after its stream did.")
         if task.cancelled():
             return None, WorkflowCancelledByUser("The run was stopped without a terminal event.")
         error = task.exception()
@@ -395,6 +399,12 @@ async def publish(
     if raise_run_errors and outcome.error is not None and outcome.status != "completed":
         raise outcome.error
     return outcome
+
+
+def _retrieve(task: asyncio.Task[StopEvent]) -> None:
+    """Marks the result's exception as seen, whoever reads it, so that asyncio does not log it as unretrieved."""
+    if not task.cancelled():
+        task.exception()
 
 
 async def _next_event(events: AsyncGenerator[Event, None]) -> Event | None:
