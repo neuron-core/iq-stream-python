@@ -8,6 +8,7 @@ header and its arguments in two halves, the way a provider sends them.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import operator
 import sys
@@ -141,17 +142,13 @@ def tool_call(name: str, args: dict[str, Any], call_id: str) -> dict[str, Any]:
     return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
 
 
-def scripted_model(**options: Any) -> FakeToolCallingModel:
-    """Turn 1: some text and a tool call. Turn 2: the final answer."""
-    return FakeToolCallingModel(
-        messages=iter(
-            [
-                AIMessage(content=FIRST, tool_calls=[tool_call("get_weather", {"city": "Turin"}, "call_1")]),  # type: ignore[list-item]
-                AIMessage(content=FINAL),
-            ]
-        ),
-        **options,
-    )
+def scripted_model(*, repeat: bool = False, **options: Any) -> FakeToolCallingModel:
+    """Turn 1: some text and a tool call. Turn 2: the final answer. With `repeat`, the same for every run."""
+    turns = [
+        AIMessage(content=FIRST, tool_calls=[tool_call("get_weather", {"city": "Turin"}, "call_1")]),  # type: ignore[list-item]
+        AIMessage(content=FINAL),
+    ]
+    return FakeToolCallingModel(messages=itertools.cycle(turns) if repeat else iter(turns), **options)
 
 
 @tool
