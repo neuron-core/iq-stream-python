@@ -10,13 +10,14 @@ from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 from ag_ui.core import BaseEvent, EventType, RunFinishedEvent, RunStartedEvent
+from agno.os.interfaces.agui import handlers as _handlers
 from agno.os.interfaces.agui.handlers import is_completion_event, process_completion, process_event
 from agno.os.interfaces.agui.state import StreamState
 from agno.run.agent import RunCompletedEvent, RunErrorEvent
 from agno.run.base import BaseRunOutputEvent
 from iq_stream import FrameTooLarge
 
-from ._common import MASKED_ERROR, ROOT_CANCELS, Fits, Frame, Report, event_name, longest_prefix
+from ._common import MASKED_ERROR, ROOT_CANCELS, ROOT_ERRORS, Fits, Frame, Report, event_name, longest_prefix
 
 try:  # ag-ui-protocol 1.0; agno's floor, 0.1.15, may not have it
     from ag_ui.core import RunFinishedCancelledOutcome as _Cancelled
@@ -177,7 +178,10 @@ class AguiEncoder:
         if status == "error":
             if terminal is None or event_name(terminal) not in _ERROR_TEXT:
                 terminal = self._error_event(error, root_error, thread_id, run_id)
-            events.extend(process_completion(terminal, state))
+            if hasattr(_handlers, "on_run_error"):
+                events.extend(process_completion(terminal, state))
+            else:  # agno 2.x converts a RunError to RAW and finishes the run: a failed run must not read as finished
+                events.extend(_run_error(terminal, state))
         else:
             finished = process_completion(terminal or RunCompletedEvent(), state)
             if status in ("cancelled", "interrupted"):
@@ -207,6 +211,35 @@ class AguiEncoder:
         return RunErrorEvent(run_id=run_id, session_id=thread_id, content=message, error_type=code)
 
 
+def _run_error(terminal: BaseRunOutputEvent, state: StreamState) -> list[BaseEvent]:
+    """What agno 3's converter emits for a ``RunError``: the open spans closed, then ``RUN_ERROR``."""
+    from ag_ui.core import (
+        ReasoningEndEvent,
+        ReasoningMessageEndEvent,
+        TextMessageEndEvent,
+        ToolCallEndEvent,
+    )
+    from ag_ui.core import (
+        RunErrorEvent as AguiRunError,
+    )
+
+    events: list[BaseEvent] = []
+    if state.reasoning_message_id is not None:
+        events.append(ReasoningMessageEndEvent(message_id=state.reasoning_message_id))
+        events.append(ReasoningEndEvent(message_id=state.reasoning_message_id))
+        state.end_reasoning()
+    for tool_call_id in sorted(state.active_tool_call_ids - state.ended_tool_call_ids):
+        events.append(ToolCallEndEvent(tool_call_id=tool_call_id))
+        state.end_tool_call(tool_call_id)
+    if state.text_message_open:
+        events.append(TextMessageEndEvent(message_id=state.text_message_id))
+        state.close_text_message()
+    code: object = getattr(terminal, "error_type", None)
+    message = str(getattr(terminal, "content", None) or MASKED_ERROR)
+    events.append(AguiRunError(message=message, code=code if isinstance(code, str) else None))
+    return events
+
+
 class AguiTrack:
     """The terminal decision for a stream of AG-UI events that Agno's ``run_entity()`` produced (the AgentOS
     interface's AG-UI route): ``RUN_ERROR`` fails the run, a ``RAW`` cancelled event of the root run cancels it. A
@@ -219,6 +252,7 @@ class AguiTrack:
         self.session_id: str | None = thread_id
         self._failed = False
         self._cancelled = False
+        self._raw_error: dict[str, Any] | None = None
         self._terminated = False
         self._started = False
         self._open: dict[str, list[str]] = {"message": [], "tool": [], "reasoning": []}
@@ -229,7 +263,15 @@ class AguiTrack:
         self._observe(item)
         if not encode:
             return []
-        if item.type == EventType.RUN_FINISHED and self._cancelled:
+        if item.type == EventType.RUN_FINISHED and self._raw_error is not None:
+            # agno 2.x converts the root run's RunError to RAW and then finishes the run.
+            from ag_ui.core import RunErrorEvent
+
+            self._failed = True
+            code: object = self._raw_error.get("error_type")
+            message = str(self._raw_error.get("content") or MASKED_ERROR)
+            item = RunErrorEvent(message=message, code=code if isinstance(code, str) else None)
+        elif item.type == EventType.RUN_FINISHED and self._cancelled:
             item = cancelled(item)
         return self._framer.frames([item])
 
@@ -270,8 +312,10 @@ class AguiTrack:
             raw: object = getattr(event, "event", None)
             if isinstance(raw, dict):
                 raw = cast("dict[str, Any]", raw)
-                if raw.get("event") in ROOT_CANCELS and raw.get("run_id") == self.run_id:
+                if raw.get("run_id") == self.run_id and raw.get("event") in ROOT_CANCELS:
                     self._cancelled = True
+                elif raw.get("run_id") == self.run_id and raw.get("event") in ROOT_ERRORS:
+                    self._raw_error = raw
         span = _SPANS.get(kind)
         if span is not None:
             group, opening, key = span

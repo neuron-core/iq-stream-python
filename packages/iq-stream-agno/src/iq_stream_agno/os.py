@@ -4,6 +4,7 @@ through IQ-Stream, from a task that publishes them. Needs the ``os`` extra (and 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
@@ -129,19 +130,16 @@ class IQStream(BaseInterface):
             reason = await _continuation_blocked(entity, run_id, request)
             if reason:
                 raise HTTPException(status_code=403, detail=reason)
-            requirements, tools = _requirements(body.tools)
-            extra: dict[str, Any] = {} if tools is None else {"updated_tools": tools}
             handle = continue_run(
                 self.client,
                 entity,
                 run_id=run_id,
                 session_id=body.session_id,
-                requirements=requirements,
+                requirements=_requirements(body.tools),
                 user_id=user_id,
                 ttl=self.ttl,
                 protocol=self.protocol,
                 publish_options=self.publish_options,
-                **extra,
             )
             self._keep(handle, user_id)
             return handle.to_dict()
@@ -163,8 +161,7 @@ class IQStream(BaseInterface):
     def _mount_agui(self, router: APIRouter) -> None:
         from ag_ui.core import RunAgentInput
 
-        @router.post("/agui")
-        async def agui(request: Request, run_input: RunAgentInput) -> dict[str, str | int]:  # pyright: ignore[reportUnusedFunction]
+        async def agui(request: Request, run_input: RunAgentInput) -> dict[str, str | int]:
             props: object = run_input.forwarded_props
             client_user_id = cast("dict[str, object]", props).get("user_id") if isinstance(props, dict) else None
             user_id = _resolve_user(request, client_user_id if isinstance(client_user_id, str) else None)
@@ -173,6 +170,10 @@ class IQStream(BaseInterface):
             handle = self._start_agui(run_input, user_id)
             self._keep(handle, user_id)
             return handle.to_dict()
+
+        # FastAPI reads annotations in the module's globals, where ag_ui is not imported: give it the class itself.
+        agui.__annotations__["run_input"] = RunAgentInput
+        router.post("/agui")(agui)
 
     async def _check_agui_resume(self, run_input: Any, request: Request) -> None:
         """A trailing tool message resumes a paused run, which Agno's own AG-UI route refuses while an admin approval
@@ -299,28 +300,31 @@ async def _continuation_blocked(entity: Any, run_id: str | None, request: Reques
         return None
     from agno.os.auth import run_continuation_blocked_reason
 
+    extra: dict[str, Any] = {}
+    if "request" in inspect.signature(run_continuation_blocked_reason).parameters:  # agno 3
+        extra["request"] = request
     reason: object = await run_continuation_blocked_reason(
         getattr(entity, "db", None),
         run_id,
         authorization_enabled=bool(getattr(request.state, "authorization_enabled", False)),
         user_scopes=list(getattr(request.state, "scopes", None) or []),
-        request=request,
+        **extra,
     )
     return reason if isinstance(reason, str) and reason else None
 
 
-def _requirements(tools: list[dict[str, Any]] | None) -> tuple[list[Any] | None, list[Any] | None]:
-    """The paused tools as AgentOS's own continue route turns them into requirements."""
+def _requirements(tools: list[dict[str, Any]] | None) -> list[Any] | None:
+    """The paused tools as AgentOS's own continue route turns them into requirements (``updated_tools``, which it
+    passes too, is deprecated since agno 2.9)."""
     if not tools:
-        return None, None
+        return None
     from agno.models.response import ToolExecution
     from agno.run.requirement import RunRequirement
 
     try:
-        executions = [ToolExecution.from_dict(tool) for tool in tools]
+        return [RunRequirement(tool_execution=ToolExecution.from_dict(tool)) for tool in tools]
     except Exception as error:
         raise HTTPException(status_code=400, detail="Invalid structure or content for tools") from error
-    return [RunRequirement(tool_execution=execution) for execution in executions], executions
 
 
 async def _cancel(entity: Any, run_id: str) -> None:
