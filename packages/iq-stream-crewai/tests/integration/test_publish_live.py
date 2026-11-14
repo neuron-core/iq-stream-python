@@ -186,11 +186,10 @@ def test_an_unreachable_server_never_breaks_the_run(iq_servers: TestServers) -> 
     assert run.errors == []
 
 
-def test_a_run_past_the_stream_s_duration_limit_finishes_unpublished() -> None:
-    with start_server(env={"MAX_STREAM_DURATION_MS": "1500"}) as server:
-        from iq_stream.testing._servers import DEFAULT_APP_KEY, DEFAULT_APP_SECRET
-
-        iq = IQClient(server.url, DEFAULT_APP_KEY, DEFAULT_APP_SECRET, min_open=0.0)
+def test_a_run_past_the_stream_s_duration_limit_finishes_unpublished(iq_servers: TestServers) -> None:
+    credentials = {"app_key": iq_servers.app_key, "app_secret": iq_servers.app_secret}
+    with start_server(env={"MAX_STREAM_DURATION_MS": "1500"}, **credentials) as server:
+        iq = IQClient(server.url, **credentials, min_open=0.0)
         ticket = iq.ticket()
         subscription = subscribe_in_background(server.url, ticket.stream_id, ticket.token)
         with publish(iq, ticket.stream_id) as run:
