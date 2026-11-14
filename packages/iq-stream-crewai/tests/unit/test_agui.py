@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import typing
+from datetime import datetime
 from typing import Any
 
 import ag_ui.core as ag
@@ -292,3 +293,57 @@ def test_a_model_that_reuses_tool_call_ids_gets_unique_ones() -> None:
     events = checked(publisher.data)
     starts = [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"]
     assert len(starts) == 2 and len(set(starts)) == 2
+
+
+def _tool_chunk(call_id: str, tool_call_id: str, chunk: str) -> Any:
+    from crewai.events.types.llm_events import LLMStreamChunkEvent
+
+    function = {"name": "lookup", "arguments": chunk}
+    return LLMStreamChunkEvent(
+        chunk=chunk, call_id=call_id, tool_call={"id": tool_call_id, "function": function, "index": 0}
+    )
+
+
+def test_a_failed_call_s_tool_call_never_gets_a_later_result() -> None:
+    from crewai.events.types.llm_events import LLMCallCompletedEvent, LLMCallFailedEvent, LLMCallType
+    from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent, ToolUsageStartedEvent
+
+    args = {"term": "x"}
+    publisher = RecordingPublisher()
+    with publish(publisher):
+        emit = crewai_event_bus.emit
+        emit(None, _tool_chunk("first", "tc-first", json.dumps(args)))
+        emit(None, LLMCallFailedEvent(error="boom", call_id="first"))
+        emit(None, _tool_chunk("retry", "tc-retry", json.dumps(args)))
+        emit(None, LLMCallCompletedEvent(response=[], call_type=LLMCallType.TOOL_CALL, call_id="retry"))
+        emit(None, ToolUsageStartedEvent(tool_name="lookup", tool_args=args))
+        now = datetime.now()
+        emit(
+            None,
+            ToolUsageFinishedEvent(tool_name="lookup", tool_args=args, output="ok", started_at=now, finished_at=now),
+        )
+    talk = conversation(checked(publisher.data))
+    assert talk.tool_results == {"tc-retry": "ok"}
+
+
+def test_a_result_without_a_started_tool_is_announced_with_it() -> None:
+    from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent
+
+    publisher = RecordingPublisher()
+    with publish(publisher):
+        now = datetime.now()
+        finished = ToolUsageFinishedEvent(
+            tool_name="lookup", tool_args={"term": "y"}, output="v", started_at=now, finished_at=now
+        )
+        crewai_event_bus.emit(None, finished)
+    events = checked(publisher.data)
+    assert types(events) == [
+        "RUN_STARTED",
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+        "RUN_FINISHED",
+    ]
+    talk = conversation(events)
+    assert list(talk.tool_args.values()) == ['{"term":"y"}'] and list(talk.tool_results.values()) == ["v"]

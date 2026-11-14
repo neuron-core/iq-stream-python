@@ -53,8 +53,13 @@ dev = [
 ]
 
 [tool.uv]
-# The versions the plan was researched against; the ranges above stay wide.
-constraint-dependencies = ["crewai==1.15.41", "ag-ui-protocol==1.0.0"]
+constraint-dependencies = [
+    # The versions the plan was researched against; the ranges above stay wide.
+    "crewai==1.15.41",
+    "ag-ui-protocol==1.0.0",
+    # chromadb's, through CrewAI: 1.24 declares Python 3.10 but publishes no wheel for it.
+    "onnxruntime<1.24 ; python_full_version < '3.11'",
+]
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }

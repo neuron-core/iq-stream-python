@@ -283,6 +283,9 @@ class AgUiEncoder:
     def _call_ended(self, snapshot: Snapshot) -> list[Frame]:
         call_id: str = snapshot.fields["call_id"]
         call = self._call(call_id)
+        if snapshot.type == "llm_call_failed":
+            # The tool calls of a failed call are not run: no later tool event may bind to them.
+            self._awaiting = [tool_call for tool_call in self._awaiting if tool_call not in call.tools.values()]
         out = self._close_call(call_id, call)
         # A model without streaming announces nothing on the way: its answer is published when the call returns.
         if snapshot.response and not call.streamed:

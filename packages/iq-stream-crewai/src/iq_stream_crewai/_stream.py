@@ -64,7 +64,11 @@ class CrewAIStream:
             resolved = target.stream_id
         if not isinstance(resolved, str) or not _STREAM_ID.fullmatch(resolved):  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError("Invalid stream id: 16 to 128 characters of A-Z a-z 0-9 _ -.")
-        if protocol not in ("ag-ui", "crewai") and isinstance(protocol, str):
+        methods = ("snapshot", "start", "frames", "finish")
+        if isinstance(protocol, str):
+            if protocol not in ("ag-ui", "crewai"):
+                raise ValueError("protocol is 'ag-ui', 'crewai' or an Encoder.")
+        elif not all(callable(getattr(protocol, method, None)) for method in methods):
             raise ValueError("protocol is 'ag-ui', 'crewai' or an Encoder.")
         if on_cancel not in ("end", "fail"):
             raise ValueError("on_cancel is 'end' or 'fail'.")
@@ -273,15 +277,15 @@ class CrewAIStream:
         if self._transport is not None:
             self._transport.detach()  # in the task's own context, before anything is awaited
 
-        def finish_and_close(outcome: Outcome | None) -> None:
-            self._close(self._finish(exc) if outcome is None else outcome, raise_errors=exc is None)
-
+        raise_errors = exc is None
         if self._transport is not None and self._transport.blocking:
-            await asyncio.shield(asyncio.to_thread(finish_and_close, None))
+            # The bus is flushed before the closing frames, which blocks: all of it in a thread.
+            await asyncio.shield(asyncio.to_thread(lambda: self._close(self._finish(exc), raise_errors)))
         else:
             # The closing frames go out at once, even when the task is being cancelled; only the server's answer is
             # waited for, in a thread, and shielded so that a cancellation cannot drop the close line.
-            await asyncio.shield(asyncio.to_thread(finish_and_close, self._finish(exc)))
+            outcome = self._finish(exc)
+            await asyncio.shield(asyncio.to_thread(self._close, outcome, raise_errors))
         return False
 
 

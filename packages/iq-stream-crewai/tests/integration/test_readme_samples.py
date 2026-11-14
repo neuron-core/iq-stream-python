@@ -53,4 +53,4 @@ def test_a_readme_block_runs(block: str, iq_servers: TestServers, tmp_path: os.P
     # A publisher that gave up, or an adapter failure, would have logged a warning.
     assert "iq-stream" not in process.stderr and "iq_stream" not in process.stderr, process.stderr[-3000:]
     saving = "save_answer(" in block
-    assert process.stdout.rstrip().endswith(f"saved {1 if saving else 0}")
+    assert f"saved {1 if saving else 0}" in process.stdout.splitlines()

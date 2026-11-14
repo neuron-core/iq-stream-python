@@ -16,7 +16,7 @@ from crew_fakes import ANSWER, FakeStreamingLLM, LookupTool, make_crew
 from crewai import Agent
 from crewai.events import crewai_event_bus
 from crewai.events.base_events import BaseEvent
-from crewai.events.types.crew_events import CrewKickoffStartedEvent
+from crewai.events.types.llm_events import LLMStreamChunkEvent
 from iq_stream import IQClient, IQError, Outcome, PublishResult
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
@@ -228,7 +228,7 @@ def test_a_thread_that_outlives_the_block_publishes_nothing() -> None:
     def straggler() -> None:
         late.wait(5)
         try:
-            crewai_event_bus.emit(None, CrewKickoffStartedEvent(crew_name="late", inputs=None))
+            crewai_event_bus.emit(None, LLMStreamChunkEvent(chunk="late", call_id="late"))
         except BaseException as error:
             failures.append(error)
 
