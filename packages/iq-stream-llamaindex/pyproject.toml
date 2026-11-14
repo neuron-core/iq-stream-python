@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iq-stream-llamaindex"
+version = "0.1.0"
+description = "Publish LlamaIndex workflow and agent runs to browsers through an IQ-Stream server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Neuron Core" }]
+keywords = ["llamaindex", "llama-index", "workflows", "ag-ui", "sse", "server-sent-events", "streaming", "agents", "iq-stream"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = ["iq-stream>=0.1.0,<0.2", "llama-index-workflows>=2.14,<3"]
+
+[project.optional-dependencies]
+# The agent events (FunctionAgent, ReActAgent, AgentWorkflow) are defined in llama-index-core.
+agents = ["llama-index-core>=0.14,<0.15"]
+# AGUIEncoder builds its events with the ag_ui.core models.
+agui = ["ag-ui-protocol>=1.0,<2"]
+
+[project.urls]
+Repository = "https://github.com/neuron-core/iq-stream-python"
+Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-llamaindex"
+Issues = "https://github.com/neuron-core/iq-stream-python/issues"
+
+[dependency-groups]
+dev = [
+    "iq-stream-llamaindex[agents,agui]",
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+    # The pass-through test of AGUIChatWorkflow; the package supports Python below 3.14 only.
+    "llama-index-protocols-ag-ui>=0.6,<0.7 ; python_version < '3.14'",
+    # The FastAPI example app, served by uvicorn in the integration tests.
+    "fastapi",
+    "uvicorn",
+]
+
+[tool.uv]
+# The versions the plan (SDKs/llamaindex.md) was researched and prototyped against; the ranges above stay wide.
+constraint-dependencies = [
+    "llama-index-workflows==2.26.1",
+    "llama-index-core==0.14.25",
+    "llama-index-instrumentation==0.6.0",
+    "llama-index-protocols-ag-ui==0.6.0",
+    "ag-ui-protocol==1.0.0",
+    "pydantic==2.14.3",
+    "httpx==0.28.1",
+]
+
+[tool.uv.sources]
+iq-stream = { path = "../iq-stream", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iq_stream_llamaindex"]
+
+# The tests need the repository (its servers and the JavaScript checkout), and the lockfile is for development:
+# neither ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/iq_stream_llamaindex", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
