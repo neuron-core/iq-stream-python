@@ -60,6 +60,12 @@ async def wait_for(condition: Any, seconds: float = 5) -> None:
         await asyncio.sleep(0.01)
 
 
+async def finished(recorders: dict[str, RecordingPublisher], stream_id: str) -> None:
+    """Waits until the stream is closed and the task that ran it has ended."""
+    await wait_for(lambda: stream_id in recorders and recorders[stream_id].outcome is not None)
+    await wait_for(lambda: not hayhooks._TASKS)  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_start_stream_answers_at_once_saves_before_the_close_and_keeps_the_task(
     client: IQClient, recorders: dict[str, RecordingPublisher]
 ) -> None:
@@ -92,7 +98,7 @@ async def test_a_failing_run_closes_with_fail_and_is_logged(
     with caplog.at_level(logging.ERROR, "haystack_integrations.iq_stream"):
         ticket = await start_stream(client, agent, {"messages": QUESTION})
         stream_id = str(ticket["streamId"])
-        await wait_for(lambda: stream_id in recorders and recorders[stream_id].outcome is not None)
+        await finished(recorders, stream_id)
         await wait_for(lambda: not hayhooks._TASKS)  # pyright: ignore[reportPrivateUsage]
     assert recorders[stream_id].outcome == "fail"
     assert any("the run failed" in record.getMessage() for record in caplog.records)
@@ -106,7 +112,7 @@ async def test_a_save_that_fails_closes_with_fail(client: IQClient, recorders: d
     release.set()
     ticket = await start_stream(client, slow_agent(release), {"messages": QUESTION}, on_result=on_result)
     stream_id = str(ticket["streamId"])
-    await wait_for(lambda: stream_id in recorders and recorders[stream_id].outcome is not None)
+    await finished(recorders, stream_id)
     assert recorders[stream_id].outcome == "fail"
 
 
@@ -126,7 +132,7 @@ async def test_a_pipeline_gets_the_callback_in_every_streaming_component(
         client, pipe, {"agent": {"messages": QUESTION, "streaming_callback": own}}, protocol="ai-sdk"
     )
     stream_id = str(ticket["streamId"])
-    await wait_for(lambda: stream_id in recorders and recorders[stream_id].outcome is not None)
+    await finished(recorders, stream_id)
     message = verify_ai_sdk(recorders[stream_id].data)
     assert message.texts == ["Let me check.", "It is sunny in Paris."]
     assert mine  # teed with the component's own callback
@@ -143,7 +149,7 @@ async def test_an_agent_on_a_sync_only_generator_gets_the_sync_callback(
     agent = slow_agent(release, SyncOnlyChatGenerator(weather_script()))
     ticket = await start_stream(client, agent, {"messages": QUESTION})
     stream_id = str(ticket["streamId"])
-    await wait_for(lambda: stream_id in recorders and recorders[stream_id].outcome is not None)
+    await finished(recorders, stream_id)
     assert recorders[stream_id].outcome == "end"
     assert verify_agui(recorders[stream_id].data).texts[-1] == "It is sunny in Paris."
 

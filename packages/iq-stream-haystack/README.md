@@ -257,7 +257,7 @@ IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=Non
 ## Limits worth knowing
 
 - A stream holds at most 10 MiB and lasts at most 30 minutes, unless the app has limits of its own on the server. An agent with the default `max_agent_steps=100` can exceed both: the server then closes the stream, the core's publisher gives up, and the run goes on unpublished. Its subscribers get `iq:fail` and load the result from you.
-- Haystack logs a warning on every model call when `run_async` gets a sync callback: use `acallback`, unless the chat generator has no `run_async`.
+- Haystack logs a warning when `run_async` gets a sync callback: use `acallback`, unless the chat generator has no `run_async`.
 - Sub-agents (`AgentTool` with `tool_streaming_callback_passthrough=True`) publish valid events, interleaved and flat: the page cannot tell which sub-agent a message belongs to.
 - A tool call that a confirmation strategy rejects gets no result frame: Haystack writes the rejection into the conversation, not the stream. Publish it with `custom()` if the page shows it.
 - The core holds the close line until the stream is `min_open` (3 seconds) old, so that a browser that subscribes just after a quick answer still receives it; leaving the block waits for that.

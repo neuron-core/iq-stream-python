@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
+from typing import Any
 
 import pytest
 from haystack.components.agents import Agent
+from haystack.hooks.human_in_the_loop import ConfirmationHook, ToolExecutionDecision
 from iq_stream import IQClient
 from iq_stream.testing import TestServers, free_port, subscribe, subscribe_in_background
 
 from haystack_integrations.iq_stream import IQStream
 from tests.checks import verify_agui, verify_ai_sdk
-from tests.fakes import ScriptedChatGenerator, text_turn, tool_turn, weather_call
+from tests.fakes import ScriptedChatGenerator, text_turn, tool_turn, weather_call, weather_script
 from tests.live import QUESTION, async_weather_tool, failing_agent, in_order_once, types, weather_agent, weather_tool
 
 
@@ -195,3 +198,53 @@ def test_frames_on_the_wire_match_the_types_of_a_scripted_run(iq_client: IQClien
     sequence = types(received)
     assert sequence[0] == "start" and sequence[-1] == "finish"
     assert sequence.count("chunk") == len(sequence) - 2
+
+
+def test_a_confirmation_that_waits_past_the_read_timeout_keeps_the_stream(iq_servers: TestServers) -> None:
+    """A human-in-the-loop pause: the request reaches the browser, the stream waits on keepalives, the run goes on."""
+    client = IQClient(iq_servers.short.url, iq_servers.app_key, iq_servers.app_secret, min_open=0, keepalive=0.5,
+                      max_frame_bytes=1024)  # fmt: skip
+
+    class AskTheBrowser:
+        def run(self, *, tool_name: str, tool_description: str, tool_params: dict[str, Any],
+                tool_call_id: str | None = None, confirmation_strategy_context: dict[str, Any] | None = None,
+                ) -> ToolExecutionDecision:  # fmt: skip
+            assert confirmation_strategy_context is not None
+            confirmation_strategy_context["stream"].custom("tool_confirmation", {"toolCallId": tool_call_id})
+            time.sleep(3.0)  # the user takes longer than the server's 2 s read timeout
+            return ToolExecutionDecision(tool_name, True, tool_call_id, None, tool_params)
+
+        async def run_async(self, **kwargs: Any) -> ToolExecutionDecision:
+            return self.run(**kwargs)
+
+    hook = ConfirmationHook(confirmation_strategies={"get_weather": AskTheBrowser()})  # pyright: ignore[reportArgumentType]
+    script = ScriptedChatGenerator(weather_script())
+    agent = Agent(chat_generator=script, tools=[weather_tool()], hooks={"before_tool": [hook]})
+    ticket = client.ticket()
+    subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
+    with IQStream(client, ticket.stream_id) as stream:
+        agent.run(QUESTION, streaming_callback=stream.callback, hook_context={"stream": stream})
+    received = subscription.result(30)
+    conversation = verify_agui(in_order_once(received))
+    assert conversation.custom == [("tool_confirmation", {"toolCallId": "call_1"})]
+    assert conversation.results == {"call_1": "Sunny, 21C in Paris"}
+    by_type = {json.loads(frame.data)["type"]: frame.at for frame in received.frames}
+    assert by_type["TOOL_CALL_RESULT"] - by_type["CUSTOM"] >= 2.5
+    assert received.terminal is not None and received.terminal.event == "iq:end"
+    assert stream.publisher is not None and stream.publisher.requests == 1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_a_run_past_the_stream_s_byte_limit_goes_on_unpublished(iq_servers: TestServers) -> None:
+    # The short server holds at most 8,192 bytes per stream: it closes the stream, and the run still ends normally.
+    client = IQClient(iq_servers.short.url, iq_servers.app_key, iq_servers.app_secret, min_open=0, max_frame_bytes=1024)
+    words = [f"word{n} " for n in range(600)]
+    agent = Agent(chat_generator=ScriptedChatGenerator([text_turn(words)]))
+    ticket = client.ticket()
+    subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
+    with IQStream(client, ticket.stream_id) as stream:
+        result = agent.run(QUESTION, streaming_callback=stream.callback)
+    received = subscription.result(30)
+    assert result["last_message"].text == "".join(words)
+    assert stream.failed
+    assert received.terminal is not None and received.terminal.event == "iq:fail"
+    assert received.terminal.data["reason"] == "too_large"
