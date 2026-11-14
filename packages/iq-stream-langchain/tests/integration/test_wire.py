@@ -255,3 +255,19 @@ def test_a_subscriber_that_reconnects_mid_run_misses_nothing(iq_client: IQClient
     assert again.terminal.event == received.terminal.event == "iq:end"
     assert again.frames[0].id == "4"
     assert again.data == received.data[3:], "no gap and no repeat"
+
+
+def test_a_stream_over_the_server_byte_limit_fails_and_the_run_completes(
+    iq_short_client: IQClient, iq_servers: TestServers
+) -> None:
+    ticket, subscription = watch(iq_short_client, iq_servers.short.url)  # 8,192 bytes a stream
+    seen = 0
+    with iq_short_client.publisher(ticket.stream_id) as publisher:
+        for _ in relay(publisher, weather_agent(token_delay=0.01), USER):
+            seen += 1
+    received = subscription.result(10)
+
+    assert seen == len(TYPES) - 1, "the run was read to its end"
+    assert received.terminal is not None and received.terminal.event == "iq:fail"
+    assert received.terminal.data["reason"] == "too_large"
+    assert not publisher.alive and publisher.error is not None

@@ -55,11 +55,7 @@ class _AguiRun:
         self.open: list[dict[str, Any]] = []
 
     def track(self, kind: str, event: dict[str, Any]) -> None:
-        if kind == "RUN_STARTED":
-            self.started = True
-        elif kind in ("RUN_FINISHED", "RUN_ERROR"):
-            self.terminal = kind
-        elif kind in _OPENERS:
+        if kind in _OPENERS:
             closer, key = _OPENERS[kind]
             closing = {"type": closer, key: event.get(key)}
             if "subagentRunId" in event:
@@ -73,11 +69,16 @@ class _AguiRun:
                     break
 
     def publish(self, event: BaseEvent) -> None:
-        fields = event.model_dump(mode="json", by_alias=True, exclude_none=True)
-        kind = str(fields.get("type"))
-        self.track(kind, fields)
+        kind = str(event.type.value)
+        if kind == "RUN_STARTED":
+            self.started = True
+        elif kind in ("RUN_FINISHED", "RUN_ERROR"):
+            self.terminal = kind
+        # A publisher that gave up is not fed: nothing is encoded for the rest of the run, which goes on.
         if stopped(self.pub):
             return
+        fields = event.model_dump(mode="json", by_alias=True, exclude_none=True)
+        self.track(kind, fields)
         if kind.endswith("_ERROR") and not self.expose_errors:
             fields = {**fields, "message": MASKED_MESSAGE}
             fields.pop("rawEvent", None)
@@ -206,14 +207,14 @@ async def _arelay_agui(
         try:
             async for event in events:
                 run.publish(event)
-                if run.terminal == "RUN_ERROR":
+                if event.type.value == "RUN_ERROR":
                     with contextlib.suppress(IQError):
                         await aclose_publisher(pub, "fail")
                 yield event
         finally:
             await events.aclose()
     except Exception as error:
-        if not isinstance(error, IQError):
+        if error is not pub.error:  # with on_error="raise", the publisher's own error: nothing more can be sent
             run.fail()
         raise
     except BaseException:  # CancelledError, GeneratorExit from aclose(), KeyboardInterrupt

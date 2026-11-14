@@ -186,6 +186,21 @@ async def test_an_inert_publisher_leaves_the_run_alone() -> None:
     assert publisher.frames == []
 
 
+async def test_with_on_error_raise_the_publishing_error_leaves_the_relay() -> None:
+    from iq_stream import IQError
+
+    publisher = AsyncRecordingPublisher(on_error="raise")
+    seen = 0
+    with pytest.raises(IQError):
+        async with publisher:
+            async for _ in arelay_agui(publisher, agent_of(weather_agent(checkpointer=InMemorySaver())), run_input()):
+                seen += 1
+                if seen == 2:
+                    publisher.fail()
+    assert seen == 2
+    assert all(json.loads(data)["type"] not in ("RUN_ERROR", "RUN_FINISHED") for data in publisher.data)
+
+
 async def test_a_synchronous_publisher_fits_too() -> None:
     publisher = RecordingPublisher()
     with publisher:

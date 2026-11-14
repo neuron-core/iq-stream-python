@@ -144,10 +144,8 @@ class _Run:
 
     def fail(self, error: BaseException) -> None:
         """The run raised: its ``error`` part, before the exception closes the stream with ``fail``."""
-        if isinstance(error, IQError):
-            return  # the publisher's own error, with on_error="raise": nothing more can be sent
-        if not self.pub.alive:
-            return
+        if error is self.pub.error or not self.pub.alive:
+            return  # with on_error="raise", the publisher's own error: nothing more can be sent
         with contextlib.suppress(IQError):
             try:
                 self.pub.send(error_part(error, expose=self.expose_errors))
