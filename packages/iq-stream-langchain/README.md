@@ -139,7 +139,7 @@ One frame per stream part, without an SSE event name, its data a JSON object: `{
 | `{"type": "error", "ns": [], "data": {"error": "<exception type>", "message": "An error occurred."}}` | The run raised. The message is the exception's only with `expose_errors=True`. |
 | `{"type": "error", "ns": [], "data": {"error": "Cancelled", "message": "run cancelled"}}` | The run was cancelled. |
 
-By default the modes are `messages`, `updates`, `custom` and `tools` (`DEFAULT_STREAM_MODE`). `values` is left out because each part repeats the whole state, which grows with the thread. A `messages` part keeps the metadata keys the browser clients read (`SLIM_METADATA`), about 430 bytes a token instead of 720.
+By default the modes are `messages`, `updates`, `custom` and `tools` (`DEFAULT_STREAM_MODE`). `values` is left out because each part repeats the whole state, which grows with the thread. A `messages` part keeps the metadata keys the browser clients read (`SLIM_METADATA`), about 430 bytes a token instead of 730.
 
 ## In the browser
 
