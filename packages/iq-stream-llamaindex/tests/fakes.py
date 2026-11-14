@@ -1,17 +1,16 @@
-"""Fake models and tools shared by both suites: no API key, no network.
+"""Fake models and tools shared by both suites: no API key, no network. No ``from __future__ import annotations``
+here: LlamaIndex finds a tool's ``Context`` parameter by its annotation at run time.
 
 ``FakeStreamingLLM`` is the prototype's model: a subclass of LlamaIndex's own ``MockFunctionCallingLLM`` that streams a
 reasoning delta, text deltas and, on its first call, one tool call in the final chunk, as providers do. ``ScriptedLLM``
 answers each call with the next scripted assistant message, streamed as one chunk.
 """
 
-from __future__ import annotations
-
 import asyncio
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any
 
-from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
@@ -22,6 +21,7 @@ from llama_index.core.base.llms.types import (
 )
 from llama_index.core.llms.callbacks import llm_chat_callback
 from llama_index.core.llms.mock import MockFunctionCallingLLM
+from llama_index.core.workflow import Context, HumanResponseEvent, InputRequiredEvent
 from pydantic import Field
 
 FIRST_TOKENS = ["Let ", "me ", "check ", "the ", "weather."]
@@ -109,12 +109,18 @@ def tool_call(name: str, tool_id: str, **kwargs: Any) -> ToolCallBlock:
 
 async def get_weather(city: str) -> str:
     """Get the weather for a city."""
-    await asyncio.sleep(SLOW["seconds"])
     return f"21 °C and sunny in {city}"
 
 
-# How long get_weather takes; the integration tests that need a silent tool set it.
-SLOW = {"seconds": 0.0}
+def slow_weather(seconds: float) -> Callable[..., Awaitable[str]]:
+    """A weather tool, named ``slow_weather``, that stays silent for ``seconds``."""
+
+    async def slow_weather(city: str) -> str:
+        """Get the weather for a city, slowly."""
+        await asyncio.sleep(seconds)
+        return f"21 °C and sunny in {city}"
+
+    return slow_weather
 
 
 async def broken_weather(city: str) -> str:
@@ -122,13 +128,79 @@ async def broken_weather(city: str) -> str:
     raise ConnectionError(f"weather service down for {city}: token=sk-tool-secret")
 
 
-def weather_agent(**llm: Any) -> FunctionAgent:
-    """The prototype's agent: one tool, the fake streaming model, a system prompt the browser must never see."""
-    tools = [broken_weather] if llm.get("tool_name") == "broken_weather" else [get_weather]
+def weather_agent(
+    *, tool: Callable[..., Awaitable[str]] = get_weather, timeout: float | None = None, **llm: Any
+) -> FunctionAgent:
+    """The prototype's agent: one tool, the fake streaming model, a system prompt the browser must never see. The
+    model calls the tool by its name."""
     return FunctionAgent(
         name="weather_agent",
         description="Answers weather questions",
-        tools=tools,
+        tools=[tool],
         system_prompt=SYSTEM_PROMPT,
-        llm=FakeStreamingLLM(**llm),
+        llm=FakeStreamingLLM(tool_name=tool.__name__, **llm),
+        timeout=timeout,
     )
+
+
+async def ask(ctx: Context, question: str) -> str:
+    """Ask the human a question."""
+    answer = await ctx.wait_for_event(
+        HumanResponseEvent, waiter_id=question, waiter_event=InputRequiredEvent(prefix=question), timeout=30
+    )
+    return str(answer.response)
+
+
+def hitl_agent() -> FunctionAgent:
+    """An agent whose one tool waits for a human's answer before the model writes "Done."."""
+    llm = ScriptedLLM(script=[[tool_call("ask", "q1", question="Proceed?")], [TextBlock(text="Done.")]])
+    return FunctionAgent(name="assistant", tools=[ask], llm=llm)
+
+
+BIG_RESULT = "x" * 200_000
+
+
+async def big_weather(city: str) -> str:
+    """Get a very detailed weather report for a city."""
+    return BIG_RESULT
+
+
+class Opaque:
+    """A tool's raw output that JSON has no type for."""
+
+    def __str__(self) -> str:
+        return "an opaque report"
+
+
+async def opaque_weather(city: str) -> Opaque:
+    """Get the weather for a city as an object."""
+    return Opaque()
+
+
+def parallel_agent() -> FunctionAgent:
+    """One model step that calls two tools at once; the slower one finishes last."""
+    llm = ScriptedLLM(
+        script=[
+            [tool_call("slow_weather", "call_a", city="Rome"), tool_call("get_weather", "call_b", city="Oslo")],
+            [TextBlock(text="Rome and Oslo are sunny.")],
+        ]
+    )
+    return FunctionAgent(name="assistant", tools=[slow_weather(0.2), get_weather], llm=llm)
+
+
+def handoff_workflow() -> AgentWorkflow:
+    """Two agents in one workflow: triage hands the question to weather, which calls its tool and answers."""
+    triage = FunctionAgent(
+        name="triage",
+        description="Routes questions",
+        tools=[],
+        can_handoff_to=["weather"],
+        llm=ScriptedLLM(script=[[tool_call("handoff", "h1", to_agent="weather", reason="a weather question")]]),
+    )
+    weather = FunctionAgent(
+        name="weather",
+        description="Answers weather questions",
+        tools=[get_weather],
+        llm=ScriptedLLM(script=[[tool_call("get_weather", "t1", city="Rome")], [TextBlock(text="Sunny in Rome.")]]),
+    )
+    return AgentWorkflow(agents=[triage, weather], root_agent="triage")

@@ -81,7 +81,14 @@ only-include = ["src/iq_stream_llamaindex", "README.md", "LICENSE", "pyproject.t
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests/unit"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Workflow._get_steps() walks an agent's attributes with inspect.getmembers(), and agents are pydantic models.
+    "ignore:The `__fields__` attribute is deprecated:DeprecationWarning",
+    "ignore:The `__fields_set__` attribute is deprecated:DeprecationWarning",
+    "ignore:Accessing the 'model_computed_fields' attribute on the instance is deprecated:DeprecationWarning",
+    "ignore:Accessing the 'model_fields' attribute on the instance is deprecated:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 120
