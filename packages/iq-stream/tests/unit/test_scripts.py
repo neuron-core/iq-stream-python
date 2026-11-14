@@ -19,4 +19,4 @@ def test_scripts_servers_py_starts_the_short_server_with_the_kits_short_settings
     assert spec is not None and spec.loader is not None
     script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(script)
-    assert script.SHORT_SETTINGS == dict(SHORT_SETTINGS)
+    assert dict(SHORT_SETTINGS) == script.SHORT_SETTINGS
