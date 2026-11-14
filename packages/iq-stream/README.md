@@ -15,10 +15,11 @@ import json
 
 from iq_stream import IQClient
 
+# app_key and app_secret come from IQ_STREAM_APP_KEY and IQ_STREAM_APP_SECRET
 iq = IQClient(
     url="http://iq.internal:8080",  # how this backend reaches the server
     public_url="https://stream.example.com",  # how browsers reach it
-)  # app_key and app_secret from IQ_STREAM_APP_KEY, IQ_STREAM_APP_SECRET
+)
 
 ticket = iq.ticket()  # what the browser needs: stream_id, token, url, expires_at
 # ... hand ticket.to_dict() to the browser, which subscribes to ticket.url ...
