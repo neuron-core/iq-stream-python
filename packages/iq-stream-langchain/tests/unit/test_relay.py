@@ -6,13 +6,16 @@ import json
 from typing import Any
 
 import pytest
-from fakes import FINAL, FIRST, TOOL_RESULT, USER, text_of, weather_agent
+from fakes import ASYNC_TOKENS, FINAL, FIRST, TOOL_RESULT, USER, text_of, weather_agent
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
 from iq_stream_langchain import DEFAULT_STREAM_MODE, apublish_run, arelay, publish_run, relay
 
-EXPECTED_TYPES = ["metadata", *["messages"] * 8, "updates", "tools", "tools", "messages", "updates"]
+EXPECTED_TYPES = ["metadata", *["messages"] * 9, "updates", "tools", "tools", "messages", "updates"]
 EXPECTED_TYPES += [*["messages"] * 8, "updates"]
+# An async run streams whole messages on Python 3.10 (see fakes.ASYNC_TOKENS).
+EXPECTED_ASYNC_TYPES = EXPECTED_TYPES if ASYNC_TOKENS else ["metadata", "messages", "updates", "tools", "tools"]
+EXPECTED_ASYNC_TYPES += [] if ASYNC_TOKENS else ["messages", "updates", "messages", "updates"]
 
 
 def decoded(publisher: RecordingPublisher | AsyncRecordingPublisher) -> list[dict[str, Any]]:
@@ -48,7 +51,7 @@ async def test_an_async_run_publishes_the_same_sequence() -> None:
         yielded = [part async for part in arelay(publisher, weather_agent(), USER)]
 
     parts = decoded(publisher)
-    assert [part["type"] for part in parts] == EXPECTED_TYPES
+    assert [part["type"] for part in parts] == EXPECTED_ASYNC_TYPES
     assert text_of(parts) == FIRST + FINAL
     assert len(yielded) == len(parts) - 1
     assert publisher.outcome == "end"
@@ -73,9 +76,7 @@ def test_the_first_frame_names_the_run_and_the_thread() -> None:
 
 
 def test_relay_yields_exactly_what_the_graph_yields() -> None:
-    expected = list(
-        weather_agent().stream(USER, stream_mode=list(DEFAULT_STREAM_MODE), subgraphs=True, version="v2")
-    )
+    expected = list(weather_agent().stream(USER, stream_mode=list(DEFAULT_STREAM_MODE), subgraphs=True, version="v2"))
     publisher = RecordingPublisher()
     with publisher:
         yielded = list(relay(publisher, weather_agent(), USER))
@@ -114,7 +115,7 @@ async def test_apublish_run_returns_the_final_state() -> None:
     async with publisher:
         final = await apublish_run(publisher, weather_agent(), USER)
     assert final["messages"][-1].content == FINAL
-    assert [part["type"] for part in decoded(publisher)] == EXPECTED_TYPES
+    assert [part["type"] for part in decoded(publisher)] == EXPECTED_ASYNC_TYPES
     assert publisher.outcome == "end"
 
 
@@ -123,7 +124,7 @@ async def test_arelay_takes_a_synchronous_publisher_too() -> None:
     with publisher:
         final = await apublish_run(publisher, weather_agent(), USER)
     assert final["messages"][-1].content == FINAL
-    assert len(publisher.frames) == len(EXPECTED_TYPES)
+    assert len(publisher.frames) == len(EXPECTED_ASYNC_TYPES)
 
 
 def test_stream_options_go_to_the_graph() -> None:

@@ -38,7 +38,13 @@ def test_a_messages_part_keeps_the_metadata_the_clients_read() -> None:
     assert part["type"] == "messages" and part["ns"] == []
     message, metadata = part["data"]
     assert message["content"] == "Hi" and message["type"] == "AIMessageChunk" and message["id"] == "m1"
-    assert set(metadata) == {"langgraph_node", "langgraph_step", "langgraph_checkpoint_ns", "ls_model_name", "lc_agent_name"}
+    assert set(metadata) == {
+        "langgraph_node",
+        "langgraph_step",
+        "langgraph_checkpoint_ns",
+        "ls_model_name",
+        "lc_agent_name",
+    }
     assert set(metadata) <= set(SLIM_METADATA)
 
 
@@ -166,7 +172,9 @@ def test_a_message_without_text_content_that_does_not_fit_is_not_sent() -> None:
     blocks = [{"type": "text", "text": "y" * 5000}]
     model = FakeToolCallingModel(messages=iter([AIMessage(content=blocks)]))  # type: ignore[list-item]
     with publisher:
-        final = publish_run(publisher, create_agent(model, []), USER, stream_mode=("updates",), on_oversize=reports.append)
+        final = publish_run(
+            publisher, create_agent(model, []), USER, stream_mode=("updates",), on_oversize=reports.append
+        )
     assert final["messages"][-1].content == blocks
     assert [json.loads(data)["type"] for data in publisher.data] == ["metadata"]
     assert reports == [Oversize("updates", reports[0].size, 1024, truncated=False)]

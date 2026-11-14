@@ -51,7 +51,7 @@ def test_a_publisher_that_gives_up_halfway_stops_frames_and_the_run_goes_on() ->
             seen += 1
             if seen == 5:
                 publisher.fail()  # as after a fatal answer from the server
-    assert seen == 22, "the whole run was read"
+    assert seen == 23, "the whole run was read"
     assert len(publisher.frames) == 6, "the metadata part and five parts"
     assert publisher.outcome is None, "a publisher that gave up has no close line of its own"
 
@@ -69,7 +69,7 @@ def test_a_failed_run_on_an_inert_publisher_still_raises() -> None:
 def test_with_on_error_raise_the_publishing_error_leaves_the_relay() -> None:
     publisher = RecordingPublisher(on_error="raise")
     seen = 0
-    with pytest.raises(IQError, match="give up"), publisher:  # noqa: PT012
+    with pytest.raises(IQError, match="give up"), publisher:
         for _ in relay(publisher, weather_agent(), USER):
             seen += 1
             if seen == 3:

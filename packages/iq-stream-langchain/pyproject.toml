@@ -74,7 +74,11 @@ only-include = ["src/iq_stream_langchain", "README.md", "LICENSE", "pyproject.to
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests/unit"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # ag-ui-langgraph 0.0.47 calls a method that LangGraph 1.x deprecated.
+    "ignore:`get_config_jsonschema` is deprecated:langgraph.warnings.LangGraphDeprecatedSinceV10",
+]
 
 [tool.ruff]
 line-length = 120

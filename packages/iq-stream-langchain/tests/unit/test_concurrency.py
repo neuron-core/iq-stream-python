@@ -7,7 +7,17 @@ import asyncio
 import json
 from typing import Any
 
-from fakes import USER, FakeToolCallingModel, get_weather, text_of, tool_call, two_sub_agents, weather_agent
+import pytest
+from fakes import (
+    ASYNC_TOKENS,
+    USER,
+    FakeToolCallingModel,
+    get_weather,
+    text_of,
+    tool_call,
+    two_sub_agents,
+    weather_agent,
+)
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
@@ -15,21 +25,38 @@ from langchain_core.messages import AIMessage
 from iq_stream_langchain import apublish_run, arelay, relay
 
 
-async def test_two_sub_agents_interleave_and_each_text_is_intact() -> None:
-    publisher = AsyncRecordingPublisher()
-    yielded: list[tuple[str, list[str]]] = []
-    async with publisher:
-        async for part in arelay(publisher, two_sub_agents(), {"messages": []}):
-            yielded.append((part["type"], list(part["ns"])))
-
-    parts = [json.loads(data) for data in publisher.data][1:]
-    assert [(part["type"], part["ns"]) for part in parts] == yielded, "published in the order yielded"
+def assert_interleaved(parts: list[dict[str, Any]]) -> None:
     order = "".join(
         part["ns"][0][0] for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "AIMessageChunk"
     )
     assert "ab" in order and "ba" in order, f"the sub-agents' tokens interleave: {order}"
     assert text_of(parts, "a:") == "alpha says one two three four five"
     assert text_of(parts, "b:") == "beta says one two three four five"
+
+
+def test_two_sub_agents_in_threads_interleave_and_each_text_is_intact() -> None:
+    publisher = RecordingPublisher()
+    with publisher:
+        yielded = [
+            (part["type"], list(part["ns"]))
+            for part in relay(publisher, two_sub_agents(async_nodes=False), {"messages": []})
+        ]
+    parts = [json.loads(data) for data in publisher.data][1:]
+    assert [(part["type"], part["ns"]) for part in parts] == yielded, "published in the order yielded"
+    assert_interleaved(parts)
+    assert publisher.outcome == "end"
+
+
+@pytest.mark.skipif(not ASYNC_TOKENS, reason="LangChain streams tokens from async nodes on Python 3.11+ only")
+async def test_two_async_sub_agents_interleave_and_each_text_is_intact() -> None:
+    publisher = AsyncRecordingPublisher()
+    yielded: list[tuple[str, list[str]]] = []
+    async with publisher:
+        async for part in arelay(publisher, two_sub_agents(async_nodes=True), {"messages": []}):
+            yielded.append((part["type"], list(part["ns"])))
+    parts = [json.loads(data) for data in publisher.data][1:]
+    assert [(part["type"], part["ns"]) for part in parts] == yielded, "published in the order yielded"
+    assert_interleaved(parts)
     assert publisher.outcome == "end"
 
 
@@ -70,7 +97,9 @@ def test_parallel_tool_calls_in_a_sync_run() -> None:
         list(relay(publisher, parallel_agent(), USER))
     assert_each_call_ordered(tool_events(publisher))
     parts = [json.loads(data) for data in publisher.data]
-    results = [part["data"][0]["content"] for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool"]
+    results = [
+        part["data"][0]["content"] for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool"
+    ]
     assert sorted(results) == ["sunny, 21C in Rome", "sunny, 21C in Turin"]
 
 

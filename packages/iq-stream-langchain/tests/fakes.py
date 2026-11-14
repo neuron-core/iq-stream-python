@@ -1,8 +1,8 @@
 """A scripted chat model and small graphs for the tests: no API key, no network.
 
 `FakeToolCallingModel` is LangChain's `GenericFakeChatModel` with the two things `create_agent` needs and the stock
-fake lacks: `bind_tools`, and a stream that carries `tool_call_chunks`. Text streams word by word, a tool call's
-arguments in two halves, the way a provider sends them.
+fake lacks: `bind_tools`, and a stream that carries `tool_call_chunks`. Text streams word by word, a tool call as a
+header and its arguments in two halves, the way a provider sends them.
 """
 
 from __future__ import annotations
@@ -10,18 +10,25 @@ from __future__ import annotations
 import asyncio
 import json
 import operator
+import sys
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
+from functools import reduce
 from typing import Annotated, Any
 
 from langchain.agents import create_agent
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
-from langchain_core.outputs import ChatGenerationChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, message_chunk_to_message
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
+
+#: LangChain hands a run's callbacks to a model that a node calls without its config (create_agent's model node does)
+#: in async code only from Python 3.11, whose asyncio.create_task takes a context. On 3.10 an async run streams whole
+#: messages, not tokens.
+ASYNC_TOKENS = sys.version_info >= (3, 11)
 
 USER = {"messages": [{"role": "user", "content": "weather in Turin?"}]}
 FIRST = "Let me check the weather."
@@ -41,6 +48,8 @@ class FakeToolCallingModel(GenericFakeChatModel):
         message = next(self.messages)
         if isinstance(message, str):
             message = AIMessage(content=message)
+        if not isinstance(message.content, str):  # content blocks: one chunk
+            yield ChatGenerationChunk(message=AIMessageChunk(content=message.content, id=message.id))
         text = message.content if isinstance(message.content, str) else ""
         pieces = [piece for piece in text.replace(" ", " \x00").split("\x00") if piece]
         for sent, piece in enumerate(pieces):
@@ -48,9 +57,10 @@ class FakeToolCallingModel(GenericFakeChatModel):
                 raise RuntimeError("fake model exploded mid-stream")
             yield ChatGenerationChunk(message=AIMessageChunk(content=piece, id=message.id))
         for index, call in enumerate(message.tool_calls):
+            # A header with the name and id, then the arguments in two fragments, as OpenAI and Anthropic send them.
             arguments = json.dumps(call["args"])
             half = len(arguments) // 2
-            for position, part in enumerate((arguments[:half], arguments[half:])):
+            for position, part in enumerate(("", arguments[:half], arguments[half:])):
                 chunk = AIMessageChunk(
                     content="",
                     id=message.id,
@@ -66,6 +76,37 @@ class FakeToolCallingModel(GenericFakeChatModel):
                 )
                 yield ChatGenerationChunk(message=chunk)
         yield ChatGenerationChunk(message=AIMessageChunk(content="", id=message.id, chunk_position="last"))
+
+    def _merged(self, chunks: list[ChatGenerationChunk]) -> ChatResult:
+        merged = reduce(operator.add, (chunk.message for chunk in chunks))
+        return ChatResult(generations=[ChatGeneration(message=message_chunk_to_message(merged))])
+
+    # Without streaming (no callback asked for tokens), the same message, the same failure, the same time.
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        chunks: list[ChatGenerationChunk] = []
+        for chunk in self._chunks():
+            chunks.append(chunk)
+            time.sleep(self.token_delay)
+        return self._merged(chunks)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        chunks: list[ChatGenerationChunk] = []
+        for chunk in self._chunks():
+            chunks.append(chunk)
+            await asyncio.sleep(self.token_delay)
+        return self._merged(chunks)
 
     def _stream(
         self,
@@ -136,7 +177,7 @@ class ParallelState(TypedDict):
     messages: Annotated[list[Any], operator.add]
 
 
-def two_sub_agents(delay_a: float = 0.03, delay_b: float = 0.02) -> Any:
+def two_sub_agents(*, async_nodes: bool, delay_a: float = 0.03, delay_b: float = 0.02) -> Any:
     """Two `create_agent` sub-agents run by two nodes of one superstep: their chunks interleave."""
 
     def sub_agent(name: str, delay: float) -> Any:
@@ -146,18 +187,23 @@ def two_sub_agents(delay_a: float = 0.03, delay_b: float = 0.02) -> Any:
         return create_agent(model, [], name=name)
 
     alpha, beta = sub_agent("alpha", delay_a), sub_agent("beta", delay_b)
+    go = {"messages": [{"role": "user", "content": "go"}]}
 
-    async def call_alpha(state: ParallelState) -> dict[str, Any]:
-        result = await alpha.ainvoke({"messages": [{"role": "user", "content": "go"}]})
-        return {"messages": [result["messages"][-1]]}
+    def call_alpha(state: ParallelState) -> dict[str, Any]:
+        return {"messages": [alpha.invoke(go)["messages"][-1]]}
 
-    async def call_beta(state: ParallelState) -> dict[str, Any]:
-        result = await beta.ainvoke({"messages": [{"role": "user", "content": "go"}]})
-        return {"messages": [result["messages"][-1]]}
+    def call_beta(state: ParallelState) -> dict[str, Any]:
+        return {"messages": [beta.invoke(go)["messages"][-1]]}
+
+    async def acall_alpha(state: ParallelState) -> dict[str, Any]:
+        return {"messages": [(await alpha.ainvoke(go))["messages"][-1]]}
+
+    async def acall_beta(state: ParallelState) -> dict[str, Any]:
+        return {"messages": [(await beta.ainvoke(go))["messages"][-1]]}
 
     graph = StateGraph(ParallelState)
-    graph.add_node("a", call_alpha)
-    graph.add_node("b", call_beta)
+    graph.add_node("a", acall_alpha if async_nodes else call_alpha)
+    graph.add_node("b", acall_beta if async_nodes else call_beta)
     graph.add_edge(START, "a")
     graph.add_edge(START, "b")
     graph.add_edge("a", END)
@@ -171,6 +217,6 @@ def text_of(parts: Sequence[dict[str, Any]], ns_prefix: str | None = None) -> st
         part["data"][0]["content"]
         for part in parts
         if part["type"] == "messages"
-        and part["data"][0]["type"] == "AIMessageChunk"
+        and part["data"][0]["type"] in ("AIMessageChunk", "ai")  # tokens, or a whole message (async on 3.10)
         and (ns_prefix is None or (part["ns"] and part["ns"][0].startswith(ns_prefix)))
     )

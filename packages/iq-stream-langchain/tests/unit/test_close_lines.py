@@ -32,7 +32,13 @@ def test_a_failing_run_publishes_its_error_and_closes_fail() -> None:
         for _ in relay(publisher, failing_agent(), USER):
             pass
     assert last(publisher) == {"type": "error", "ns": [], "data": {"error": "RuntimeError", "message": MASKED_MESSAGE}}
-    assert [json.loads(data)["type"] for data in publisher.data] == ["metadata", "messages", "messages", "messages", "error"]
+    assert [json.loads(data)["type"] for data in publisher.data] == [
+        "metadata",
+        "messages",
+        "messages",
+        "messages",
+        "error",
+    ]
     assert publisher.outcome == "fail"
 
 
@@ -125,13 +131,12 @@ def test_a_sync_loop_left_early_is_a_cancelled_run() -> None:
 
 async def test_an_async_loop_left_early_under_aclosing_is_a_cancelled_run() -> None:
     publisher = AsyncRecordingPublisher()
-    async with publisher:
-        async with contextlib.aclosing(arelay(publisher, weather_agent(), USER)) as parts:
-            index = 0
-            async for _ in parts:
-                index += 1
-                if index == 3:
-                    break
+    async with publisher, contextlib.aclosing(arelay(publisher, weather_agent(), USER)) as parts:
+        index = 0
+        async for _ in parts:
+            index += 1
+            if index == 3:
+                break
     assert publisher.data[-1] == CANCELLED_PART
     assert publisher.outcome == "fail"
 
