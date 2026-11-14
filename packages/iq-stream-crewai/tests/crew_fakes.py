@@ -18,6 +18,7 @@ from crewai import Agent, Crew, Task
 from crewai.events.types.llm_events import LLMCallType
 from crewai.llms.base_llm import BaseLLM, llm_call_context
 from crewai.tools import BaseTool
+from pydantic import Field
 
 ANSWER = "The capital of France is Paris."
 TERM = "capital of France"
@@ -28,7 +29,7 @@ class FakeStreamingLLM(BaseLLM):
     CrewAI). Second call: the answer, word by word. ``fail_on_call`` raises on that call after one chunk."""
 
     answer: str = ANSWER
-    tool_args: list[dict[str, Any]] = []
+    tool_args: list[dict[str, Any]] = Field(default_factory=lambda: [])
     delay: float = 0.0
     fail_on_call: int | None = None
     thinking: str | None = None
@@ -159,9 +160,7 @@ class FakeReActLLM(BaseLLM):
             self._emit_call_started_event(messages=messages, tools=tools, **where)
             for i in range(0, len(text), 12):
                 self._emit_stream_chunk_event(chunk=text[i : i + 12], **where)
-            self._emit_call_completed_event(
-                response=text, call_type=LLMCallType.LLM_CALL, messages=messages, **where
-            )
+            self._emit_call_completed_event(response=text, call_type=LLMCallType.LLM_CALL, messages=messages, **where)
             return text
 
     async def acall(self, messages: Any, **kwargs: Any) -> Any:

@@ -162,8 +162,9 @@ class CrewAIStream:
         assert publisher is not None
         for event, data in frames:
             try:
-                if publisher.send(data, event):
-                    self._frames_sent += 1
+                if not publisher.send(data, event):
+                    return  # it gave up: nobody will receive the rest
+                self._frames_sent += 1
             except IQError as error:
                 # FrameTooLarge from an encoder of the application's, or the publisher's own error with
                 # on_error="raise": the run goes on, and close() raises that error at the end of the block.
@@ -230,7 +231,7 @@ class CrewAIStream:
                 self._fail(failure)
         with self._lock:
             self._closed = True
-            if self._encoder is not None:
+            if self._encoder is not None and self._publisher is not None and self._publisher.alive:
                 try:
                     self._emit(self._encoder.finish(error))
                 except Exception as failure:
