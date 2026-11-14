@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iq-stream-haystack"
+version = "0.1.0"
+description = "Publish Haystack agent and pipeline runs to browsers through an IQ-Stream server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Neuron Core" }]
+keywords = ["haystack", "haystack-ai", "agents", "ag-ui", "ai-sdk", "sse", "server-sent-events", "streaming", "iq-stream"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+# AG-UI is the default wire format, so its models are a dependency, not an extra.
+dependencies = ["iq-stream>=0.1.0,<0.2", "haystack-ai>=3.0,<4", "ag-ui-protocol>=1.0,<2"]
+
+[project.optional-dependencies]
+hayhooks = ["hayhooks>=2.3,<3"]
+
+[project.urls]
+Repository = "https://github.com/neuron-core/iq-stream-python"
+Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-haystack"
+Issues = "https://github.com/neuron-core/iq-stream-python/issues"
+
+[dependency-groups]
+dev = [
+    "iq-stream-haystack[hayhooks]",
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+]
+
+[tool.uv]
+# The versions the plan (SDKs/haystack.md) was researched and prototyped against; the ranges above stay wide.
+constraint-dependencies = [
+    "haystack-ai==3.5.0",
+    "hayhooks==2.3.0",
+    "fastapi-openai-compat==1.4.0",
+    "ag-ui-protocol==1.0.0",
+    "httpx==0.28.1",
+]
+
+[tool.uv.sources]
+iq-stream = { path = "../iq-stream", editable = true }
+
+# haystack_integrations is a namespace shared with every Haystack integration: the wheel holds our part only,
+# with no __init__.py above it.
+[tool.hatch.build.targets.wheel]
+only-include = ["src/haystack_integrations/iq_stream"]
+sources = ["src"]
+
+# The tests need the repository (its servers and the JavaScript checkout), and the lockfile is for development:
+# neither ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/haystack_integrations/iq_stream", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+
+[tool.ruff.lint.isort]
+# The core, not this package's own haystack_integrations/iq_stream directory.
+known-third-party = ["iq_stream"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
