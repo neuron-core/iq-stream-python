@@ -30,8 +30,9 @@ classifiers = [
 dependencies = ["iq-stream>=0.1.0,<0.2", "agno>=2.9,<4"]
 
 [project.optional-dependencies]
-# Agno's own AG-UI converter and the ag-ui-protocol models it emits.
-agui = ["agno[agui]>=2.9,<4"]
+# Agno's own AG-UI converter and the ag-ui-protocol models it emits. The converter lives in agno.os, whose
+# package imports FastAPI.
+agui = ["agno[agui]>=2.9,<4", "fastapi"]
 # The AgentOS interface, iq_stream_agno.os.IQStream.
 os = ["agno[os]>=2.9,<4"]
 

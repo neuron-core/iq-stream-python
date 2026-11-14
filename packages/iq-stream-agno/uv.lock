@@ -454,6 +454,8 @@ dependencies = [
 [package.optional-dependencies]
 agui = [
     { name = "agno", extra = ["agui"] },
+    { name = "fastapi", version = "0.162.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "fastapi", version = "0.162.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 os = [
     { name = "agno", extra = ["os"] },
@@ -473,6 +475,7 @@ requires-dist = [
     { name = "agno", specifier = ">=2.9,<4" },
     { name = "agno", extras = ["agui"], marker = "extra == 'agui'", specifier = ">=2.9,<4" },
     { name = "agno", extras = ["os"], marker = "extra == 'os'", specifier = ">=2.9,<4" },
+    { name = "fastapi", marker = "extra == 'agui'" },
     { name = "iq-stream", editable = "../iq-stream" },
 ]
 provides-extras = ["agui", "os"]
