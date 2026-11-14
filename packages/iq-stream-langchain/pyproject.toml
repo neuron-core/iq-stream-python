@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iq-stream-langchain"
+version = "0.1.0"
+description = "Publish a LangGraph or LangChain agent run to browsers through an IQ-Stream server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Neuron Core" }]
+keywords = ["langgraph", "langchain", "ag-ui", "sse", "server-sent-events", "streaming", "agents", "iq-stream"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = ["iq-stream>=0.1.0,<0.2", "langgraph>=1.1"]
+
+[project.optional-dependencies]
+# ag_ui_langgraph imports FastAPI in its __init__, so the extra brings it.
+ag-ui = ["ag-ui-langgraph[fastapi]>=0.0.47"]
+
+[project.urls]
+Repository = "https://github.com/neuron-core/iq-stream-python"
+Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-langchain"
+Issues = "https://github.com/neuron-core/iq-stream-python/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+    "langchain>=1.2",
+    "ag-ui-langgraph[fastapi]>=0.0.47",
+    "uvicorn>=0.30",
+]
+
+[tool.uv]
+# The versions the plan was researched against. langchain 1.5 and langchain-core 1.8 need Python 3.11, so on 3.10
+# the lockfile holds the newest releases that support it (langchain 1.4, langchain-core 1.7).
+constraint-dependencies = [
+    "langgraph==1.2.21",
+    "langgraph-prebuilt==1.1.1",
+    "langchain==1.5.0 ; python_version >= '3.11'",
+    "langchain-core==1.8.0 ; python_version >= '3.11'",
+    "ag-ui-langgraph==0.0.47",
+]
+
+[tool.uv.sources]
+iq-stream = { path = "../iq-stream", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iq_stream_langchain"]
+
+# The tests need the repository (its servers and the JavaScript checkout), and the lockfile is for development.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/iq_stream_langchain", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
