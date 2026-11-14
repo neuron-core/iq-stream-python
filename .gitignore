@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# The containers scripts/servers.py started
+scripts/.servers.json
+
+# Editors and agents
+.idea/
+.vscode/
+.DS_Store
+.claude
+.codex
+.kiro
