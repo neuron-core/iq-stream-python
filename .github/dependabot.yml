@@ -1,0 +1,52 @@
+# Dependabot checks what this repository depends on once a month. A release must be at least 5 days old before it
+# is proposed, which leaves time for a broken or compromised version to be caught and pulled first. The cooldown does
+# not delay security updates.
+version: 2
+updates:
+  # The actions used by the workflows, each pinned to a commit.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+
+  # One entry per package: each has its own uv.lock.
+  - package-ecosystem: uv
+    directory: /packages/iq-stream
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+
+  # The adapters, as each is added:
+  # - package-ecosystem: uv
+  #   directory: /packages/iq-stream-langchain
+  #   schedule:
+  #     interval: monthly
+  #   cooldown:
+  #     default-days: 5
+  # - package-ecosystem: uv
+  #   directory: /packages/iq-stream-agno
+  #   schedule:
+  #     interval: monthly
+  #   cooldown:
+  #     default-days: 5
+  # - package-ecosystem: uv
+  #   directory: /packages/iq-stream-crewai
+  #   schedule:
+  #     interval: monthly
+  #   cooldown:
+  #     default-days: 5
+  # - package-ecosystem: uv
+  #   directory: /packages/iq-stream-llamaindex
+  #   schedule:
+  #     interval: monthly
+  #   cooldown:
+  #     default-days: 5
+  # - package-ecosystem: uv
+  #   directory: /packages/iq-stream-haystack
+  #   schedule:
+  #     interval: monthly
+  #   cooldown:
+  #     default-days: 5

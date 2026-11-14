@@ -1,0 +1,85 @@
+name: Release
+
+# Publishes one package to PyPI when a tag `<package>@<version>` is pushed: `iq-stream@0.1.1` publishes
+# packages/iq-stream at 0.1.1, `iq-stream-agno@0.1.0` packages/iq-stream-agno at 0.1.0. The whole of CI runs first,
+# integration tests included. PyPI authenticates this workflow by trusted publishing (OIDC), so no PyPI token is
+# stored in the repository. A pre-release version in PEP 440's terms (0.2.0b1, 0.2.0rc1) is published as a
+# pre-release: PyPI marks it so from the version, and pip installs it only when asked for it (--pre, or ==0.2.0b1).
+
+on:
+  push:
+    tags: ['*@[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fails at once when the tag names no package, or a version its pyproject.toml does not have.
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.check.outputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: check
+        run: |
+          name="${GITHUB_REF_NAME%@*}"
+          version="${GITHUB_REF_NAME##*@}"
+          manifest="packages/$name/pyproject.toml"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME names no package: there is no $manifest."
+            exit 1
+          fi
+          actual=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$manifest")
+          if [ "$actual" != "$version" ]; then
+            echo "::error::The tag says $version, but $manifest says $actual."
+            exit 1
+          fi
+          if [[ "$version" =~ (a|b|rc|dev)[0-9]*$ ]]; then
+            echo "::notice::$name $version is a pre-release: pip installs it only when asked for it."
+          fi
+          echo "package=$name" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: read
+
+  build:
+    needs: [tag, ci]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No cache in the jobs that make what is published.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+      - run: uv build
+        working-directory: packages/${{ needs.tag.outputs.package }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: packages/${{ needs.tag.outputs.package }}/dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment (repository settings, Environments) to approve each release.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/${{ needs.tag.outputs.package }}/
+    permissions:
+      id-token: write # trusted publishing, and the attestations PyPI shows for each file
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
