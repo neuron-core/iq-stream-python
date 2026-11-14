@@ -156,7 +156,9 @@ def test_start_stream_sync_runs_in_a_thread_and_saves_before_the_close(
     done = threading.Event()
 
     def on_result(stream_id: str, result: dict[str, Any]) -> None:
-        saved.append((recorders[stream_id].outcome, result["agent"]["last_message"].text, threading.current_thread().name))
+        saved.append(
+            (recorders[stream_id].outcome, result["agent"]["last_message"].text, threading.current_thread().name)
+        )
         done.set()
 
     pipe = Pipeline()

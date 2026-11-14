@@ -110,7 +110,9 @@ def test_runs_in_two_threads_publish_to_their_own_streams_through_the_module_lev
             assert current_stream() is stream
             agent.run(QUESTION)
 
-    threads = [threading.Thread(target=run, args=(p, city)) for p, city in zip(publishers, ["Paris", "Rome"], strict=True)]
+    threads = [
+        threading.Thread(target=run, args=(p, city)) for p, city in zip(publishers, ["Paris", "Rome"], strict=True)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -166,7 +168,9 @@ async def test_parallel_sub_agents_with_passthrough_publish_a_valid_flat_stream(
     sub = Agent(chat_generator=MockChatGenerator(response_fn=sub_reply), tools=[get_weather])
     research = AgentTool(agent=sub, name="research", description="Research a question")
     calls = [
-        ToolCall(tool_name="research", arguments={"messages": [{"role": "user", "content": f"q{n}"}]}, id=f"research_{n}")
+        ToolCall(
+            tool_name="research", arguments={"messages": [{"role": "user", "content": f"q{n}"}]}, id=f"research_{n}"
+        )
         for n in range(2)
     ]
     coordinator = Agent(
