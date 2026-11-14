@@ -46,7 +46,7 @@ def _number(name: str, value: object, minimum: float, *, integer: bool = False) 
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
-        or math.isnan(value)
+        or not math.isfinite(value)
         or value < minimum
         or (integer and not isinstance(value, int))
     ):
@@ -186,7 +186,8 @@ class IQClient:
 
     @property
     def trust_env(self) -> bool:
-        """Whether httpx reads proxy settings from the environment for this client."""
+        """Whether httpx reads proxy settings from the environment for this client. The CA bundle that
+        ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` names is used either way."""
         return self._core.connector.trust_env
 
     def __repr__(self) -> str:

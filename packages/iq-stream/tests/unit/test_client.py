@@ -6,6 +6,7 @@ import asyncio
 import pickle
 import re
 import ssl
+from pathlib import Path
 
 import pytest
 from fakes import STREAM, Harness, answer, closed_fail, open_
@@ -22,6 +23,20 @@ VECTOR = {
     "sub": f"{BODY}.axHyIkb73vpsdXhSCIuvasYjNTZEcVNnVqaCbckYL5U",
 }
 URL = "http://iq.test:8080"
+# A self-signed CA certificate, as a company's internal CA would be: only its subject is looked at.
+INTERNAL_CA = """\
+-----BEGIN CERTIFICATE-----
+MIIBoDCCAUegAwIBAgIUcfHlikupAZnVTsvO3NTwqsY1XuIwCgYIKoZIzj0EAwIw
+JTEjMCEGA1UEAwwaaXEtc3RyZWFtIGludGVybmFsIHRlc3QgQ0EwIBcNMjYxMTE0
+MjAzNDI4WhgPMjEyNjEwMjEyMDM0MjhaMCUxIzAhBgNVBAMMGmlxLXN0cmVhbSBp
+bnRlcm5hbCB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEV33O524w
+uFAMlr4d3exYKAiJYtdj/IgcGqxAZiO/4Mtun21r1vkcgFjzKR/Fpg7sXGfFCZ1d
+BwzYg8NPzR7es6NTMFEwHQYDVR0OBBYEFMAoXigtWJrCpp9sw3tqr1LxIwXkMB8G
+A1UdIwQYMBaAFMAoXigtWJrCpp9sw3tqr1LxIwXkMA8GA1UdEwEB/wQFMAMBAf8w
+CgYIKoZIzj0EAwIDRwAwRAIgXT7WT7TDI47dcnzMg1Cy5uPkMd5YIJS2rtbAGwll
+OdsCIFa1IVPEtitt/PLEyPaoXH4xMl3xZ9ra50Im1FQdo/Vz
+-----END CERTIFICATE-----
+"""
 ENV = ["IQ_STREAM_URL", "IQ_STREAM_APP_KEY", "IQ_STREAM_APP_SECRET", "IQ_STREAM_PUBLIC_URL", "IQ_STREAM_TRUST_ENV"]
 
 
@@ -134,6 +149,11 @@ def test_the_constructor_validates_its_options() -> None:
         {"max_frame_bytes": 0},
         {"max_frame_bytes": 1.5},
         {"retry_budget": float("nan")},
+        {"retry_budget": float("inf")},
+        {"takeover_budget": float("inf")},
+        {"min_open": float("inf")},
+        {"keepalive": float("inf")},
+        {"keepalive": float("-inf")},
         {"queue_bytes": 0},
         {"on_error": "ignore"},
         {"error_handler": "not callable"},
@@ -195,6 +215,20 @@ def test_trust_env_follows_iq_stream_trust_env_and_the_option(monkeypatch: pytes
     assert client(url="https://stream.example.com", trust_env=True).trust_env is True
     monkeypatch.delenv("IQ_STREAM_TRUST_ENV")
     assert client(url="http://127.0.0.1", trust_env=True).trust_env is True
+
+
+def test_the_ca_bundle_of_ssl_cert_file_counts_on_a_private_network_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "internal-ca.pem"
+    bundle.write_text(INTERNAL_CA, encoding="ascii")
+    monkeypatch.setenv("SSL_CERT_FILE", str(bundle))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    for url in ("https://10.0.0.5:8443", "https://iq:8443", "https://stream.example.com"):
+        iq = client(url=url)
+        context = iq._core.connector._ssl()  # pyright: ignore[reportPrivateUsage]
+        subjects = [dict(field[0] for field in cert["subject"]) for cert in context.get_ca_certs()]  # type: ignore[index]
+        assert {"commonName": "iq-stream internal test CA"} in subjects, f"{url}, trust_env={iq.trust_env}"
 
 
 def test_a_unix_socket_url_needs_a_public_url_for_tickets() -> None:

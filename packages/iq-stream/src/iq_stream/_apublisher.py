@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from time import monotonic
 from types import TracebackType
@@ -16,7 +17,7 @@ from ._frame import frame_size
 from ._protocol import Outcome, check_outcome, check_seconds
 from ._publisher import ANSWER_POLL
 from ._transport import Watch
-from ._writer import OUT_OF_BAND, Command, Idle, Pause, Stream, Writer, adrive
+from ._writer import OUT_OF_BAND, Command, Idle, Pause, Stream, Writer, adrive, drive
 
 # The loop keeps only weak references to tasks: a writer must not be collected while it holds a stream open.
 _tasks: set[asyncio.Task[object]] = set()
@@ -46,7 +47,11 @@ class AsyncPublisher:
         self._stream_id = stream_id
         self._settings = core.settings
         self._transport = core.async_transport()
+        self._sync_transport = core.sync_transport
         self._mint = core.mint
+        self._orphan_lock = threading.Lock()
+        self._orphaned_at_all = False
+        self._orphan_done = threading.Event()
         self._wakeup = asyncio.Event()
         self._stopped = asyncio.Event()
         self._done = asyncio.Event()
@@ -108,6 +113,8 @@ class AsyncPublisher:
         Raises ``FrameTooLarge`` for a line over ``max_frame_bytes`` and ``ValueError`` for data that is not a
         string or an invalid event name. With ``on_error="raise"``, raises the error the publisher gave up on.
         """
+        if self._loop.is_closed():
+            self._orphaned()
         return self._writer.send(data, event)
 
     async def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
@@ -116,18 +123,25 @@ class AsyncPublisher:
         result. Cancelling the caller does not stop the close."""
         outcome = check_outcome(outcome)
         timeout = check_seconds("timeout", timeout)
-        if self._closer is None:
-            deadline = self._writer.request_close(outcome) + timeout
-            self._closer = self._loop.create_task(self._closing(deadline))
-            _keep(self._closer)  # pyright: ignore[reportArgumentType]
-        result = await asyncio.shield(self._closer)
+        if self._loop.is_closed():
+            # Closed by its loop's owner without asyncio.run()'s teardown: its writer will never run again.
+            self._orphaned()
+            await asyncio.to_thread(self._orphan_done.wait, OUT_OF_BAND + 1.0)
+            result = self._writer.settled_result()
+        else:
+            if self._closer is None:
+                deadline = self._writer.request_close(outcome) + timeout
+                self._closer = self._loop.create_task(self._closing(deadline))
+                _keep(self._closer)  # pyright: ignore[reportArgumentType]
+            result = await asyncio.shield(self._closer)
         error = self._writer.error
         if error is not None and self._settings.raise_errors:
             raise error.with_traceback(None)
         return result
 
     def abort(self) -> None:
-        """Drops the connection without closing the stream, for a process that hands the stream to another."""
+        """Drops the connection and leaves the stream open, without a close line: it ends with the server's idle
+        timeout, or with ``IQClient.close_stream()`` from another process."""
         self._writer.abort()
 
     async def __aenter__(self) -> AsyncPublisher:
@@ -147,12 +161,50 @@ class AsyncPublisher:
         return f"<AsyncPublisher {self._stream_id} alive={self.alive} frames_sent={self.frames_sent}>"
 
     def _on_loop(self, callback: Callable[[], object]) -> None:
-        if threading.get_ident() == self._loop_thread:
-            callback()
+        if self._loop.is_closed():
+            self._orphaned()
             return
-        # A closed loop raises RuntimeError: nothing waits on it any more.
+        # A loop closed meanwhile raises RuntimeError: nothing waits on it any more.
         with contextlib.suppress(RuntimeError):
-            self._loop.call_soon_threadsafe(callback)
+            if threading.get_ident() == self._loop_thread:
+                callback()
+            else:
+                self._loop.call_soon_threadsafe(callback)
+
+    def _orphaned(self) -> None:
+        """The loop was closed under a writer that had not finished, so nothing will run it again: the publisher goes
+        inert, and a thread of its own closes the stream out of band over the synchronous transport."""
+        with self._orphan_lock:
+            if self._orphaned_at_all:
+                return
+            self._orphaned_at_all = True
+        self._writer.cancelled()
+        thread = threading.Thread(target=self._finish_without_loop, name=f"iq-stream {self._stream_id}", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            # At the interpreter's shutdown no thread starts, and the stream ends with the server's idle timeout.
+            self._orphan_done.set()
+
+    def _finish_without_loop(self) -> None:
+        transport = self._sync_transport()
+
+        def carry_out(command: Command) -> Answer:
+            if isinstance(command, Pause):
+                time.sleep(command.seconds)
+                return NO_ANSWER
+            if isinstance(command, Stream):
+                return NO_ANSWER
+            token = self._mint("pub", self._stream_id, PUB_TOKEN_TTL)
+            return transport.post(self._stream_id, token, command.body, command.timeout, Watch())
+
+        try:
+            drive(self._writer.finish(), carry_out)
+        except Exception:
+            pass
+        finally:
+            self._writer.settled_result()
+            self._orphan_done.set()
 
     def _wake(self) -> None:
         self._on_loop(self._wakeup.set)
@@ -243,16 +295,11 @@ class AsyncPublisher:
         self._wakeup.clear()
 
     async def _body(self, watch: Watch) -> AsyncIterator[bytes]:
-        program = self._writer.body()
+        program = self._writer.body(watch.answered)
         try:
             for command in program:
                 if isinstance(command, Idle):
                     await self._idle(min(command.seconds, ANSWER_POLL))
-                    if watch.answered():
-                        return
-                elif watch.answered():
-                    # Once the server has answered it reads nothing more: what was taken is resent from the ring.
-                    return
                 else:
                     yield command.data
         finally:

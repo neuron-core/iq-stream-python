@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -26,16 +27,33 @@ _open_lock = threading.Lock()
 _hooked = False
 
 
-def close_open_publishers() -> None:
+def _forget_the_parents_publishers() -> None:
+    # A forked child has none of the parent's writer threads, and the connections are the parent's: the child's exit
+    # leaves the parent's publishers alone. The lock may have been held by one of the parent's threads at the fork.
+    global _open_lock
+    _open_lock = threading.Lock()
+    _open.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_the_parents_publishers)
+
+
+def close_open_publishers(timeout: float = 10.0) -> None:
     """The ``atexit`` hook: a daemon thread dies with the interpreter, so every publisher still open is closed
-    with ``fail`` first."""
+    with ``fail`` first. They are closed side by side: exit takes one ``timeout`` and one out-of-band close, however
+    many there are."""
     with _open_lock:
         publishers = list(_open)
-    for publisher in publishers:
-        publisher._begin_close("fail")  # pyright: ignore[reportPrivateUsage]
-    for publisher in publishers:
-        with contextlib.suppress(Exception):
-            publisher.close("fail")
+    deadlines = [publisher._begin_close("fail", timeout) for publisher in publishers]  # pyright: ignore[reportPrivateUsage]
+    for publisher, deadline in zip(publishers, deadlines, strict=True):
+        publisher._done.wait(max(0.0, deadline - monotonic()))  # pyright: ignore[reportPrivateUsage]
+    late = [publisher for publisher in publishers if not publisher._done.is_set()]  # pyright: ignore[reportPrivateUsage]
+    for publisher in late:
+        publisher._time_out()  # pyright: ignore[reportPrivateUsage]
+    deadline = monotonic() + OUT_OF_BAND + 1.0
+    for publisher in late:
+        publisher._done.wait(max(0.0, deadline - monotonic()))  # pyright: ignore[reportPrivateUsage]
 
 
 class Publisher:
@@ -123,12 +141,10 @@ class Publisher:
         ``min_open`` old; ``timeout`` counts from then. The first outcome wins, and every call returns the same
         result."""
         deadline = self._begin_close(check_outcome(outcome), check_seconds("timeout", timeout))
-        if not self._done.wait(max(0.0, deadline - monotonic())):
-            self._writer.give_up(
-                refusal(self._stream_id, "the close was not answered in time", NO_ANSWER, "close_timeout"),
-                None,
-                close_it=True,
-            )
+        # On the writer's thread, from the error handler, the result is known already, and only this thread could
+        # settle one: waiting would wait for itself.
+        if threading.current_thread() is not self._thread and not self._done.wait(max(0.0, deadline - monotonic())):
+            self._time_out()
             self._done.wait(OUT_OF_BAND + 1.0)
         result = self._writer.settled_result()
         error = self._writer.error
@@ -137,7 +153,8 @@ class Publisher:
         return result
 
     def abort(self) -> None:
-        """Drops the connection without closing the stream, for a process that hands the stream to another."""
+        """Drops the connection and leaves the stream open, without a close line: it ends with the server's idle
+        timeout, or with ``IQClient.close_stream()`` from another process."""
         self._writer.abort()
 
     def __enter__(self) -> Publisher:
@@ -159,6 +176,13 @@ class Publisher:
             if self._close_deadline is None:
                 self._close_deadline = self._writer.request_close(outcome) + timeout
             return self._close_deadline
+
+    def _time_out(self) -> None:
+        self._writer.give_up(
+            refusal(self._stream_id, "the close was not answered in time", NO_ANSWER, "close_timeout"),
+            None,
+            close_it=True,
+        )
 
     def __repr__(self) -> str:
         return f"<Publisher {self._stream_id} alive={self.alive} frames_sent={self.frames_sent}>"
@@ -217,17 +241,12 @@ class Publisher:
                     self._watch = None
 
     def _body(self, watch: Watch) -> Iterator[bytes]:
-        program = self._writer.body()
+        program = self._writer.body(watch.answered)
         try:
             for command in program:
                 if isinstance(command, Idle):
                     self._wakeup.wait(min(command.seconds, ANSWER_POLL))
                     self._wakeup.clear()
-                    if watch.answered():
-                        return
-                elif watch.answered():
-                    # Once the server has answered it reads nothing more: what was taken is resent from the ring.
-                    return
                 else:
                     yield command.data
         finally:

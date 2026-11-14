@@ -11,7 +11,7 @@ from collections.abc import Callable
 import pytest
 from fakes import SECRET, STREAM, Harness, Pending, answer, closed_fail, open_, until
 
-from iq_stream import FrameTooLarge, IQError, PublishResult
+from iq_stream import FrameTooLarge, IQError, Publisher, PublishResult
 
 Setup = Callable[..., Harness]
 
@@ -154,6 +154,25 @@ async def test_nothing_is_written_into_a_request_the_server_has_answered(setup: 
     assert second.data == ["b", "c"]
     second.respond(200, lastEventId=3, closed=True, outcome="end")
     await h.close(pub)
+
+
+async def test_frames_queued_during_a_write_the_server_answered_go_into_the_next_request(setup: Setup) -> None:
+    h = setup(replay_frames=4)
+    pub = h.publisher()
+    first = await h.request(0)
+    first.stalled = True  # the write of "a" does not complete yet
+    pub.send("a")
+    await until(lambda: first.data == ["a"])
+    for i in range(10):  # more than the replay ring holds
+        pub.send(f"b{i}")
+    first.respond(408, lastEventId=1, closed=False, error="read_timeout")
+    second = await h.request(1)
+    await until(lambda: len(second.data) == 10)
+    assert first.data == ["a"]
+    assert second.data == [f"b{i}" for i in range(10)], "still in hand: neither lost nor taken for a gap"
+    second.respond(200, lastEventId=11, closed=True, outcome="end")
+    assert (await h.close(pub)).last_event_id == 11
+    assert h.errors == []
 
 
 async def test_a_close_line_lost_with_its_request_is_sent_again(setup: Setup) -> None:
@@ -462,8 +481,9 @@ async def test_the_replay_ring_is_bounded_by_bytes_too(setup: Setup) -> None:
     assert [data[0] for data in second.data] == ["3", "4"]
     second.respond(408, lastEventId=1, closed=False, error="read_timeout")
     await until(lambda: not pub.alive)
-    assert h.errors[0].code == "gap"
+    assert pub.error.code == "gap"
     await h.close(pub)
+    assert [error.code for error in h.errors] == ["gap"]
 
 
 async def test_a_restarted_server_reports_fewer_frames_than_the_ring_can_bridge(setup: Setup) -> None:
@@ -598,6 +618,38 @@ async def test_fail_open_without_a_handler_logs_one_warning_with_nothing_sensiti
     assert "403" in message
     for secret in ("private-data", SECRET, request.token):
         assert secret not in message
+
+
+async def test_the_error_handler_runs_once_subscribers_were_told_and_may_call_close(kind: str) -> None:
+    calls: list[object] = []
+    publishers: list[Publisher] = []
+
+    def handler(error: IQError) -> None:
+        calls.append((error.code, list(h.transport.closes)))
+        if publishers:  # the synchronous publisher's handler runs on its writer's thread
+            started = time.monotonic()
+            closed = publishers[0].close("fail", timeout=0.5)
+            calls.append((time.monotonic() - started, closed))
+
+    h = Harness(kind, error_handler=handler)
+    h.transport.on_post = lambda body, n: closed_fail(1)
+    pub = h.publisher()
+    if kind == "sync":
+        publishers.append(pub)
+    pub.send("ok")
+    pub.send("refused")
+    request = await h.request(0)
+    await until(lambda: len(request.data) == 2)
+    request.respond(413, lastEventId=1, closed=False, error="frame_too_large", line=2)
+    outcome = await h.close(pub)
+    assert outcome == result(
+        413, last_event_id=1, closed=True, outcome="fail", reason="publisher", error="frame_too_large"
+    )
+    assert calls[0] == ("frame_too_large", ["fail"]), "the stream was closed out of band before the handler ran"
+    if kind == "sync":
+        elapsed, closed = calls[1]  # type: ignore[misc]
+        assert elapsed < 0.3, f"close() from the handler waited {elapsed:.1f}s"
+        assert closed == outcome
 
 
 async def test_a_handler_that_raises_does_not_break_the_run(kind: str) -> None:
@@ -817,9 +869,10 @@ async def test_the_queue_bound_counts_what_waits_during_a_recovery_and_lets_go_o
     request.respond(0)
     await until(lambda: h.transport.probes == 1)
     assert [pub.send(data) for _ in range(4)] == [True, True, True, False]
-    assert h.errors[0].code == "queue_full"
+    assert pub.error.code == "queue_full"
     probe.resolve(open_(10))
     assert (await h.close(pub)).error == "queue_full"
+    assert [error.code for error in h.errors] == ["queue_full"]
     assert len(h.transport.requests) == 1
 
 

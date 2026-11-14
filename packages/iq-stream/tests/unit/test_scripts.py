@@ -1,16 +1,20 @@
-"""The repository's scripts/servers.py starts the short server with its own copy of SHORT_SETTINGS, since it runs
-before any package is installed. The two must not drift apart."""
+"""The repository around the package: scripts/servers.py starts the short server with its own copy of
+SHORT_SETTINGS, since it runs before any package is installed, and the two must not drift apart; and the test suite
+is laid out so that pytest collects all of it in one run."""
 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from iq_stream.testing import SHORT_SETTINGS
 
-SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "servers.py"
+PACKAGE = Path(__file__).resolve().parents[2]
+SCRIPT = PACKAGE.parents[1] / "scripts" / "servers.py"
 
 
 @pytest.mark.skipif(not SCRIPT.exists(), reason="not in a checkout of the repository")
@@ -20,3 +24,17 @@ def test_scripts_servers_py_starts_the_short_server_with_the_kits_short_settings
     script = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(script)
     assert dict(SHORT_SETTINGS) == script.SHORT_SETTINGS
+
+
+def test_the_whole_suite_collects_in_one_run() -> None:
+    # pytest refuses pytest_plugins in a conftest it does not load at startup: `pytest tests` and an IDE's run of
+    # the whole suite would stop at collection.
+    process = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "tests"],
+        cwd=PACKAGE,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert "tests/integration/test_scenarios.py" in process.stdout

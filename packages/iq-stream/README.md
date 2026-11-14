@@ -78,7 +78,7 @@ What the publisher does for you:
 - **A lost request is continued.** After a `408`, a `503` or a dropped connection it asks the server how many frames it holds and resends exactly the missing ones. If the gap cannot be bridged, as after a server restart, it closes the stream with `fail` and stops, so that no browser gets an answer with a hole in it.
 - **Publishing never breaks the run.** By default an error on the way to the server is reported once, the publisher goes inert, and `send()` returns `False`. Your agent finishes and saves its answer.
 - **A quick answer is not lost.** The close line is held back until the stream is three seconds old (`min_open`), so a browser that subscribes just after a short answer still receives it. Frames are never delayed.
-- **A cancelled run is closed.** The async close is shielded from cancellation, so a cancelled task still sends `fail` and its browser hears of it at once. Synchronous publishers still open when the interpreter exits are closed with `fail` by an `atexit` hook.
+- **A cancelled run is closed.** The async close is shielded from cancellation, so a cancelled task still sends `fail` and its browser hears of it at once. A writer task cancelled while an `end` waits (its loop shutting down) sends that `end` only if the server holds every frame, and `fail` otherwise. Synchronous publishers still open when the interpreter exits are closed with `fail` by an `atexit` hook.
 
 ## Handing the stream to the browser
 
@@ -152,10 +152,12 @@ The client holds no connection and no thread until a publisher or a request need
 | --- | --- |
 | `send(data, event=None) -> bool` | Queues one frame and returns whether the publisher is alive. `data` is a string, usually JSON; `event` an optional SSE event name. Raises `FrameTooLarge` for a line over `max_frame_bytes` and `ValueError` for data that is not a string or an invalid event name. Never waits for the network. |
 | `close(outcome="end", timeout=10.0) -> PublishResult` | Sends the close line and returns the server's answer; awaited, and shielded from cancellation, in `AsyncPublisher`. The first outcome wins and every call returns the same result. `timeout` counts from the moment the close line may go out. |
-| `abort()` | Drops the connection and leaves the stream open, for a process that hands the stream to another. |
+| `abort()` | Drops the connection and leaves the stream open, without a close line: it ends with the server's idle timeout, or with `close_stream()` from another process. |
 | `with` / `async with` | Closes with `end` on a normal exit, and with `fail` on an exception, a `KeyboardInterrupt` or a cancellation, which then goes on. |
 | `frame_size(data, event=None)`, `max_frame_bytes` | The size a frame would have on the wire, envelope and escapes included, and the limit it must fit. |
 | `frames_sent`, `bytes_sent`, `alive`, `error`, `requests`, `stream_id` | What was queued, whether the publisher gave up and why, and how many requests the stream took. |
+
+Code that takes a publisher types it with `PublisherLike` or `AsyncPublisherLike`, protocols of this surface that the real publishers and the testing kit's recorders all fit.
 
 A synchronous `Publisher` may be created, used and closed inside a running event loop: `send()` only touches a thread-safe queue. Its `close()` waits for the server, so async code calls it through `asyncio.to_thread`, and it may be called from any thread. `send()` may be called from any number of threads; frames go out in the order the calls returned. `AsyncPublisher.send()` belongs to its loop's thread: a framework that emits from worker threads takes the synchronous publisher.
 
@@ -175,7 +177,7 @@ A synchronous `Publisher` may be created, used and closed inside a running event
 | `takeover_budget` | `65.0` | Seconds spent waiting for the server to let go of a lost request of ours (`409 publisher_active`), which it does after its read timeout. |
 | `replay_frames`, `replay_bytes` | `512`, 4 MiB | What is kept to resend after a lost request. |
 | `queue_bytes` | 8 MiB | Bytes that may wait for the server before the stream is given up. |
-| `trust_env` | auto | Whether httpx reads proxy settings from the environment. Off for loopback and private addresses and single-label host names, since a proxy would buffer the request body; `IQ_STREAM_TRUST_ENV=1` turns it on, `=0` off. |
+| `trust_env` | auto | Whether httpx reads proxy settings from the environment. Off for loopback and private addresses and single-label host names, since a proxy would buffer the request body; `IQ_STREAM_TRUST_ENV=1` turns it on, `=0` off. The CA bundle that `SSL_CERT_FILE` or `SSL_CERT_DIR` names is used either way. |
 | `verify` | `True` | TLS verification, or an `ssl.SSLContext`. |
 
 `url` may be `http://`, `https://` (with a path prefix if the server sits behind one), or `http+unix:///path/to/iq.sock` for a server started with `SOCKET=`. Durations are seconds.
@@ -184,7 +186,7 @@ A synchronous `Publisher` may be created, used and closed inside a running event
 
 Every error is an `IQError` with `stream_id`, `status` (the HTTP status, when there was an answer) and `code` (the server's error code or the publisher's own), and a message that never carries a token, the secret or frame data. Configuration mistakes raise `IQError` from the constructor.
 
-Publishing fails open. A publisher that gives up, on a refusal or after its retries, closes the stream with `fail` when the server still holds it, reports the error once, and goes inert: `send()` returns `False`, `alive` is `False` and `error` says why. An adapter reads `alive` to stop encoding frames nobody will receive, while it goes on draining the framework's stream so that the run and its persistence complete.
+Publishing fails open. A publisher that gives up, on a refusal or after its retries, goes inert at once: `send()` returns `False`, `alive` is `False` and `error` says why. It closes the stream with `fail` when the server still holds it, and then reports the error once: `error_handler` runs on the writer's thread (or in its task) after subscribers were told, so a handler that takes its time holds nothing up, and one that calls `close()` gets the result at once. An adapter reads `alive` to stop encoding frames nobody will receive, while it goes on draining the framework's stream so that the run and its persistence complete.
 
 `FrameTooLarge` (an `IQError` with `size` and `limit`) is raised by `send()` itself, at once, because the caller is the one who knows what to send instead. The publisher does not split frames, since only the protocol knows how a client puts them back together:
 
@@ -213,20 +215,22 @@ with iq.publisher(iq.new_stream_id()) as publisher:
 - A connection that stalls without being reset is noticed when the queue of unsent frames reaches `queue_bytes`, or when `close()` times out.
 - The writer of a synchronous publisher is a daemon thread: call `close()` (or use the `with` block) before the process exits. The `atexit` hook closes what is left with `fail`; a process killed outright closes nothing, and its subscribers get `iq:fail` with `publisher_idle` after the idle timeout.
 - A stream belongs to the publisher that started it: another process cannot continue it after `abort()`.
+- An `AsyncPublisher` belongs to its event loop: close it before the loop closes. One left open on a loop closed without `asyncio.run()`'s teardown gives up with `cancelled` at its next call and closes the stream with `fail` from a thread.
 
 ## Testing your own code
 
 `iq_stream.testing` ships with the package and needs nothing beyond the standard library and httpx.
 
-`RecordingPublisher` has the publisher's surface in memory, for unit tests without a network. It validates frames as the real one does, records them (`frames`, `data`) from any number of threads in the order the calls returned, records the close `outcome` (the first one wins), works as a sync and as an async context manager, and its `close()` can be called or awaited, so it stands in for both publishers. `fail()` makes it give up as the real one does after a fatal answer; with `on_error="raise"` it then raises.
+`RecordingPublisher` has `Publisher`'s surface in memory, for unit tests without a network. It validates frames as the real one does, records them (`frames`, `data`) from any number of threads in the order the calls returned, and records the close `outcome` (the first one wins). `fail()` makes it give up as the real one does after a fatal answer; with `on_error="raise"` it then raises. `AsyncRecordingPublisher` is the same for `AsyncPublisher`: an `async with` block, and a `close()` that is a coroutine and records the outcome only once awaited, so a test shows a close that was never awaited. Both fit `PublisherLike` and `AsyncPublisherLike`, the types an adapter gives its publisher parameters.
 
 ```python
 import json
 
+from iq_stream import PublisherLike
 from iq_stream.testing import RecordingPublisher
 
 
-def publish_run(publisher, chunks):  # the adapter under test
+def publish_run(publisher: PublisherLike, chunks: list[dict[str, str]]) -> None:  # the adapter under test
     with publisher:
         for chunk in chunks:
             if not publisher.send(json.dumps(chunk)):
@@ -247,7 +251,7 @@ def test_publishing_fails_open() -> None:
     assert publisher.data == []
 ```
 
-For integration tests, the kit finds two IQ-Stream servers: one with default settings and one with short timeouts and small limits (`SHORT_SETTINGS`). Each is the one `IQ_STREAM_TEST_URL` or `IQ_STREAM_TEST_SHORT_URL` names, else the one answering on `http://127.0.0.1:8080` or `:8081`, else a container started from `IQ_STREAM_TEST_IMAGE` (default `ghcr.io/neuron-core/iq-stream:1`). The pytest fixtures come from a plugin that a suite opts into in its `conftest.py`:
+For integration tests, the kit finds two IQ-Stream servers: one with default settings and one with short timeouts and small limits (`SHORT_SETTINGS`). Each is the one `IQ_STREAM_TEST_URL` or `IQ_STREAM_TEST_SHORT_URL` names, else the one answering on `http://127.0.0.1:8080` or `:8081`, else a container started from `IQ_STREAM_TEST_IMAGE` (default `ghcr.io/neuron-core/iq-stream:1`). The pytest fixtures come from a plugin that a suite opts into in its top-level `conftest.py`, `tests/conftest.py` (pytest refuses `pytest_plugins` in `tests/integration/conftest.py` as soon as it collects all of `tests`):
 
 ```python
 # conftest.py

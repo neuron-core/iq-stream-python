@@ -121,9 +121,9 @@ async def test_a_server_that_restarts_mid_stream_ends_the_publisher_with_fail_an
     await until(lambda: not pub.alive, "the publisher to give up", 12)
     assert pub.send("f7") is False
     assert pub.error.code == "gap"
-    assert run.errors == [pub.error]
     outcome = await run.close(pub, "end")
     assert (outcome.outcome, outcome.closed) == ("fail", True)
+    assert run.errors == [pub.error]
 
     old = await before
     assert old.data == ["f1", "f2", "f3", "f4", "f5"]
@@ -190,6 +190,58 @@ async def test_a_process_that_exits_with_a_publisher_open_closes_it_with_fail(
     received = await subscription
     assert received.data == ["a", "b"]
     assert received.terminal == Terminal("iq:fail", {"reason": "publisher", "lastEventId": 2}), "not publisher_idle"
+
+
+LOOP_SHUTDOWN = """
+import asyncio, sys
+from iq_stream import IQClient
+
+async def main():
+    pub = IQClient(min_open=float(sys.argv[2])).apublisher(sys.argv[1])
+    await asyncio.sleep(0)  # the writer has started, and is still connecting
+    for i in range(3):
+        pub.send(f"f{i}")
+    await asyncio.sleep(float(sys.argv[3]))
+    asyncio.get_running_loop().create_task(pub.close("end"))
+    await asyncio.sleep(0)
+    # main returns while the close waits: asyncio.run() cancels the tasks left, the writer's among them
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.parametrize(
+    ("min_open", "wait", "terminal"),
+    [
+        (0.0, 0.0, Terminal("iq:fail", {"reason": "publisher", "lastEventId": 0})),
+        (5.0, 1.0, Terminal("iq:end", {"lastEventId": 3})),
+    ],
+    ids=["frames-still-queued", "frames-delivered"],
+)
+async def test_a_loop_that_shuts_down_while_close_end_waits_ends_the_stream_with_end_only_if_nothing_is_missing(
+    iq_client: IQClient, iq_servers: TestServers, min_open: float, wait: float, terminal: Terminal
+) -> None:
+    stream_id = iq_client.new_stream_id()
+    subscription = await asyncio.to_thread(
+        subscribe_in_background, iq_servers.default.url, stream_id, iq_client.token("sub", stream_id), timeout=15
+    )
+    env = {
+        **os.environ,
+        "IQ_STREAM_URL": iq_servers.default.url,
+        "IQ_STREAM_APP_KEY": iq_servers.app_key,
+        "IQ_STREAM_APP_SECRET": iq_servers.app_secret,
+    }
+    process = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", LOOP_SHUTDOWN, stream_id, str(min_open), str(wait)],
+        env=env,
+        timeout=15,
+        capture_output=True,
+    )
+    assert process.returncode == 0, process.stderr
+    received = await subscription
+    assert received.terminal == terminal, "never `end` on an answer with a hole in it"
+    assert received.data == ["f0", "f1", "f2"][: terminal.data["lastEventId"]]
 
 
 async def test_a_cancelled_task_closes_its_async_publisher_with_fail_at_once(

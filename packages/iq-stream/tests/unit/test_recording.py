@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import threading
 
 import pytest
 
-from iq_stream import FrameTooLarge, IQError, PublishResult
-from iq_stream.testing import RecordedFrame, RecordingPublisher
+from iq_stream import (
+    AsyncPublisher,
+    AsyncPublisherLike,
+    FrameTooLarge,
+    IQError,
+    Publisher,
+    PublisherLike,
+    PublishResult,
+)
+from iq_stream.testing import AsyncRecordingPublisher, RecordedFrame, RecordingPublisher
 
 
 def test_it_records_frames_and_the_first_close() -> None:
@@ -82,16 +92,60 @@ def test_it_is_a_sync_context_manager() -> None:
     assert failing.outcome == "fail"
 
 
-async def test_it_is_an_async_context_manager_and_close_can_be_awaited() -> None:
-    async with RecordingPublisher() as pub:
+def test_the_synchronous_recorder_is_what_publisher_is_and_no_more() -> None:
+    pub = RecordingPublisher()
+    assert not hasattr(pub, "__aenter__"), "async code takes AsyncRecordingPublisher, as it takes AsyncPublisher"
+    assert not inspect.isawaitable(pub.close())
+
+
+async def test_the_asynchronous_recorder_is_an_async_context_manager_and_close_is_awaited() -> None:
+    async with AsyncRecordingPublisher() as pub:
         pub.send("a")
     assert pub.outcome == "end"
-    other = RecordingPublisher()
+    other = AsyncRecordingPublisher()
     other.send("a")
     assert await other.close("fail") == PublishResult(
         200, last_event_id=1, closed=True, outcome="fail", reason="publisher"
     )
     with pytest.raises(KeyError):
-        async with RecordingPublisher() as failing:
+        async with AsyncRecordingPublisher() as failing:
             raise KeyError
     assert failing.outcome == "fail"
+    assert not hasattr(failing, "__enter__")
+
+
+async def test_a_close_that_is_never_awaited_records_nothing_as_with_the_real_publisher() -> None:
+    pub = AsyncRecordingPublisher()
+    pub.send("a")
+    closing = pub.close()  # the adapter forgot the await
+    assert (pub.outcome, pub.alive, pub.close_calls) == (None, True, 0)
+    closing.close()  # the coroutine is dropped without the RuntimeWarning of a garbage-collected one
+
+
+async def test_the_asynchronous_recorders_close_can_be_scheduled_as_a_task() -> None:
+    pub = AsyncRecordingPublisher()
+    assert inspect.iscoroutinefunction(pub.close)
+    result = await asyncio.create_task(pub.close("fail"))
+    assert (result.outcome, pub.outcome) == ("fail", "fail")
+
+
+def _publish_sync(publisher: PublisherLike) -> PublishResult:
+    with publisher:
+        publisher.send("a")
+    return publisher.close()
+
+
+async def _publish_async(publisher: AsyncPublisherLike) -> PublishResult:
+    async with publisher:
+        publisher.send("a")
+    return await publisher.close()
+
+
+async def test_the_recorders_fit_the_protocols_an_adapter_types_its_publisher_with() -> None:
+    sync_recorder: PublisherLike = RecordingPublisher()
+    async_recorder: AsyncPublisherLike = AsyncRecordingPublisher()
+    assert (await asyncio.to_thread(_publish_sync, sync_recorder)).outcome == "end"
+    assert (await _publish_async(async_recorder)).outcome == "end"
+    # The real publishers fit them too (the type checker says so): a function typed with one takes either.
+    real: tuple[type[PublisherLike], type[AsyncPublisherLike]] = (Publisher, AsyncPublisher)
+    assert real == (Publisher, AsyncPublisher)

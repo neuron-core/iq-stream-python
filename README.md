@@ -45,13 +45,13 @@ python3 scripts/servers.py start           # in Docker, from IQ_STREAM_TEST_IMAG
 python3 scripts/servers.py stop
 ```
 
-The tests find servers by themselves: the ones `IQ_STREAM_TEST_URL` and `IQ_STREAM_TEST_SHORT_URL` name, else those answering on the two ports, else containers they start and remove. `IQ_STREAM_TEST_APP_KEY` and `IQ_STREAM_TEST_APP_SECRET` override the credentials (`demo-app`, `test-app-secret-0123456789abcdef0123`). The tests that kill or restart a server start a container of their own on a free port. An adapter's suite gets the same servers through the core's pytest plugin (`pytest_plugins = ["iq_stream.testing.pytest_plugin"]`); see the core's README.
+The tests find servers by themselves: the ones `IQ_STREAM_TEST_URL` and `IQ_STREAM_TEST_SHORT_URL` name, else those answering on the two ports, else containers they start and remove. `IQ_STREAM_TEST_APP_KEY` and `IQ_STREAM_TEST_APP_SECRET` override the credentials (`demo-app`, `test-app-secret-0123456789abcdef0123`). The tests that kill or restart a server start a container of their own on a free port. An adapter's suite gets the same servers through the core's pytest plugin (`pytest_plugins = ["iq_stream.testing.pytest_plugin"]` in its `tests/conftest.py`); see the core's README.
 
 CI (`.github/workflows/ci.yml`) runs, for every `packages/*/pyproject.toml`, lint, types, unit tests and the build on each Python its classifiers name, and the integration tests on the lowest and the highest; `scripts/ci_matrix.py` reads the list. CI pulls the server image with the workflow's own token, so the package on GitHub must give this repository read access (its settings, "Manage Actions access"), or be public.
 
 ### Adding an adapter
 
-1. `packages/<name>/` with `pyproject.toml` (hatchling, the classifiers of the Pythons it supports, `iq-stream>=0.1.0,<0.2`, the `tool.uv.sources` entry above), `README.md`, a copy of `LICENSE`, `src/<import path>/py.typed`, `tests/unit/` and `tests/integration/`, then `uv lock`.
+1. `packages/<name>/` with `pyproject.toml` (hatchling, the classifiers of the Pythons it supports, `iq-stream>=0.1.0,<0.2`, the `tool.uv.sources` entry above), `README.md`, a copy of `LICENSE`, `src/<import path>/py.typed`, `tests/conftest.py` with the core's pytest plugin, `tests/unit/` and `tests/integration/` (test files with names of their own: the two directories share one import path), then `uv lock`.
 2. Its entry in `.github/dependabot.yml`, and its row in the table above.
 
 CI and releases pick it up from its directory.
@@ -61,12 +61,14 @@ CI and releases pick it up from its directory.
 Each package is released by itself, from GitHub Actions (`.github/workflows/release.yml`), when a tag `<package>@<version>` is pushed:
 
 ```sh
-# set version = "0.1.1" in packages/iq-stream/pyproject.toml, then:
-(cd packages/iq-stream && uv lock)
+# set version = "0.1.1" in packages/iq-stream/pyproject.toml, then relock every package:
+for package in packages/*/; do (cd "$package" && uv lock); done
 git commit -am "iq-stream 0.1.1"
 git tag iq-stream@0.1.1
 git push origin main iq-stream@0.1.1
 ```
+
+Every package, not only the one released: an adapter's `uv.lock` records the version of the core it takes from `../iq-stream`, and CI, which the release runs first, syncs each package with `--locked`.
 
 The workflow checks the tag against the package's `pyproject.toml`, runs the whole of CI, builds with `uv build`, and publishes to PyPI by trusted publishing, with attestations. A pre-release version in PEP 440's terms (`0.2.0b1`, `0.2.0rc1`) is published as such: pip installs it only when asked for it. When an adapter needs a newer core, release the core first and raise the adapter's range.
 

@@ -5,8 +5,6 @@ from helpers import Run
 
 from iq_stream.testing import TestServers
 
-pytest_plugins = ["iq_stream.testing.pytest_plugin"]
-
 
 @pytest.fixture(params=["sync", "async"])
 def kind(request: pytest.FixtureRequest) -> str:

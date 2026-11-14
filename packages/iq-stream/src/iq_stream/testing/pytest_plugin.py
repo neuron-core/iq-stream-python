@@ -2,8 +2,10 @@
 
     pytest_plugins = ["iq_stream.testing.pytest_plugin"]
 
-in its ``conftest.py``. ``iq_servers`` finds (or starts) the servers once per session; ``iq_client`` and
-``iq_short_client`` are clients for each, with ``min_open=0`` so that tests do not wait for the close line.
+in its top-level ``conftest.py``, ``tests/conftest.py``: pytest refuses ``pytest_plugins`` in a conftest further
+down, such as ``tests/integration/conftest.py``, as soon as it collects more than that directory. ``iq_servers``
+finds (or starts) the servers once per session; ``iq_client`` and ``iq_short_client`` are clients for each, with
+``min_open=0`` so that tests do not wait for the close line.
 """
 
 from __future__ import annotations

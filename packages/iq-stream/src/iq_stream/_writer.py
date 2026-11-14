@@ -106,19 +106,24 @@ class Idle:
 BodyCommand = Write | Idle
 
 
-def close_stream_within(outcome: Outcome, retry: float, within: float = math.inf) -> Generator[Command, Answer, Answer]:
-    """A short request holding only a close line, retried while the server says "not now" and ``retry`` lasts.
-    ``retry`` bounds the retries only; ``within`` bounds the whole of it, the requests included."""
+def post_within(body: bytes, retry: float, within: float = math.inf) -> Generator[Command, Answer, Answer]:
+    """A short request, retried while the server says "not now" and ``retry`` lasts. ``retry`` bounds the retries
+    only; ``within`` bounds the whole of it, the requests included."""
     started = monotonic()
     deadline = started + within
     retry_until = min(started + retry, deadline)
     tries = 0
     while True:
-        answer = yield Post(close_line(outcome), max(0.001, min(POST_TIMEOUT, deadline - monotonic())))
+        answer = yield Post(body, max(0.001, min(POST_TIMEOUT, deadline - monotonic())))
         if not is_retryable(answer) or monotonic() + backoff(tries) >= retry_until:
             return answer
         yield Pause(backoff(tries), interruptible=False)
         tries += 1
+
+
+def close_stream_within(outcome: Outcome, retry: float, within: float = math.inf) -> Generator[Command, Answer, Answer]:
+    """A short request holding only a close line."""
+    return post_within(close_line(outcome), retry, within)
 
 
 T = TypeVar("T")
@@ -200,6 +205,9 @@ class Writer:
         self._stopped = False
         self._give_up: _GiveUp | None = None
         self.error: IQError | None = None
+        # The error is reported once the result is known, when subscribers have heard of the failure: a handler that
+        # takes its time, or calls close(), then holds nothing up.
+        self._unreported: IQError | None = None
         self.result: PublishResult | None = None
 
     @property
@@ -253,24 +261,23 @@ class Writer:
         self._settle(PublishResult(status=0, closed=False))
 
     def give_up(self, error: IQError, answer: Answer | None, close_it: bool) -> None:
-        """Fail open: the error is recorded and reported once, the publisher goes inert, and the run goes on.
-        With ``close_it`` the server may still hold the stream open, and ``finish()`` tells it that it failed, so
-        that subscribers get ``iq:fail`` now and not after the idle timeout."""
+        """Fail open: the error is recorded, the publisher goes inert, and the run goes on. With ``close_it`` the
+        server may still hold the stream open, and ``finish()`` tells it that it failed, so that subscribers get
+        ``iq:fail`` now and not after the idle timeout. The error is reported once, with the result."""
         with self._lock:
             if self._stopped:
                 return
             self._stopped = True
-            self.error = error
+            self.error = self._unreported = error
             result = to_result(answer) if answer is not None and answer.status != 0 else PublishResult(status=0)
             if error.code is not None:
                 result = replace(result, error=error.code)
             self._give_up = _GiveUp(result, close_it)
         self._stopping()
-        self._report(error)
 
     def cancelled(self) -> None:
         """The writer's task was cancelled, as at the shutdown of its event loop: the stream is closed out of band,
-        with the outcome already asked for, else with ``fail``."""
+        with the outcome already asked for (``end`` only if the server holds every frame), else with ``fail``."""
         with self._lock:
             if self._stopped:
                 return
@@ -364,7 +371,30 @@ class Writer:
             return
         result = pending.result
         if pending.close_it:
-            closed = yield from close_stream_within(pending.outcome, self.settings.retry_budget, OUT_OF_BAND)
+            deadline = monotonic() + OUT_OF_BAND
+            outcome = pending.outcome
+            closed: Answer | None = None
+            if outcome == "end":
+                # Only a cancellation leaves `end` to send here, and it may have cut the request short: the server
+                # alone knows whether it holds every frame, and an answer with a hole in it ends with `fail`.
+                probe = yield from post_within(b"", self.settings.retry_budget, OUT_OF_BAND)
+                if is_closed(probe.body):
+                    closed = probe
+                elif last_event_id(probe.body) != self.frames_sent:
+                    outcome = "fail"
+                    error = IQError(
+                        f"IQ stream {self.stream_id}: the publisher's task was cancelled before every frame reached "
+                        "the server (cancelled)",
+                        stream_id=self.stream_id,
+                        code="cancelled",
+                    )
+                    with self._lock:
+                        self.error = self._unreported = error
+                    result = replace(result, error=error.code)
+            if closed is None:
+                closed = yield from close_stream_within(
+                    outcome, self.settings.retry_budget, max(0.0, deadline - monotonic())
+                )
             if is_closed(closed.body):
                 # The result keeps the status and the code of what went wrong, and says how the stream ended.
                 said = to_result(closed)
@@ -379,9 +409,14 @@ class Writer:
                     result = replace(said, error=None if said.error == "stream_closed" else said.error)
         self._settle(result)
 
-    def body(self) -> Generator[BodyCommand, None, None]:
-        """One held request's body: pending resends, then the queue as it fills, keepalives, the close line."""
+    def body(self, answered: Callable[[], bool]) -> Generator[BodyCommand, None, None]:
+        """One held request's body: pending resends, then the queue as it fills, keepalives, the close line.
+
+        ``answered`` says whether the server has answered the request or dropped it. It is asked before anything is
+        taken from the queue: the server reads nothing more, and what is still queued goes into the next request."""
         keepalive = math.inf if self.settings.keepalive is None else self.settings.keepalive
+        if answered():
+            return
         with self._lock:
             resend, self._resend = self._resend, []
             self._in_flight = sum(len(line) for line in resend)
@@ -392,6 +427,8 @@ class Writer:
         while True:
             final = False
             wait = 0.0
+            if answered():
+                return
             with self._lock:
                 if self._stopped:
                     return
@@ -459,10 +496,15 @@ class Writer:
         )
 
     def _settle(self, result: PublishResult) -> None:
+        """Records the result, reports the error, then says that the result is known: whoever waits in ``close()``
+        returns with the error reported."""
         with self._lock:
             if self.result is not None:
                 return
             self.result = result
+            error, self._unreported = self._unreported, None
+        if error is not None:
+            self._report(error)
         self._settled()
 
     def _report(self, error: IQError) -> None:

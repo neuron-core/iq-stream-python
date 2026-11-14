@@ -1,12 +1,12 @@
-"""The conformance kit for the core and its adapters: a publisher that records in memory, real servers to publish
+"""The conformance kit for the core and its adapters: publishers that record in memory, real servers to publish
 to, and a subscriber that collects what a stream delivered. It needs nothing beyond the standard library and httpx;
 starting a server needs the Docker CLI.
 
 The pytest fixtures are in ``iq_stream.testing.pytest_plugin``, which a test suite opts into with
-``pytest_plugins = ["iq_stream.testing.pytest_plugin"]``.
+``pytest_plugins = ["iq_stream.testing.pytest_plugin"]`` in its top-level ``conftest.py`` (``tests/conftest.py``).
 """
 
-from ._recording import RecordedFrame, RecordedResult, RecordingPublisher
+from ._recording import AsyncRecordingPublisher, RecordedFrame, RecordingPublisher
 from ._servers import (
     SHORT_SETTINGS,
     ServerAddress,
@@ -29,9 +29,9 @@ from ._subscribe import (
 
 __all__ = [
     "SHORT_SETTINGS",
+    "AsyncRecordingPublisher",
     "BackgroundSubscription",
     "RecordedFrame",
-    "RecordedResult",
     "RecordingPublisher",
     "ServerAddress",
     "StartedServer",

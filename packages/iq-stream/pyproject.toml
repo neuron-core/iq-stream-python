@@ -35,10 +35,20 @@ Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-
 Issues = "https://github.com/neuron-core/iq-stream-python/issues"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff", "pyright"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+    "uvloop>=0.21 ; sys_platform != 'win32'",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iq_stream"]
+
+# The tests need the repository (its servers and scripts), and the lockfile is for development: neither ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/iq_stream", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

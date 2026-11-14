@@ -117,10 +117,10 @@ async def test_t4_a_line_over_the_servers_limit_is_answered_413_and_the_stream_i
     await until(lambda: not pub.alive, "the publisher to give up")
     assert pub.send("after") is False, "fail open: no exception"
     assert (pub.error.status, pub.error.code) == (413, "frame_too_large")
-    assert run.errors == [pub.error]
     assert await run.close(pub) == PublishResult(
         413, last_event_id=1, closed=True, outcome="fail", reason="publisher", error="frame_too_large"
     )
+    assert run.errors == [pub.error], "reported once the stream was closed out of band"
     received = await subscription
     assert received.data == ["ok"]
     assert received.terminal == Terminal("iq:fail", {"reason": "publisher", "lastEventId": 1})

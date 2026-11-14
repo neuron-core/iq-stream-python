@@ -4,7 +4,7 @@ httpx sends the whole body of a request before it reads the answer. Two things m
 ``trace`` extension hands over the connection's socket as it opens: the writer then looks at it before every
 write and while it waits, and stops the body as soon as the server has answered or dropped the connection (on
 plain connections; TLS records such as session tickets make a TLS socket readable without an answer). And
-``destroy()`` shuts that socket down from any thread, which ends a write the server stopped reading.
+``destroy()`` shuts that connection down from any thread, which ends a write the server stopped reading.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import ssl
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from importlib.metadata import PackageNotFoundError, version
-from typing import Protocol
+from typing import Protocol, cast
 
 import httpx
 
@@ -42,7 +42,14 @@ USER_AGENT = f"iq-stream-python/{_version()}"
 _LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=0)
 
 
-def _readable(sock: socket.socket) -> bool:
+class _Descriptor(Protocol):
+    """What a connection's socket has to offer whatever the event loop: asyncio's ``TransportSocket`` and uvloop's
+    ``PseudoSocket`` are not ``socket.socket``, and uvloop's refuses ``shutdown()``."""
+
+    def fileno(self) -> int: ...
+
+
+def _readable(sock: _Descriptor) -> bool:
     try:
         if hasattr(select, "poll"):
             poller = select.poll()
@@ -62,7 +69,7 @@ class Watch:
     def __init__(self, wake: Callable[[], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._wake = wake
-        self._sock: socket.socket | None = None
+        self._sock: _Descriptor | None = None
         self._tls = False
         self._settled = False
         self._destroyed = False
@@ -75,11 +82,11 @@ class Watch:
         get_extra_info = getattr(info.get("return_value"), "get_extra_info", None)
         if not callable(get_extra_info):
             return
-        sock = get_extra_info("socket")
-        if not isinstance(sock, socket.socket) and not callable(getattr(sock, "shutdown", None)):
+        sock: object = get_extra_info("socket")
+        if not callable(getattr(sock, "fileno", None)):
             return
         with self._lock:
-            self._sock = sock  # pyright: ignore[reportAttributeAccessIssue]
+            self._sock = cast(_Descriptor, sock)
             self._tls = self._tls or get_extra_info("ssl_object") is not None
             destroyed = self._destroyed
         if destroyed:
@@ -120,8 +127,21 @@ class Watch:
         sock = self._sock
         if sock is None:
             return
-        with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
+        # Dropping the connection is the last resort of abort(), a full queue and a close that timed out: whatever
+        # the socket is, it must not raise into them.
+        with contextlib.suppress(Exception):
+            if isinstance(sock, socket.socket):
+                # Not SSLSocket.shutdown(), which unwraps the socket before it shuts it down: a write in between, from
+                # the writer's thread, would go out unencrypted.
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+                return
+            try:
+                getattr(sock, "shutdown")(socket.SHUT_RDWR)  # noqa: B009 - asyncio's TransportSocket has it
+            except (AttributeError, TypeError):
+                # uvloop's refuses it. A duplicate of the descriptor shuts down the same connection, and the loop sees
+                # the connection end.
+                with socket.socket(fileno=os.dup(sock.fileno())) as duplicate:
+                    duplicate.shutdown(socket.SHUT_RDWR)
 
 
 class SyncTransport(Protocol):
@@ -169,9 +189,10 @@ class Connector:
         if isinstance(self._verify, ssl.SSLContext):
             return self._verify
         with self._lock:
-            # One context for every client of this IQClient: loading the CA bundle costs milliseconds.
+            # One context for every client of this IQClient: loading the CA bundle costs milliseconds. trust_env is
+            # about proxies: the CA bundle that SSL_CERT_FILE or SSL_CERT_DIR names counts on a private network too.
             if self._context is None:
-                self._context = httpx.create_ssl_context(verify=self._verify, trust_env=self.trust_env)
+                self._context = httpx.create_ssl_context(verify=self._verify, trust_env=True)
             return self._context
 
     def sync_client(self) -> httpx.Client:

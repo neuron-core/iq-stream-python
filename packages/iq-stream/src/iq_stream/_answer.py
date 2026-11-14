@@ -29,7 +29,7 @@ def parse_body(content: bytes) -> dict[str, object]:
     return value if isinstance(value, dict) else {}  # pyright: ignore[reportUnknownVariableType]
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class PublishResult:
     """The server's answer to a publish request, or what the publisher knows when it had none."""
 
@@ -43,16 +43,6 @@ class PublishResult:
     reason: str | None = None
     #: The server's error code, or the publisher's own, when the request was refused or the publisher gave up.
     error: str | None = None
-
-    def _fields(self) -> tuple[object, ...]:
-        return (self.status, self.last_event_id, self.closed, self.outcome, self.reason, self.error)
-
-    # Results compare by value, whatever subclass carries them (the testing kit's is awaitable).
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, PublishResult) and self._fields() == other._fields()
-
-    def __hash__(self) -> int:
-        return hash(self._fields())
 
 
 def last_event_id(body: Mapping[str, object]) -> int | None:

@@ -4,10 +4,12 @@ threads, the atexit hook, and a synchronous publisher inside a running loop."""
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
+import time
 
 import pytest
-from fakes import STREAM, Harness, closed_end, closed_fail, until
+from fakes import STREAM, Harness, Pending, closed_end, closed_fail, open_, until
 
 from iq_stream import AsyncPublisher, IQClient, Publisher
 from iq_stream import _publisher as publisher_module
@@ -86,16 +88,46 @@ async def test_a_writer_task_cancelled_with_its_loop_closes_the_stream_out_of_ba
 
 async def test_a_writer_task_cancelled_after_a_close_was_asked_for_sends_that_close() -> None:
     h = Harness("async", min_open=5)
-    h.transport.on_post = lambda body, n: closed_fail(1) if "fail" in body else closed_end(1)
+    h.transport.on_post = lambda body, n: (
+        open_(1) if body == "" else closed_fail(1) if "fail" in body else closed_end(1)
+    )
     pub = h.publisher()
     pub.send("a")
-    await h.request(0)
+    request = await h.request(0)
+    await until(lambda: request.data == ["a"])
     closing = asyncio.ensure_future(pub.close("end"))
     await asyncio.sleep(0.05)
     pub._task.cancel()  # pyright: ignore[reportPrivateUsage]
     outcome = await closing
+    assert h.transport.posts[0] == "", "the server is asked whether it holds every frame"
     assert h.transport.closes == ["end"]
     assert (outcome.closed, outcome.outcome, pub.error) == (True, "end", None)
+
+
+async def test_a_writer_task_cancelled_after_close_end_closes_with_fail_when_frames_never_reached_the_server() -> None:
+    h = Harness("async")
+    probe = Pending()
+    h.transport.on_post = lambda body, n: (
+        probe if n == 0 else open_(2) if body == "" else closed_fail(2) if "fail" in body else closed_end(2)
+    )
+    pub = h.publisher()
+    pub.send("a")
+    pub.send("b")
+    request = await h.request(0)
+    await until(lambda: request.data == ["a", "b"])
+    request.respond(0)  # the connection is lost, and the writer asks what the server holds
+    await until(lambda: h.transport.probes == 1)
+    pub.send("c")  # the agent goes on: these wait in the queue
+    pub.send("d")
+    closing = asyncio.ensure_future(pub.close("end"))
+    await asyncio.sleep(0.05)
+    pub._task.cancel()  # pyright: ignore[reportPrivateUsage] - the loop shuts down
+    outcome = await closing
+    assert [data for r in h.transport.requests for data in r.data] == ["a", "b"]
+    assert h.transport.closes == ["fail"], "an answer with a hole in it is not ended with `end`"
+    assert (outcome.closed, outcome.outcome, outcome.error) == (True, "fail", "cancelled")
+    assert pub.error is not None and pub.error.code == "cancelled"
+    assert [error.code for error in h.errors] == ["cancelled"]
 
 
 async def test_the_atexit_hook_closes_every_open_sync_publisher_with_fail() -> None:
@@ -119,6 +151,79 @@ async def test_the_atexit_hook_closes_every_open_sync_publisher_with_fail() -> N
     assert first.alive is second.alive is False
     assert first not in publisher_module._open  # pyright: ignore[reportPrivateUsage]
     assert publisher_module._hooked  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_the_atexit_hook_gives_up_on_every_unanswered_publisher_at_once() -> None:
+    h = Harness("sync")
+    h.transport.on_open = lambda request, n: None  # a server that never answers the close line
+
+    def slow_close(body: str, n: int) -> object:
+        time.sleep(0.4)
+        return closed_fail(0)
+
+    h.transport.on_post = slow_close
+    publishers = [h.client.publisher(f"exiting-stream-{n:07d}") for n in range(4)]
+    started = time.monotonic()
+    await asyncio.to_thread(close_open_publishers, 0.2)
+    elapsed = time.monotonic() - started
+    # One timeout and one out-of-band close, side by side: 0.6 s. One after another: 0.2 + 4 x 0.4 s.
+    assert elapsed < 1.2, f"{elapsed:.1f}s to exit with four open publishers"
+    assert h.transport.closes == ["fail"] * 4
+    assert [publisher.error.code for publisher in publishers if publisher.error] == ["close_timeout"] * 4
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork() here")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_forked_child_leaves_its_parents_publishers_alone_when_it_exits() -> None:
+    h = Harness("sync")
+    pub = h.client.publisher(STREAM)
+    pub.send("a")
+    deadline = time.monotonic() + 3
+    while not (h.transport.requests and h.transport.requests[0].data == ["a"]) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    request = h.transport.requests[0]
+    pid = os.fork()
+    if pid == 0:  # the child: what its atexit hook does
+        code = 1
+        try:
+            started = time.monotonic()
+            close_open_publishers(0.5)
+            quick = time.monotonic() - started < 0.3
+            code = 0 if quick and not request.destroyed and h.transport.posts == [] else 1
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, "the child waited for, or dropped, the parent's stream"
+    assert not request.destroyed
+    closer = threading.Thread(target=pub.close)
+    closer.start()
+    while not request.ended and time.monotonic() < deadline + 3:
+        time.sleep(0.005)
+    request.respond(200, lastEventId=1, closed=True, outcome="end")
+    closer.join(3)
+    assert pub.error is None
+
+
+def test_an_async_publisher_whose_loop_was_closed_under_it_goes_inert_and_closes_the_stream() -> None:
+    h = Harness("async")
+    h.transport.on_post = lambda body, n: closed_fail(1)
+
+    async def start() -> AsyncPublisher:
+        pub = h.publisher()
+        pub.send("a")
+        request = await h.request(0)
+        await until(lambda: request.data == ["a"])
+        return pub
+
+    loop = asyncio.new_event_loop()
+    pub = loop.run_until_complete(start())
+    loop.close()  # as a framework's sync wrapper does: no asyncio.run() teardown, the writer is left pending
+    assert pub.send("b") is False, "send() does not raise, and says the publisher is gone"
+    assert pub.error is not None and pub.error.code == "cancelled"
+    outcome = asyncio.run(pub.close())
+    assert h.transport.closes == ["fail"], "subscribers hear of it at once"
+    assert (outcome.closed, outcome.outcome, outcome.error) == (True, "fail", "cancelled")
+    assert [error.code for error in h.errors] == ["cancelled"]
 
 
 async def test_a_sync_publisher_works_inside_a_running_loop() -> None:
