@@ -51,8 +51,9 @@ async def start_stream(
     ``protocol``, ...). An exception in the run closes the stream with ``fail`` and is logged.
     """
     stream = IQStream(client, **stream_options)
+    kwargs = _arguments(stream, target, run_args, sync=False)
     ticket = client.ticket(stream.stream_id, ttl)
-    task = asyncio.create_task(_run_async(stream, target, dict(run_args), on_result))
+    task = asyncio.create_task(_run_async(stream, target, kwargs, on_result))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return ticket.to_dict()
@@ -70,11 +71,12 @@ def start_stream_sync(
     """``start_stream`` for synchronous code: ``target.run()`` in a thread of its own, under a copy of the caller's
     context, and ``on_result`` called in that thread."""
     stream = IQStream(client, **stream_options)
+    kwargs = _arguments(stream, target, run_args, sync=True)
     ticket = client.ticket(stream.stream_id, ttl)
     context = contextvars.copy_context()
     thread = threading.Thread(
         target=context.run,
-        args=(_run_sync, stream, target, dict(run_args), on_result),
+        args=(_run_sync, stream, target, kwargs, on_result),
         name=f"iq-stream-haystack {stream.stream_id}",
         daemon=True,
     )
@@ -82,14 +84,21 @@ def start_stream_sync(
     return ticket.to_dict()
 
 
-async def _run_async(stream: IQStream, target: Target, run_args: dict[str, Any], on_result: OnResult | None) -> None:
+def _arguments(stream: IQStream, target: Target, run_args: Mapping[str, Any], *, sync: bool) -> dict[str, Any]:
+    """The keyword arguments of ``target.run`` or ``run_async``, with the stream's callback in place."""
+    if isinstance(target, Agent):
+        kwargs = dict(run_args)
+        kwargs["streaming_callback"] = _callback(stream, target, kwargs.get("streaming_callback"), sync=sync)
+        return kwargs
+    if isinstance(target, Pipeline):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return {"data": _with_callbacks(stream, target, dict(run_args), sync=sync)}
+    raise TypeError("target must be a Haystack Agent or Pipeline.")
+
+
+async def _run_async(stream: IQStream, target: Target, kwargs: dict[str, Any], on_result: OnResult | None) -> None:
     try:
         async with stream:
-            if isinstance(target, Agent):
-                callback = _callback(stream, target, run_args.pop("streaming_callback", None))
-                result = await target.run_async(**run_args, streaming_callback=callback)
-            else:
-                result = await target.run_async(_with_callbacks(stream, target, run_args))
+            result = await target.run_async(**kwargs)
             if on_result is not None:
                 saved = on_result(stream.stream_id, result)
                 if inspect.isawaitable(saved):
@@ -101,16 +110,12 @@ async def _run_async(stream: IQStream, target: Target, run_args: dict[str, Any],
 def _run_sync(
     stream: IQStream,
     target: Target,
-    run_args: dict[str, Any],
+    kwargs: dict[str, Any],
     on_result: Callable[[str, dict[str, Any]], object] | None,
 ) -> None:
     try:
         with stream:
-            if isinstance(target, Agent):
-                callback = _callback(stream, target, run_args.pop("streaming_callback", None), sync=True)
-                result = target.run(**run_args, streaming_callback=callback)
-            else:
-                result = target.run(_with_callbacks(stream, target, run_args, sync=True))
+            result = target.run(**kwargs)
             if on_result is not None:
                 on_result(stream.stream_id, result)
     except Exception:
