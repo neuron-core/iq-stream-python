@@ -69,6 +69,19 @@ async def test_a_run_that_cannot_start_fails_its_stream_and_says_why() -> None:
     assert client.recorders[0].outcome == "fail"
 
 
+async def test_an_entity_whose_arun_does_not_stream_fails_its_stream_and_the_task_returns_its_summary() -> None:
+    client = RecordingClient()
+
+    class NotStreaming(Agent):
+        async def arun(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+            return None
+
+    handle = start_run(client, NotStreaming(model=None, telemetry=False), "Weather?")
+    summary = await asyncio.wait_for(handle.task, 10)
+    assert summary.status == "error" and isinstance(summary.error, TypeError)
+    assert client.recorders[0].outcome == "fail" and client.recorders[0].close_calls == 1
+
+
 async def test_cancelling_the_task_cancels_the_run_and_fails_the_stream() -> None:
     SLOW["seconds"] = 1.0
     client = RecordingClient()

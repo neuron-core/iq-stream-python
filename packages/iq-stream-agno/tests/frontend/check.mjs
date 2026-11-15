@@ -46,8 +46,10 @@ async function native() {
   } catch (error) {
     outcome = { type: error.kind, reason: error.reason ?? null };
   }
-  // What an Agent UI-style page derives: the root run's text, its tool calls, and how the run ended.
-  const root = events[0]?.run_id;
+  // What an Agent UI-style page derives: the root run's text, its tool calls, and how the run ended. The root run is
+  // the outermost one: a team member's or a workflow step's events name the run they are nested in.
+  const outermost = events.find((event) => !event.parent_run_id && !event.workflow_run_id) ?? events[0];
+  const root = outermost?.run_id;
   const own = events.filter((event) => event.run_id === root);
   const started = own.filter((event) => event.event === 'ToolCallStarted' || event.event === 'TeamToolCallStarted');
   const completed = own.filter((event) => event.event === 'ToolCallCompleted' || event.event === 'TeamToolCallCompleted');

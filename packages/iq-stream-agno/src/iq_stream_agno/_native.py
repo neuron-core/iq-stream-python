@@ -11,21 +11,10 @@ from agno.run.base import BaseRunOutputEvent
 from agno.utils.serialize import json_serializer
 from iq_stream import FrameTooLarge
 
-from ._common import EVENT_NAME, MASKED_ERROR, Fits, Frame, Report, event_name, longest_prefix
+from ._common import ERROR_TEXT, EVENT_NAME, MASKED_ERROR, TOOL_EVENTS, Fits, Frame, Report, event_name, longest_prefix
 
 Transform = Callable[[BaseRunOutputEvent], "Mapping[str, Any] | None"]
 """Turns an event into the dictionary to publish, or ``None`` to publish nothing for it."""
-
-#: Error events and the member that carries the error's text.
-_ERROR_TEXT = {
-    "RunError": "content",
-    "TeamRunError": "content",
-    "WorkflowError": "error",
-    "StepError": "error",
-    "ToolCallError": "error",
-    "TeamToolCallError": "error",
-}
-_TOOL_EVENTS = frozenset({"ToolCallCompleted", "TeamToolCallCompleted", "ToolCallError", "TeamToolCallError"})
 
 #: What the shrink policy removes, group by group, until the line fits: nested runs, media, then context.
 _REMOVABLE = (
@@ -43,13 +32,13 @@ def dumps(payload: Mapping[str, Any]) -> str:
 
 def masked(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     """The payload with the error text of an error event, or of a failed tool's result, replaced."""
-    field = _ERROR_TEXT.get(name)
+    field = ERROR_TEXT.get(name)
     if field is not None:
         if payload.get(field) is not None:
             payload[field] = MASKED_ERROR
         payload.pop("additional_data", None)
     tool: object = payload.get("tool")
-    if name in _TOOL_EVENTS and isinstance(tool, dict):
+    if name in TOOL_EVENTS and isinstance(tool, dict):
         tool = cast("dict[str, Any]", tool)
         if tool.get("tool_call_error") and tool.get("result") is not None:
             payload["tool"] = {**tool, "result": MASKED_ERROR}
@@ -104,8 +93,8 @@ class NativeEncoder:
 
 
 def shrink(payload: dict[str, Any], fits: Callable[[str], bool]) -> str | None:
-    """Removes members in a fixed order, then cuts tool results and text, until the JSON fits; lists what it removed
-    or cut under ``iq_truncated``. ``None`` when even that is not enough."""
+    """Removes members in a fixed order, then cuts tool results and text and removes tool arguments, until the JSON
+    fits; lists what it removed or cut under ``iq_truncated``. ``None`` when even that is not enough."""
     payload = dict(payload)
     truncated: list[str] = []
 
@@ -120,7 +109,6 @@ def shrink(payload: dict[str, Any], fits: Callable[[str], bool]) -> str | None:
         if truncated and fits(encoded()):
             return encoded()
 
-    # The text that remains, longest first within each kind: tool results, then the event's own text.
     tool: object = payload.get("tool")
     if isinstance(tool, dict):
         payload["tool"] = dict(cast("dict[str, Any]", tool))
@@ -129,36 +117,49 @@ def shrink(payload: dict[str, Any], fits: Callable[[str], bool]) -> str | None:
         payload["tools"] = [
             dict(cast("dict[str, Any]", item)) if isinstance(item, dict) else item for item in cast("list[Any]", tools)
         ]
-    for holder, key, label in _texts(payload):
+    # Text is cut to what fits; an object is removed whole, and the text cut before it then grows back into the room.
+    cut: list[tuple[dict[str, Any], str, str, str]] = []
+
+    def grow(holder: dict[str, Any], key: str, text: str) -> None:
+        def fits_cut(prefix: str) -> bool:
+            holder[key] = prefix
+            return fits(encoded())
+
+        holder[key] = text[: max(longest_prefix(text, fits_cut), 0)]
+
+    for holder, key, label in _places(payload):
         if fits(encoded()):
-            return encoded()
+            break
         value: object = holder.get(key)
         if value is None:
             continue
         if label not in truncated:
-            truncated.append(label)
-        if not isinstance(value, str):
+            truncated.append(label)  # before the cut, which measures the line with it
+        if isinstance(value, str):
+            cut.append((holder, key, label, value))
+            grow(holder, key, value)
+        else:
             del holder[key]
-            continue
-
-        def fits_cut(prefix: str, holder: dict[str, Any] = holder, key: str = key) -> bool:
-            holder[key] = prefix
-            return fits(encoded())
-
-        length = longest_prefix(value, fits_cut)
-        holder[key] = value[: max(length, 0)]
+            for earlier in reversed(cut):  # the text cut last grows first: a tool's result, cut first, takes the rest
+                grow(earlier[0], earlier[1], earlier[3])
+    partial = {label for holder, key, label, value in cut if holder[key] != value}
+    whole = {label for _, _, label, _ in cut} - partial
+    truncated[:] = [label for label in truncated if label not in whole]
     return encoded() if fits(encoded()) else None
 
 
-def _texts(payload: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
-    found: list[tuple[dict[str, Any], str, str]] = []
+def _places(payload: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
+    """Where to cut, in order. A tool event's own text is a one-line summary, cut before the tool's arguments go; the
+    text of an event that lists its tools, such as ``RunCompleted``, is the answer, cut last."""
+    texts = [(payload, key, key) for key in ("content", "reasoning_content")]
     tool: object = payload.get("tool")
     if isinstance(tool, dict):
-        found.append((cast("dict[str, Any]", tool), "result", "tool.result"))
+        tool = cast("dict[str, Any]", tool)
+        return [(tool, "result", "tool.result"), *texts, (tool, "tool_args", "tool.tool_args")]
     tools: object = payload.get("tools")
-    if isinstance(tools, list):
-        items = [cast("dict[str, Any]", item) for item in cast("list[Any]", tools) if isinstance(item, dict)]
-        items.sort(key=lambda item: len(str(item.get("result") or "")), reverse=True)
-        found.extend((item, "result", "tools[].result") for item in items)
-    found.extend((payload, key, key) for key in ("content", "reasoning_content"))
-    return found
+    listed = cast("list[Any]", tools) if isinstance(tools, list) else []
+    items = [cast("dict[str, Any]", item) for item in listed if isinstance(item, dict)]
+    items.sort(key=lambda item: len(str(item.get("result") or "")), reverse=True)
+    found = [(item, "result", "tools[].result") for item in items]
+    found.extend((item, "tool_args", "tools[].tool_args") for item in items)
+    return [*found, *texts]

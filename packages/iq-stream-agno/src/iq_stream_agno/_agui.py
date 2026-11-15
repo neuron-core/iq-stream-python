@@ -1,15 +1,15 @@
 """AG-UI events as frames. The conversion is Agno's own (``agno.os.interfaces.agui.handlers``), one event at a time
-so that frames go out between Agno's events; this module adds ``RUN_STARTED``, decides the terminal event from the
-root run, and splits or cuts an event that does not fit the line limit."""
+so that frames go out between Agno's events; this module adds ``RUN_STARTED`` (and the request's state snapshot, as
+Agno's route does), decides the terminal event from the root run, and splits or cuts an event that does not fit the
+line limit."""
 
 from __future__ import annotations
 
 import copy
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import Any, cast
 
-from ag_ui.core import BaseEvent, EventType, RunFinishedEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, EventType, RunStartedEvent, StateSnapshotEvent
 from agno.os.interfaces.agui import handlers as _handlers
 from agno.os.interfaces.agui.handlers import is_completion_event, process_completion, process_event
 from agno.os.interfaces.agui.state import StreamState
@@ -17,7 +17,17 @@ from agno.run.agent import RunCompletedEvent, RunErrorEvent
 from agno.run.base import BaseRunOutputEvent
 from iq_stream import FrameTooLarge
 
-from ._common import MASKED_ERROR, ROOT_CANCELS, ROOT_ERRORS, Fits, Frame, Report, event_name, longest_prefix
+from ._common import (
+    ERROR_TEXT,
+    MASKED_ERROR,
+    TOOL_EVENTS,
+    AguiRequest,
+    Fits,
+    Frame,
+    Report,
+    event_name,
+    longest_prefix,
+)
 
 try:  # ag-ui-protocol 1.0; agno's floor, 0.1.15, may not have it
     from ag_ui.core import RunFinishedCancelledOutcome as _Cancelled
@@ -27,8 +37,8 @@ except ImportError:  # pragma: no cover - depends on the installed ag-ui-protoco
 #: Deltas a client concatenates, so an oversize one may be split into several events of its type.
 _SPLITTABLE = frozenset({EventType.TEXT_MESSAGE_CONTENT, EventType.TOOL_CALL_ARGS, EventType.REASONING_MESSAGE_CONTENT})
 _CUT = " [truncated]"
-_ERROR_TEXT = {"RunError": "content", "TeamRunError": "content"}
-_TOOL_EVENTS = frozenset({"ToolCallCompleted", "TeamToolCallCompleted", "ToolCallError", "TeamToolCallError"})
+#: The error events Agno's converter turns into ``RUN_ERROR``.
+_RUN_ERRORS = frozenset({"RunError", "TeamRunError"})
 
 
 def dump(event: BaseEvent) -> str:
@@ -52,7 +62,6 @@ class AguiFramer:
         self,
         *,
         event_names: bool,
-        mask_errors: bool,
         shrink: bool,
         fits: Fits,
         size: Callable[[str, str | None], int],
@@ -60,7 +69,6 @@ class AguiFramer:
         report: Report,
     ) -> None:
         self._event_names = event_names
-        self._mask_errors = mask_errors
         self._shrink = shrink
         self._fits = fits
         self._size = size
@@ -71,8 +79,6 @@ class AguiFramer:
         return [frame for event in events for frame in self._frames(event)]
 
     def _frames(self, event: BaseEvent) -> list[Frame]:
-        if self._mask_errors and event.type == EventType.RUN_ERROR:
-            event = event.model_copy(update={"message": MASKED_ERROR, "raw_event": None})
         name = str(event.type.value) if self._event_names else None
         data = dump(event)
         if self._fits(data, name):
@@ -118,16 +124,19 @@ class AguiFramer:
 
 
 def _masked(event: BaseRunOutputEvent) -> BaseRunOutputEvent:
-    """A copy of an error event, or of a failed tool's event, without the error's text."""
+    """A copy of an error event, or of a failed tool's event, without the error's text: what the native encoder
+    masks, masked before the conversion, since Agno's converter copies the events it has no handler for into
+    ``RAW``."""
     name = event_name(event)
-    field = _ERROR_TEXT.get(name)
+    field = ERROR_TEXT.get(name)
     tool: object = getattr(event, "tool", None)
-    failed_tool = name in _TOOL_EVENTS and getattr(tool, "tool_call_error", False) and getattr(tool, "result", None)
+    failed_tool = name in TOOL_EVENTS and getattr(tool, "tool_call_error", False) and getattr(tool, "result", None)
     if field is None and not failed_tool:
         return event
     event = copy.copy(event)
     if field is not None:
-        setattr(event, field, MASKED_ERROR)
+        if getattr(event, field, None) is not None:
+            setattr(event, field, MASKED_ERROR)
         if hasattr(event, "additional_data"):
             setattr(event, "additional_data", None)  # noqa: B010 - the error events have it, the others do not
     if failed_tool and dataclasses.is_dataclass(tool) and not isinstance(tool, type):
@@ -139,18 +148,25 @@ class AguiEncoder:
     """One Agno run as AG-UI events, through Agno's converter. Only the root run's terminal event ends the AG-UI run:
     a team member's or a workflow step's ``RunCompleted`` or ``RunError`` is passed on as ``RAW``."""
 
-    def __init__(self, framer: AguiFramer, *, expose_errors: bool) -> None:
+    def __init__(self, framer: AguiFramer, *, expose_errors: bool, request: AguiRequest | None = None) -> None:
         self._framer = framer
         self._expose_errors = expose_errors
+        self._request = request
         self._state: StreamState | None = None
         self._terminal: BaseRunOutputEvent | None = None
 
     def _start(self, thread_id: str | None, run_id: str | None) -> tuple[StreamState, list[BaseEvent]]:
         if self._state is not None:
             return self._state, []
-        self._state = StreamState(thread_id=thread_id or "", run_id=run_id or "")
-        started = RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id or "", run_id=run_id or "")
-        return self._state, [started]
+        request = self._request or AguiRequest(thread_id or "", run_id or "")
+        self._state = StreamState(thread_id=request.thread_id, run_id=request.run_id, run_state=request.state)
+        events: list[BaseEvent] = [
+            RunStartedEvent(type=EventType.RUN_STARTED, thread_id=request.thread_id, run_id=request.run_id)
+        ]
+        if request.state is not None:
+            self._state.set_state_snapshot(request.state)
+            events.append(StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot=copy.deepcopy(request.state)))
+        return self._state, events
 
     def encode(
         self, event: BaseRunOutputEvent, *, root: bool, thread_id: str | None, run_id: str | None
@@ -176,7 +192,7 @@ class AguiEncoder:
         state, events = self._start(thread_id, run_id)
         terminal = self._terminal
         if status == "error":
-            if terminal is None or event_name(terminal) not in _ERROR_TEXT:
+            if terminal is None or event_name(terminal) not in _RUN_ERRORS:
                 terminal = self._error_event(error, root_error, thread_id, run_id)
             if hasattr(_handlers, "on_run_error"):
                 events.extend(process_completion(terminal, state))
@@ -238,100 +254,3 @@ def _run_error(terminal: BaseRunOutputEvent, state: StreamState) -> list[BaseEve
     message = str(getattr(terminal, "content", None) or MASKED_ERROR)
     events.append(AguiRunError(message=message, code=code if isinstance(code, str) else None))
     return events
-
-
-class AguiTrack:
-    """The terminal decision for a stream of AG-UI events that Agno's ``run_entity()`` produced (the AgentOS
-    interface's AG-UI route): ``RUN_ERROR`` fails the run, a ``RAW`` cancelled event of the root run cancels it. A
-    stream that stops without a terminal event gets one: what is open is closed, and the run ends with ``RUN_ERROR``
-    or, when it was interrupted, ``RUN_FINISHED`` with the cancelled outcome."""
-
-    def __init__(self, framer: AguiFramer, *, run_id: str, thread_id: str) -> None:
-        self._framer = framer
-        self.run_id: str | None = run_id
-        self.session_id: str | None = thread_id
-        self._failed = False
-        self._cancelled = False
-        self._raw_error: dict[str, Any] | None = None
-        self._terminated = False
-        self._started = False
-        self._open: dict[str, list[str]] = {"message": [], "tool": [], "reasoning": []}
-
-    def frames(self, item: object, encode: bool) -> list[Frame]:
-        if not isinstance(item, BaseEvent):
-            return []
-        self._observe(item)
-        if not encode:
-            return []
-        if item.type == EventType.RUN_FINISHED and self._raw_error is not None:
-            # agno 2.x converts the root run's RunError to RAW and then finishes the run.
-            from ag_ui.core import RunErrorEvent
-
-            self._failed = True
-            code: object = self._raw_error.get("error_type")
-            message = str(self._raw_error.get("content") or MASKED_ERROR)
-            item = RunErrorEvent(message=message, code=code if isinstance(code, str) else None)
-        elif item.type == EventType.RUN_FINISHED and self._cancelled:
-            item = cancelled(item)
-        return self._framer.frames([item])
-
-    def status(self) -> str:
-        return "error" if self._failed else "cancelled" if self._cancelled else "completed"
-
-    def final_frames(self, status: str, error: BaseException | None) -> list[Frame]:
-        if self._terminated:
-            return []
-        from ag_ui.core import ReasoningMessageEndEvent, RunErrorEvent, TextMessageEndEvent, ToolCallEndEvent
-
-        events: list[BaseEvent] = []
-        if not self._started:
-            events.append(
-                RunStartedEvent(type=EventType.RUN_STARTED, thread_id=self.session_id or "", run_id=self.run_id or "")
-            )
-        events.extend(ReasoningMessageEndEvent(message_id=item) for item in self._open["reasoning"])
-        events.extend(ToolCallEndEvent(tool_call_id=item) for item in self._open["tool"])
-        events.extend(TextMessageEndEvent(message_id=item) for item in self._open["message"])
-        if status == "error":
-            message = str(error) if error is not None and str(error) else MASKED_ERROR
-            events.append(RunErrorEvent(message=message))
-        else:
-            finished = RunFinishedEvent(thread_id=self.session_id or "", run_id=self.run_id or "")
-            events.append(cancelled(finished) if status in ("cancelled", "interrupted") else finished)
-        self._terminated = True
-        return self._framer.frames(events)
-
-    def _observe(self, event: BaseEvent) -> None:
-        kind = event.type
-        if kind == EventType.RUN_STARTED:
-            self._started = True
-        elif kind == EventType.RUN_ERROR:
-            self._failed = self._terminated = True
-        elif kind == EventType.RUN_FINISHED:
-            self._terminated = True
-        elif kind == EventType.RAW:
-            raw: object = getattr(event, "event", None)
-            if isinstance(raw, dict):
-                raw = cast("dict[str, Any]", raw)
-                if raw.get("run_id") == self.run_id and raw.get("event") in ROOT_CANCELS:
-                    self._cancelled = True
-                elif raw.get("run_id") == self.run_id and raw.get("event") in ROOT_ERRORS:
-                    self._raw_error = raw
-        span = _SPANS.get(kind)
-        if span is not None:
-            group, opening, key = span
-            value: object = getattr(event, key, None)
-            if isinstance(value, str):
-                if opening:
-                    self._open[group].append(value)
-                elif value in self._open[group]:
-                    self._open[group].remove(value)
-
-
-_SPANS = {
-    EventType.TEXT_MESSAGE_START: ("message", True, "message_id"),
-    EventType.TEXT_MESSAGE_END: ("message", False, "message_id"),
-    EventType.TOOL_CALL_START: ("tool", True, "tool_call_id"),
-    EventType.TOOL_CALL_END: ("tool", False, "tool_call_id"),
-    EventType.REASONING_MESSAGE_START: ("reasoning", True, "message_id"),
-    EventType.REASONING_MESSAGE_END: ("reasoning", False, "message_id"),
-}

@@ -13,10 +13,11 @@ from typing import Any
 
 import pytest
 from agno.agent import Agent
+from agno.team import Team
 from iq_stream import IQClient
 from iq_stream.testing import TestServers, subscribe_in_background
 from live import recording
-from scripted_model import ANSWER, SLOW, weather_agent
+from scripted_model import ANSWER, SLOW, team, weather_agent
 
 from iq_stream_agno import MASKED_ERROR, apublish, start_run
 
@@ -46,11 +47,16 @@ def check(record: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
 
 
 async def published(
-    client: IQClient, servers: TestServers, agent: Agent, protocol: str, cancel: bool = False
+    client: IQClient,
+    servers: TestServers,
+    agent: Agent | Team,
+    protocol: str,
+    cancel: bool = False,
+    stream_events: bool | None = True,
 ) -> dict[str, Any]:
     ticket = client.ticket()
     subscription = subscribe_in_background(servers.default.url, ticket.stream_id, ticket.token)
-    stream = agent.arun("Weather in Paris?", stream=True, stream_events=True, run_id=ticket.stream_id)
+    stream = agent.arun("Weather in Paris?", stream=True, stream_events=stream_events, run_id=ticket.stream_id)
     async for event in apublish(stream, client.apublisher(ticket.stream_id), protocol=protocol):  # type: ignore[arg-type]
         if cancel and event.event == "ToolCallStarted":
             Agent.cancel_run(ticket.stream_id)
@@ -112,6 +118,19 @@ async def test_ag_ui_frames_of_a_cancelled_run_finish_with_the_cancelled_outcome
     seen = check(await published(iq_client, iq_servers, agent, "agui", cancel=True), tmp_path)
     assert seen["rejected"] is None and not any("stream failed" in failure for failure in seen["failures"])
     assert seen["last"]["type"] == "RUN_FINISHED" and seen["last"]["outcome"] == {"type": "cancelled"}
+
+
+@pytest.mark.parametrize("protocol", ["agno", "agui"])
+async def test_a_team_whose_member_speaks_first_and_whose_leader_fails_reaches_the_browser_as_failed(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path, protocol: str
+) -> None:
+    # arun(stream=True) alone: no TeamRunStarted, and the member's events come first.
+    failing = team(leader_fails=True, preamble=False)
+    seen = check(await published(iq_client, iq_servers, failing, protocol, stream_events=None), tmp_path)
+    if protocol == "agno":
+        assert seen["last"] == "TeamRunError" and seen["outcome"] == {"type": "fail", "reason": "publisher"}
+    else:
+        assert seen["last"]["type"] == "RUN_ERROR" and seen["rejected"] is None and seen["failures"] == []
 
 
 async def test_a_start_run_stream_reaches_stream_agent(

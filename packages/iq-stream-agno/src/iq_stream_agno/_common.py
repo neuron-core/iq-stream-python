@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from iq_stream import IQError
 
@@ -31,6 +32,39 @@ EVENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 ROOT_ERRORS = frozenset({"RunError", "TeamRunError", "WorkflowError"})
 ROOT_CANCELS = frozenset({"RunCancelled", "TeamRunCancelled", "WorkflowCancelled"})
 ROOT_PAUSES = frozenset({"RunPaused", "TeamRunPaused", "WorkflowPaused"})
+
+#: Error events and the member that carries the error's text; both encoders mask it.
+ERROR_TEXT = {
+    "RunError": "content",
+    "TeamRunError": "content",
+    "WorkflowError": "error",
+    "StepError": "error",
+    "ToolCallError": "error",
+    "TeamToolCallError": "error",
+}
+#: Events whose ``tool`` holds a failed tool's error text as its result.
+TOOL_EVENTS = frozenset({"ToolCallCompleted", "TeamToolCallCompleted", "ToolCallError", "TeamToolCallError"})
+
+
+@dataclass(frozen=True)
+class AguiRequest:
+    """What an AG-UI request fixes for the events published in answer to it: the ids that ``RUN_STARTED`` and
+    ``RUN_FINISHED`` carry (the client's, even when Agno resumes a paused run under that run's own id), and the
+    request's state, which Agno's converter snapshots and diffs as the run changes it."""
+
+    thread_id: str
+    run_id: str
+    state: dict[str, Any] | None = None
+
+
+def nested(event: object) -> str | None:
+    """The run an event's run is nested in: a team member's parent run, a workflow step's workflow run. ``None``
+    for the outermost run's own events."""
+    for key in ("parent_run_id", "workflow_run_id"):
+        value: object = getattr(event, key, None)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def event_name(event: object) -> str:

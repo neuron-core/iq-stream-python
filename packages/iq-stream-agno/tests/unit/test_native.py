@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from agno.run.agent import (
     CustomEvent,
     RunCompletedEvent,
     RunContentEvent,
+    RunErrorEvent,
     RunOutput,
     RunStartedEvent,
     ToolCallCompletedEvent,
@@ -192,11 +194,60 @@ def test_tool_results_are_cut_before_the_answer() -> None:
 def test_the_shrink_policy_removes_nested_runs_first() -> None:
     publisher = RecordingPublisher(max_frame_bytes=1_024)
     member = RunOutput(run_id="member", content="m" * 3_000)
-    event = TeamRunCompletedEvent(run_id="team", content="The member says it is sunny.", member_responses=[member])
+    event = TeamRunCompletedEvent(
+        run_id="team",
+        content="The member says it is sunny.",
+        member_responses=[member],
+        images=[],  # media and context too: removing the nested runs alone is enough, so they stay
+        session_state={"city": "Paris"},
+    )
     list(publish(iter([event]), publisher))
     (payload,) = payloads(publisher)
     assert payload["iq_truncated"] == ["member_responses"] and "member_responses" not in payload
     assert payload["content"] == "The member says it is sunny."
+    assert payload["images"] == [] and payload["session_state"] == {"city": "Paris"}
+
+
+def test_oversize_tool_arguments_are_removed_and_the_tool_call_still_published() -> None:
+    publisher = RecordingPublisher(max_frame_bytes=2_048)
+    errors = Errors()
+    agent = weather_agent(tool_args={"city": "P" * 3_000})
+    received = list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, on_error=errors))
+    assert len(publisher.frames) == len(received) and errors == []
+    assert all(publisher.frame_size(data) <= 2_048 for data in publisher.data)
+    started = next(payload for payload in payloads(publisher) if payload["event"] == "ToolCallStarted")
+    assert started["iq_truncated"] == ["tool.tool_args"] and "tool_args" not in started["tool"]
+    assert started["tool"]["tool_name"] == "get_weather" and started["tool"]["tool_call_id"] == "call_1"
+    completed = next(payload for payload in payloads(publisher) if payload["event"] == "ToolCallCompleted")
+    assert completed["iq_truncated"] == ["tool.result", "tool.tool_args"]
+    assert completed["tool"]["result"].startswith("21C and sunny in PPP")
+
+
+def test_a_small_result_is_kept_whole_when_the_arguments_are_what_does_not_fit() -> None:
+    publisher = RecordingPublisher(max_frame_bytes=2_048)
+    tool = ToolExecution(tool_call_id="call_1", tool_name="write_file", tool_args={"text": "x" * 3_000}, result="ok")
+    list(publish(iter([ToolCallCompletedEvent(run_id="r1", content="write_file completed.", tool=tool)]), publisher))
+    (payload,) = payloads(publisher)
+    assert payload["iq_truncated"] == ["tool.tool_args"] and payload["tool"]["result"] == "ok"
+    assert payload["content"] == "write_file completed."
+
+
+def test_the_tools_listed_in_run_completed_lose_their_arguments_before_the_answer_is_cut() -> None:
+    publisher = RecordingPublisher(max_frame_bytes=2_048)
+    tools = [ToolExecution(tool_call_id="call_1", tool_name="write_file", tool_args={"text": "x" * 3_000}, result="ok")]
+    list(publish(iter([RunCompletedEvent(run_id="r1", content="The file is written.", tools=tools)]), publisher))
+    (payload,) = payloads(publisher)
+    assert payload["iq_truncated"] == ["tools[].tool_args"] and payload["content"] == "The file is written."
+    assert payload["tools"][0]["result"] == "ok" and "tool_args" not in payload["tools"][0]
+
+
+def test_an_error_event_s_additional_data_is_not_published() -> None:
+    publisher = RecordingPublisher()
+    event = RunErrorEvent(run_id="r1", content="connection to db:5432 refused", additional_data={"dsn": "secret"})
+    list(publish(iter([event]), publisher))
+    (payload,) = payloads(publisher)
+    assert payload["content"] == MASKED_ERROR and "additional_data" not in payload and "secret" not in publisher.data[0]
+    assert publisher.outcome == "fail"
 
 
 def test_with_on_oversize_drop_an_oversize_frame_is_dropped_and_reported() -> None:
@@ -280,6 +331,23 @@ def test_a_source_of_strings_is_passed_through_reported_and_fails_the_stream() -
     assert [error.code for error in errors] == ["unsupported_source"] and publisher.outcome == "fail"
 
 
+def test_a_run_output_instead_of_an_iterator_closes_the_stream_and_says_why() -> None:
+    publisher = RecordingPublisher()
+    output = weather_agent().run("Weather?")  # stream=True forgotten
+    with pytest.raises(TypeError, match=r"stream=True"):
+        list(publish(output, publisher))  # type: ignore[arg-type]
+    assert publisher.outcome == "fail" and publisher.close_calls == 1
+
+
+async def test_a_coroutine_instead_of_an_async_iterator_closes_the_stream_and_is_not_left_unawaited() -> None:
+    publisher = AsyncRecordingPublisher()
+    coroutine = weather_agent().arun("Weather?")  # stream=True forgotten
+    with pytest.raises(TypeError, match=r"stream=True"):
+        await collect(apublish(coroutine, publisher))  # type: ignore[arg-type]
+    assert publisher.outcome == "fail" and publisher.close_calls == 1
+    assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED  # no "never awaited" warning
+
+
 def test_an_async_publisher_is_refused_by_publish() -> None:
     with pytest.raises(TypeError):
         publish(iter([]), AsyncRecordingPublisher())  # type: ignore[arg-type]
@@ -304,6 +372,19 @@ def test_before_close_sees_the_summary_before_the_close_line() -> None:
     agent = weather_agent()
     list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, before_close=before_close))
     assert order == ["before_close completed end None"] and publisher.outcome == "end"
+
+
+def test_before_close_is_not_called_when_the_iterator_raised() -> None:
+    publisher = RecordingPublisher()
+    called: list[RunSummary] = []
+
+    def events() -> Iterator[Any]:
+        yield from weather_agent().run("Weather?", stream=True)
+        raise RuntimeError("after the last event")
+
+    with pytest.raises(RuntimeError):
+        list(publish(events(), publisher, before_close=called.append))
+    assert called == [] and publisher.outcome == "fail"
 
 
 def test_a_before_close_that_raises_fails_the_stream_and_reaches_the_caller() -> None:

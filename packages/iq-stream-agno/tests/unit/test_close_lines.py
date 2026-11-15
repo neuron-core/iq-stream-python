@@ -4,42 +4,54 @@ cancelled task; teams and workflows; and the run saved before the close line goe
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from agno.agent import Agent
 from agno.db.in_memory import InMemoryDb
-from agno.team import Team
 from agno.workflow import Step, Workflow
 from iq_stream import Outcome, PublishResult
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from recorded import collect, names, payloads
-from scripted_model import SLOW, ScriptedModel, get_weather, weather_agent
+from scripted_model import SLOW, team, weather_agent
 
 from iq_stream_agno import RunSummary, apublish, publish
 
 
 def test_a_caller_that_stops_early_fails_the_stream_once_sync() -> None:
     publisher = RecordingPublisher()
-    stream = publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher)
+    source = weather_agent().run("Weather?", stream=True, stream_events=True)
+    stream = publish(source, publisher)
     for event in stream:
         if event.event == "ToolCallStarted":
             break
     stream.close()
     assert names(publisher)[-1] == "ToolCallStarted"
     assert publisher.outcome == "fail" and publisher.close_calls == 1
+    # Agno's own iterator is closed too. Its synchronous run stores nothing when it is (unlike arun, below).
+    assert inspect.getgeneratorstate(source) == inspect.GEN_CLOSED  # type: ignore[arg-type]
 
 
-async def test_a_caller_that_stops_early_fails_the_stream_once_async() -> None:
+async def test_a_caller_that_stops_early_fails_the_stream_once_and_agno_stores_the_run_as_cancelled() -> None:
     publisher = AsyncRecordingPublisher()
-    stream = apublish(weather_agent().arun("Weather?", stream=True, stream_events=True), publisher)
+    agent = weather_agent(db=InMemoryDb())
+    stream = apublish(agent.arun("Weather?", stream=True, stream_events=True, session_id="s-stop"), publisher)
     async for event in stream:
         if event.event == "ToolCallStarted":
             break
     await stream.aclose()  # type: ignore[attr-defined]
     assert names(publisher)[-1] == "ToolCallStarted"
     assert publisher.outcome == "fail" and publisher.close_calls == 1
+    run_id = payloads(publisher)[0]["run_id"]
+    stored: Any = None
+    for _ in range(250):  # Agno stores it from a task of its own
+        stored = await agent.aget_run_output(run_id, session_id="s-stop")
+        if stored is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert stored is not None and str(getattr(stored.status, "value", stored.status)).lower() == "cancelled"
 
 
 async def test_a_task_cancelled_while_it_waits_for_the_next_event_fails_the_stream() -> None:
@@ -102,23 +114,6 @@ async def test_a_paused_run_ends_its_stream_and_continues_on_another_with_the_sa
     assert "booked Paris" in "".join(second.data) and second.outcome == "end"
 
 
-def team(member_fails: bool = False) -> Team:
-    member = Agent(
-        id="weather-member",
-        name="Weather Member",
-        role="weather",
-        model=ScriptedModel(fail_on_turn=2 if member_fails else None),
-        tools=[get_weather],
-        telemetry=False,
-    )
-    leader = ScriptedModel(
-        tool_name="delegate_task_to_member",
-        tool_args={"member_id": "weather-member", "task": "weather in Paris"},
-        answer="The member says it is sunny.",
-    )
-    return Team(id="weather-team", name="Team", model=leader, members=[member], telemetry=False)
-
-
 async def test_a_team_run_carries_its_members_events_and_ends_with_the_leader() -> None:
     publisher = AsyncRecordingPublisher()
     await collect(apublish(team().arun("Weather?", stream=True, stream_events=True), publisher))
@@ -136,6 +131,16 @@ async def test_a_member_s_failure_does_not_fail_a_team_that_completes() -> None:
     await collect(apublish(team(member_fails=True).arun("Weather?", stream=True, stream_events=True), publisher))
     assert "RunError" in names(publisher) and names(publisher)[-1] == "TeamRunCompleted"
     assert publisher.outcome == "end"
+
+
+async def test_without_stream_events_a_leader_that_delegates_first_still_decides_the_close_line() -> None:
+    # Team.stream_events defaults to None: a bare arun(stream=True) yields no TeamRunStarted, so the member's events
+    # come first when the leader delegates before it writes. The member's run must not be taken for the root.
+    publisher = AsyncRecordingPublisher()
+    received = await collect(apublish(team(leader_fails=True, preamble=False).arun("Weather?", stream=True), publisher))
+    assert received[0].event == "RunStarted" and received[0].parent_run_id
+    assert "RunCompleted" in names(publisher) and names(publisher)[-1] == "TeamRunError"
+    assert publisher.outcome == "fail"
 
 
 async def test_a_workflow_whose_step_fails_and_is_skipped_ends() -> None:

@@ -4,16 +4,18 @@ frame valid against the ag_ui.core models."""
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from ag_ui.core import Event
 from agno.agent import Agent
 from agno.os.interfaces.agui.stream import stream_agno_response_as_agui_events
+from agno.workflow import Workflow
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from pydantic import TypeAdapter
 from recorded import Errors, collect, payloads, types
-from scripted_model import SLOW, weather_agent
+from scripted_model import SLOW, team, weather_agent
 
 from iq_stream_agno import MASKED_ERROR, apublish, publish
 
@@ -160,11 +162,54 @@ def test_event_names_name_each_frame_after_its_type() -> None:
 
 
 def test_a_team_run_converts_and_ends_with_the_leader() -> None:
-    from test_close_lines import team
-
     publisher = RecordingPublisher()
     list(publish(team().run("Weather?", stream=True, stream_events=True), publisher, protocol="agui"))
     valid(publisher)
     kinds = types(publisher, raw=False)
     assert kinds[0] == "RUN_STARTED" and kinds[-1] == "RUN_FINISHED" and kinds.count("RUN_FINISHED") == 1
     assert "TOOL_CALL_RESULT" in kinds and publisher.outcome == "end"
+
+
+async def test_a_team_whose_member_speaks_first_ends_with_the_leader_s_error_under_the_team_s_run_id() -> None:
+    publisher = AsyncRecordingPublisher()
+    received = await collect(
+        apublish(team(leader_fails=True, preamble=False).arun("Weather?", stream=True), publisher, protocol="agui")
+    )
+    valid(publisher)
+    team_run_id = received[-1].run_id
+    assert received[-1].event == "TeamRunError" and received[0].run_id != team_run_id
+    rows = payloads(publisher)
+    assert rows[0] == {"type": "RUN_STARTED", "threadId": received[0].session_id, "runId": team_run_id}
+    # The member's RunCompleted is not the run's end: it goes out as RAW, and the leader's error ends the run.
+    assert [row["event"]["event"] for row in rows if row["type"] == "RAW"].count("RunCompleted") == 1
+    assert "RUN_FINISHED" not in types(publisher) and rows[-1]["type"] == "RUN_ERROR"
+    assert publisher.outcome == "fail"
+
+
+def test_a_failing_tool_s_error_text_is_masked_in_every_frame() -> None:
+    publisher = RecordingPublisher()
+    agent = weather_agent(tool_name="broken_tool")
+    list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, protocol="agui"))
+    valid(publisher)
+    assert "secret database password" not in "".join(publisher.data)
+    (result,) = [row for row in payloads(publisher) if row["type"] == "TOOL_CALL_RESULT"]
+    assert text_of(result["content"]) == MASKED_ERROR
+    (error,) = [
+        row["event"] for row in payloads(publisher) if row["type"] == "RAW" and row["event"]["event"] == "ToolCallError"
+    ]
+    assert error["error"] == MASKED_ERROR and error["tool"]["result"] == MASKED_ERROR
+    assert publisher.outcome == "end"
+
+
+async def test_a_workflow_s_error_text_is_masked_in_ag_ui_too() -> None:
+    async def steps(workflow: Workflow, execution_input: Any) -> AsyncIterator[str]:
+        raise RuntimeError("workflow blew up")
+        yield ""
+
+    publisher = AsyncRecordingPublisher()
+    workflow = Workflow(id="failing-wf", name="Failing WF", steps=steps, telemetry=False)
+    with pytest.raises(RuntimeError, match="workflow blew up"):
+        await collect(apublish(workflow.arun("Go", stream=True, stream_events=True), publisher, protocol="agui"))
+    valid(publisher)
+    assert "workflow blew up" not in "".join(publisher.data)
+    assert payloads(publisher)[-1]["type"] == "RUN_ERROR" and publisher.outcome == "fail"

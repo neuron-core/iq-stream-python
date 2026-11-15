@@ -9,12 +9,12 @@ import inspect
 import logging
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from agno.run.base import BaseRunOutputEvent
 from iq_stream import AsyncPublisherLike, FrameTooLarge, IQError, Outcome, PublisherLike, PublishResult
 
-from ._common import ROOT_CANCELS, ROOT_ERRORS, ROOT_PAUSES, Frame, event_name
+from ._common import ROOT_CANCELS, ROOT_ERRORS, ROOT_PAUSES, AguiRequest, Frame, event_name, nested
 from ._common import Protocol as WireProtocol
 from ._native import NativeEncoder, Transform
 
@@ -39,7 +39,7 @@ class RunSummary:
     #: The close line: ``end`` or ``fail``.
     outcome: Outcome
     status: RunStatus
-    #: The root run's id: the ``root_run_id`` option, else the ``run_id`` of the first event.
+    #: The root run's id: the ``root_run_id`` option, else the ``run_id`` of the first event of the outermost run.
     run_id: str | None
     session_id: str | None
     #: Frames this tee queued on the publisher.
@@ -54,19 +54,6 @@ BeforeClose = Callable[[RunSummary], object]
 """Called after the iterator ended and before the close line; for ``apublish`` it may return an awaitable."""
 
 ErrorHandler = Callable[[IQError], object]
-
-
-class _Track(Protocol):
-    """A run's terminal decision and its encoder, as the drivers below see them."""
-
-    run_id: str | None
-    session_id: str | None
-
-    def frames(self, item: object, encode: bool) -> list[Frame]: ...
-
-    def status(self) -> str: ...
-
-    def final_frames(self, status: str, error: BaseException | None) -> list[Frame]: ...
 
 
 @dataclass(frozen=True)
@@ -154,11 +141,19 @@ class Reporter:
 class AgnoTrack:
     """The root run of an Agno iterator, and its encoder."""
 
-    def __init__(self, options: Options, publisher: PublisherLike | AsyncPublisherLike, report: Reporter) -> None:
+    def __init__(
+        self,
+        options: Options,
+        publisher: PublisherLike | AsyncPublisherLike,
+        report: Reporter,
+        agui: AguiRequest | None = None,
+    ) -> None:
         self._options = options
         self._report = report
         self._stream_id = publisher.stream_id
-        self.run_id: str | None = options.root_run_id
+        self._root: str | None = options.root_run_id
+        # The run a nested run's first events name as theirs, until the root's own events arrive.
+        self._outer: str | None = None
         self.session_id: str | None = None
         self._failed = False
         self._cancelled = False
@@ -174,14 +169,13 @@ class AgnoTrack:
 
             framer = AguiFramer(
                 event_names=options.event_names,
-                mask_errors=False,  # masked on the Agno event, before the conversion
                 shrink=options.shrink,
                 fits=fits,
                 size=publisher.frame_size,
                 limit=publisher.max_frame_bytes,
                 report=report,
             )
-            self._agui: AguiEncoder | None = AguiEncoder(framer, expose_errors=options.expose_errors)
+            self._agui: AguiEncoder | None = AguiEncoder(framer, expose_errors=options.expose_errors, request=agui)
             self._native: NativeEncoder | None = None
         else:
             self._agui = None
@@ -195,6 +189,10 @@ class AgnoTrack:
                 limit=publisher.max_frame_bytes,
                 report=report,
             )
+
+    @property
+    def run_id(self) -> str | None:
+        return self._root or self._outer
 
     def frames(self, item: object, encode: bool) -> list[Frame]:
         if isinstance(item, str):
@@ -214,12 +212,19 @@ class AgnoTrack:
             return []  # the RunOutput that yield_run_output=True adds at the end
         name = event_name(item)
         run_id: object = getattr(item, "run_id", None)
-        if self.run_id is None and isinstance(run_id, str) and run_id:
-            self.run_id = run_id
+        if self._root is None and isinstance(run_id, str) and run_id:
+            # Without stream_events, a team that delegates before it writes yields its member's events first: a
+            # nested run is never the root, whose own ending alone decides the close line.
+            outer = nested(item)
+            depth: object = getattr(item, "nested_depth", 0)
+            if outer is None and not (isinstance(depth, int) and depth > 0):
+                self._root = run_id
+            elif self._outer is None:
+                self._outer = outer
         session_id: object = getattr(item, "session_id", None)
         if self.session_id is None and isinstance(session_id, str) and session_id:
             self.session_id = session_id
-        root = run_id is not None and run_id == self.run_id
+        root = run_id is not None and run_id == self._root
         if root:
             if name in ROOT_ERRORS:
                 self._failed = True
@@ -273,7 +278,7 @@ class _Run:
     """The per-run state the two drivers share: frames queued, and the ending."""
 
     def __init__(
-        self, publisher: PublisherLike | AsyncPublisherLike, track: _Track, cancelled_outcome: Outcome
+        self, publisher: PublisherLike | AsyncPublisherLike, track: AgnoTrack, cancelled_outcome: Outcome
     ) -> None:
         self.publisher = publisher
         self.track = track
@@ -341,6 +346,30 @@ def _failure_status(error: BaseException) -> str:
     return "interrupted" if isinstance(error, _INTERRUPTIONS) else "error"
 
 
+def _iterate(source: Iterable[E]) -> Iterator[E]:
+    """The source's iterator, taken inside the driver's ``try`` so that a source that is none still closes the
+    stream."""
+    checked = cast("object", source)
+    if isinstance(checked, Iterable):
+        return iter(source)
+    raise TypeError(
+        "publish() takes the iterator of run(..., stream=True) or continue_run(..., stream=True); "
+        f"it was given {type(source).__name__}"
+    )
+
+
+def _aiterate(source: AsyncIterable[E]) -> AsyncIterator[E]:
+    checked = cast("object", source)
+    if isinstance(checked, AsyncIterable):
+        return source.__aiter__()
+    if inspect.iscoroutine(checked):
+        checked.close()  # arun() without stream=True: the run never starts, and no warning says it was not awaited
+    raise TypeError(
+        "apublish() takes the async iterator of arun(..., stream=True) or acontinue_run(..., stream=True); "
+        f"it was given {type(source).__name__}"
+    )
+
+
 def drive(
     source: Iterable[E],
     run: _Run,  # its publisher is a PublisherLike
@@ -348,10 +377,11 @@ def drive(
     on_summary: Callable[[RunSummary], object] | None = None,
 ) -> Iterator[E]:
     publisher = cast("PublisherLike", run.publisher)
-    iterator = iter(source)
+    iterator: Iterator[E] | None = None
     error: BaseException | None = None
     exhausted = False
     try:
+        iterator = _iterate(source)
         for item in iterator:
             run.take(item)
             yield item
@@ -394,10 +424,11 @@ async def adrive(
     before_close: BeforeClose | None,
     on_summary: Callable[[RunSummary], object] | None = None,
 ) -> AsyncIterator[E]:
-    iterator = source.__aiter__()
+    iterator: AsyncIterator[E] | None = None
     error: BaseException | None = None
     exhausted = False
     try:
+        iterator = _aiterate(source)
         while True:
             try:
                 item = await iterator.__anext__()

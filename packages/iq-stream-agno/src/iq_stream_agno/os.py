@@ -4,7 +4,9 @@ through IQ-Stream, from a task that publishes them. Needs the ``os`` extra (and 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
+from collections.abc import AsyncIterable
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
@@ -19,9 +21,9 @@ except ImportError as error:  # pragma: no cover - depends on the installed extr
 
 from iq_stream import IQClient
 
-from ._common import Protocol
-from ._runner import PublishOptions, StreamHandle, _running, continue_run, publish_task, start_run  # pyright: ignore[reportPrivateUsage]
-from ._tee import RunSummary, _Run  # pyright: ignore[reportPrivateUsage]
+from ._common import AguiRequest, Protocol
+from ._runner import PublishOptions, StreamHandle, checked_options, continue_run, launch, start_run
+from ._tee import RunSummary
 
 if TYPE_CHECKING:
     from agno.agent import Agent
@@ -53,8 +55,8 @@ class IQStream(BaseInterface):
     """Mounts, under ``prefix``:
 
     - ``POST /runs`` — ``{"message", "session_id"?, "user_id"?}``; starts the run and answers with its ticket.
-    - ``POST /agui`` — an AG-UI ``RunAgentInput``, for an agent or a team when ``ag-ui-protocol`` is installed;
-      Agno's own AG-UI conversion (``run_entity``) is published, and the answer is the ticket.
+    - ``POST /agui`` — an AG-UI ``RunAgentInput``, for an agent or a team when ``ag-ui-protocol`` is installed: read
+      as Agno's own AG-UI route reads it, and published in AG-UI as ``apublish(protocol="agui")`` publishes.
     - ``POST /runs/{run_id}/continue`` — the next leg of a paused run, on a new stream.
     - ``POST /runs/{run_id}/cancel`` — cancels a run this interface is publishing.
 
@@ -79,6 +81,8 @@ class IQStream(BaseInterface):
     ) -> None:
         if sum(entity is not None for entity in (agent, team, workflow)) != 1:
             raise ValueError("IQStream publishes one agent, team or workflow.")
+        # Checked here, so that a bad option fails at startup rather than in a route or at a run's close line.
+        self._checked = checked_options(protocol, publish_options, None)
         self.client = client
         self.entity: Agent | Team | Workflow = agent or team or workflow  # type: ignore[assignment]
         self.agent = agent  # pyright: ignore[reportIncompatibleVariableOverride]
@@ -130,6 +134,7 @@ class IQStream(BaseInterface):
             reason = await _continuation_blocked(entity, run_id, request)
             if reason:
                 raise HTTPException(status_code=403, detail=reason)
+            self._refuse_running(run_id)  # with no await between it and _keep()
             handle = continue_run(
                 self.client,
                 entity,
@@ -166,8 +171,7 @@ class IQStream(BaseInterface):
             client_user_id = cast("dict[str, object]", props).get("user_id") if isinstance(props, dict) else None
             user_id = _resolve_user(request, client_user_id if isinstance(client_user_id, str) else None)
             await _assert_session_writable(self.entity, run_input.thread_id, user_id, request)
-            await self._check_agui_resume(run_input, request)
-            handle = self._start_agui(run_input, user_id)
+            handle = await self._start_agui(run_input, user_id, request)
             self._keep(handle, user_id)
             return handle.to_dict()
 
@@ -175,59 +179,96 @@ class IQStream(BaseInterface):
         agui.__annotations__["run_input"] = RunAgentInput
         router.post("/agui")(agui)
 
-    async def _check_agui_resume(self, run_input: Any, request: Request) -> None:
-        """A trailing tool message resumes a paused run, which Agno's own AG-UI route refuses while an admin approval
-        is pending; so does this one, where the installed Agno has the check."""
-        try:
-            from agno.os.interfaces.agui.input import extract_tool_messages
-            from agno.os.interfaces.agui.resume import (  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]
-                find_resume_target_run_id,
-            )
-        except ImportError:  # agno 2.x has no such check
-            return
-        tool_messages = extract_tool_messages(run_input.messages or [])
-        if not tool_messages:
-            return
-        run_id: object = await find_resume_target_run_id(self.entity, run_input.thread_id, tool_messages)
-        reason = await _continuation_blocked(self.entity, run_id if isinstance(run_id, str) else None, request)
-        if reason:
-            raise HTTPException(status_code=403, detail=reason)
-
-    def _start_agui(self, run_input: Any, user_id: str | None) -> StreamHandle:
-        from agno.os.interfaces.agui.router import run_entity
-
-        from ._agui import AguiFramer, AguiTrack
-        from ._tee import Reporter
-
-        options = self.publish_options
-        report = Reporter(options.get("on_error"))
-        ticket = self.client.ticket(None, self.ttl)
-        publisher = self.client.apublisher(ticket.stream_id)
-
-        def fits(data: str, event: str | None) -> bool:
-            return publisher.frame_size(data, event) <= publisher.max_frame_bytes
-
-        framer = AguiFramer(
-            event_names=bool(options.get("event_names", False)),
-            mask_errors=not options.get("expose_errors", False),
-            shrink=options.get("on_oversize", "shrink") == "shrink",
-            fits=fits,
-            size=publisher.frame_size,
-            limit=publisher.max_frame_bytes,
-            report=report,
+    async def _start_agui(self, run_input: Any, user_id: str | None, request: Request) -> StreamHandle:
+        """What Agno's AG-UI route does (``run_entity()``) up to the conversion, with its own helpers: the inputs read
+        from the request, then a new run, or the paused run that trailing tool results answer, which Agno continues
+        under that run's id. The events then go through the tee, as with ``apublish(protocol="agui")``: masked, sized
+        and closed like those of every other route."""
+        from agno.os.interfaces.agui.input import (
+            extract_context,
+            extract_media,
+            extract_tool_messages,
+            extract_user_input,
+            parse_client_tools,
+            validate_state,
         )
-        run_id: str = run_input.run_id
-        track = AguiTrack(framer, run_id=run_id, thread_id=run_input.thread_id)
-        run = _Run(publisher, track, options.get("cancelled", "fail"))
+        from agno.os.interfaces.agui.resume import resume_paused_run  # pyright: ignore[reportUnknownVariableType]
+        from agno.run.base import RunContext
+
         entity: Any = self.entity
-        before_close = options.get("before_close")
-        task = asyncio.get_running_loop().create_task(
-            publish_task(publisher, run, lambda: run_entity(entity, run_input, user_id=user_id), before_close),
-            name=f"iq-stream-agno {run_id}",
+        thread_id: str = run_input.thread_id
+        messages: list[Any] = run_input.messages or []
+        state = validate_state(run_input.state, thread_id)
+        dependencies = extract_context(run_input.context)
+        context = RunContext(
+            run_id=run_input.run_id,
+            session_id=thread_id,
+            user_id=user_id,
+            client_tools=parse_client_tools(run_input.tools) or None,
+            dependencies=dependencies,
+            session_state=state,
         )
-        _running.add(task)
-        task.add_done_callback(_running.discard)
-        return StreamHandle(ticket, run_id, run_input.thread_id, task)
+        extra: dict[str, Any] = {"add_dependencies_to_context": True} if dependencies else {}
+        tool_messages = extract_tool_messages(messages)
+        if tool_messages:
+            try:
+                resumed: AsyncIterable[object] = await resume_paused_run(
+                    entity=entity,
+                    session_id=thread_id,
+                    tool_messages=tool_messages,
+                    run_context=context,
+                    run_kwargs=extra,
+                )
+            except ValueError as error:  # no paused run answers these tool results, or it cannot be resumed here
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            run_id: str = context.run_id
+            # Refused while an admin approval is pending, as Agno's own AG-UI route refuses it.
+            reason = await _continuation_blocked(entity, run_id, request)
+            if reason:
+                raise HTTPException(status_code=403, detail=reason)
+
+            def events() -> AsyncIterable[object]:
+                return resumed
+
+        else:
+            run_id = run_input.run_id
+            images, audio, videos, files = extract_media(messages)
+
+            def events() -> AsyncIterable[object]:
+                return entity.arun(
+                    input=extract_user_input(messages),
+                    stream=True,
+                    stream_events=True,
+                    session_id=thread_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    images=images or None,
+                    audio=audio or None,
+                    videos=videos or None,
+                    files=files or None,
+                    run_context=context,
+                    **extra,
+                )
+
+        self._refuse_running(run_id)  # with no await between it and _keep()
+        checked = dataclasses.replace(self._checked, protocol="agui", transform=None, root_run_id=run_id)
+        ticket = self.client.ticket(None, self.ttl)
+        before_close = self.publish_options.get("before_close")
+        return launch(
+            self.client,
+            ticket,
+            events,
+            run_id,
+            thread_id,
+            checked,
+            before_close,
+            AguiRequest(thread_id, run_input.run_id, state),
+        )
+
+    def _refuse_running(self, run_id: str) -> None:
+        """A run id names one run in flight here: a second request for it would take its place in the registry."""
+        if run_id in self._runs:
+            raise HTTPException(status_code=409, detail="The run is already in flight")
 
     def _keep(self, handle: StreamHandle, user_id: str | None) -> None:
         self._runs[handle.run_id] = (handle, user_id)
@@ -295,9 +336,7 @@ async def _assert_session_writable(entity: Any, session_id: str, user_id: str | 
     )
 
 
-async def _continuation_blocked(entity: Any, run_id: str | None, request: Request) -> str | None:
-    if run_id is None:
-        return None
+async def _continuation_blocked(entity: Any, run_id: str, request: Request) -> str | None:
     from agno.os.auth import run_continuation_blocked_reason
 
     extra: dict[str, Any] = {}
