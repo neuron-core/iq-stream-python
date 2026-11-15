@@ -6,9 +6,9 @@ from collections.abc import Hashable, Iterable
 import pytest
 from haystack.dataclasses import ImageContent, ReasoningContent, StreamingChunk, TextContent, ToolCall
 from haystack.dataclasses.streaming_chunk import ToolCallDelta
+from iq_stream import frame_size
 
 from haystack_integrations.iq_stream import AGUIConverter
-from haystack_integrations.iq_stream.converters.base import frame_size
 from tests.checks import verify_agui
 from tests.fakes import RESULTS_DONE, result_chunk, text_turn, tool_turn, weather_call
 

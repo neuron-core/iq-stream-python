@@ -116,7 +116,7 @@ A generator streams whenever it has a callback, so with the module-level one it 
 
 ## In Hayhooks, or another server
 
-`haystack_integrations.iq_stream.hayhooks.start_stream` starts an agent or a pipeline in a task of the running loop and returns the ticket at once; `on_result(stream_id, result)` runs inside the stream's block, before its close line. A Hayhooks pipeline wrapper returns it from `run_api_async` (from [`examples/hayhooks/weather_agent/pipeline_wrapper.py`](https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-haystack/examples/hayhooks/weather_agent/pipeline_wrapper.py), which the tests deploy in a real Hayhooks server):
+`haystack_integrations.iq_stream.hayhooks.start_stream` starts an agent or a pipeline in a task of the running loop and returns the ticket at once; `before_close(stream_id, result)` runs inside the stream's block, before its close line, and is where you save the answer. A Hayhooks pipeline wrapper returns it from `run_api_async` (from [`examples/hayhooks/weather_agent/pipeline_wrapper.py`](https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-haystack/examples/hayhooks/weather_agent/pipeline_wrapper.py), which the tests deploy in a real Hayhooks server):
 
 ```python
 from hayhooks import BasePipelineWrapper
@@ -132,12 +132,63 @@ iq = IQClient()  # IQ_STREAM_URL, IQ_STREAM_PUBLIC_URL, IQ_STREAM_APP_KEY, IQ_ST
 ...
 class PipelineWrapper(BasePipelineWrapper):
 ...
-    async def run_api_async(self, question: str) -> dict[str, Any]:
+    async def run_api_async(
+        self,
+        question: str,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        protocol: Literal["ag-ui", "ai-sdk"] = "ag-ui",
+    ) -> dict[str, Any]:
         """Starts the agent and returns what the browser needs to subscribe."""
-        return await start_stream(iq, self.agent, {"messages": [ChatMessage.from_user(question)]}, on_result=save)
+        run_args = {"messages": [ChatMessage.from_user(question)]}
+        return await start_stream(
+            iq, self.agent, run_args, before_close=save, thread_id=thread_id, run_id=run_id, protocol=protocol
+        )
 ```
 
-`POST /weather_agent/run` then answers `{"result": {"streamId": ..., "token": ..., "url": ..., "expiresAt": ...}}` and the browser subscribes to `url`. For a pipeline, `run_args` is its data in nested form and the stream's callback goes to every component that takes a `streaming_callback`, teed with one the data already gives. `start_stream` gives a component `acallback` only when that is safe by the rule above, and `callback` when it cannot tell, as for an agent that passes its callback to its tools. Keyword arguments beyond `on_result` and `ttl` go to `IQStream`. An exception in the run closes the stream with `fail` and is logged. `start_stream_sync` does the same from `run_api`, in a thread. Neither imports Hayhooks, so a FastAPI route can return them just as well. The run belongs to the serving process: it ends with that process, and its subscribers then get `iq:fail`.
+`POST /weather_agent/run` with `{"question": ..., "thread_id": ...}` then answers `{"result": {"streamId": ..., "token": ..., "url": ..., "expiresAt": ...}}`: Hayhooks wraps what `run_api_async` returns in `result`, so the page reads the ticket there. `protocol` lets the example serve both bridges below; an application publishes the one its page reads. For a pipeline, `run_args` is its data in nested form and the stream's callback goes to every component that takes a `streaming_callback`, teed with one the data already gives. `start_stream` gives a component `acallback` only when that is safe by the rule above, and `callback` when it cannot tell, as for any agent that passes its callback to its tools (`tool_streaming_callback_passthrough=True`), whether they come at construction or at run time. Keyword arguments beyond `before_close` and `ttl` go to `IQStream` (`stream_id`, `protocol`, `thread_id`, `run_id`, `close_on_cancel`, ...). An exception in the run closes the stream with `fail` and is logged; with a client opened with `on_error="raise"`, a publishing failure after a run that completed is logged as that, not as a failed run. `start_stream_sync` does the same from `run_api`, in a thread. Neither imports Hayhooks, so a FastAPI route can return them just as well. The run belongs to the serving process: it ends with that process, and its subscribers then get `iq:fail`.
+
+In the page, `StreamAgent` from `@neuron-core/iq-stream/ag-ui` posts what the route reads, with AG-UI's `threadId` and `runId`, so that the events carry the client's own ids, and returns the ticket:
+
+```ts
+import { StreamAgent } from '@neuron-core/iq-stream/ag-ui';
+
+const agent = new StreamAgent({
+  threadId: 'chat-1',
+  start: async ({ threadId, runId, messages }) => {
+    const response = await fetch('/weather_agent/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: messages.at(-1)?.content ?? '', thread_id: threadId, run_id: runId }),
+    });
+    return (await response.json()).result; // the ticket, which Hayhooks wraps in "result"
+  },
+});
+
+agent.addMessage({ id: 'user-1', role: 'user', content: 'Weather in Paris?' });
+await agent.runAgent();
+```
+
+With `protocol="ai-sdk"`, `useChat` reads the stream through `chatTransport` from `@neuron-core/iq-stream/ai-sdk`:
+
+```ts
+import { chatTransport } from '@neuron-core/iq-stream/ai-sdk';
+
+const transport = chatTransport({
+  start: async ({ chatId, messages }) => {
+    const question = messages.at(-1)?.parts.find((part) => part.type === 'text')?.text ?? '';
+    const response = await fetch('/weather_agent/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, thread_id: chatId, protocol: 'ai-sdk' }),
+    });
+    return (await response.json()).result;
+  },
+});
+// const { messages, sendMessage, status } = useChat({ id: chatId, transport });
+```
+
+Both snippets run in Node in the integration tests, against the example deployed in a real Hayhooks server and a real IQ-Stream server (Node's `EventSource`, `AbstractChat` of the AI SDK for `useChat`); the React hook itself is not run.
 
 ## Human in the loop
 
@@ -173,7 +224,7 @@ with IQStream(iq) as stream:
     careful_agent.run(load_messages("chat-1"), streaming_callback=stream.callback, hook_context={"stream": stream})
 ```
 
-The run goes on in the same stream once the strategy returns, and closes with `end` when it completes. The request is an AG-UI `CUSTOM` event, an AI SDK `data-tool_confirmation` part, or `{"type": "custom"}` in Haystack's format; a value JSON cannot hold is written as its `str()` in each. `emit(payload, event=None)` publishes a frame exactly as given instead: an `ag_ui.core` event, a mapping as JSON, or a string. A frame of either kind that is too large is dropped and reported to `on_error`, and the stream goes on.
+The run goes on in the same stream once the strategy returns, and closes with `end` when it completes. The request is an AG-UI `CUSTOM` event, an AI SDK `data-tool_confirmation` part, or `{"type": "custom"}` in Haystack's format; in each, a value JSON cannot hold is written as its `str()`, and a NaN or an infinity as `null`, as `JSON.stringify` writes them. `emit(payload, event=None)` publishes a frame exactly as given instead: an `ag_ui.core` event, a mapping as JSON, or a string. A frame of either kind that cannot be encoded (a mapping with keys that are not strings, a reference cycle) or is too large is dropped and reported to `on_error`, and the stream goes on.
 
 ## What the browser needs
 
@@ -203,7 +254,7 @@ The integration tests replay what real subscribers received into `StreamAgent.ru
 | leaving with `CancelledError` | `RUN_FINISHED {outcome: {type: "cancelled"}}` | `abort {reason: "cancelled"}` |
 | `custom(name, value)` | `CUSTOM {name, value}` | `data-<name> {data}` |
 
-A model message that a failing generator leaves open, as when `FallbackChatGenerator` moves to its next generator mid-answer, is closed when the next one starts streaming (its blocks start again), so the page shows the cut-off part and the new answer apart. A tool call cut off that way, or by the `length` limit, has arguments that are not JSON and gets no result, since Haystack runs no such call: AG-UI ends it, and the AI SDK marks it with `tool-input-error`. Empty deltas publish nothing, so Anthropic's empty reasoning and signature chunks are left out; `ReasoningContent.extra`, `ToolCallDelta.extra` and `chunk.meta` are never published. Model messages are told apart by the thread and task that call back, since one model response always comes from one of them while sub-agents interleave. A tool call without a provider id gets one, and its result is matched by tool name and arguments. A result for a call the browser never saw is preceded by that call. Tool results that are content parts become their text, with `[ImageContent]` or `[FileContent]` in place of the rest.
+A model message that a failing generator leaves open, as when `FallbackChatGenerator` moves to its next generator mid-answer, is closed when the next one starts streaming from the same thread or task (its blocks start again), or else when the agent streams the tool results of that step, so the page shows the cut-off part and the new answer apart. A tool call cut off that way, or by the `length` limit, has arguments that are not JSON and gets no result, since Haystack runs no such call: AG-UI ends it, and the AI SDK marks it with `tool-input-error`. Empty deltas publish nothing, so Anthropic's empty reasoning and signature chunks are left out; `ReasoningContent.extra`, `ToolCallDelta.extra` and `chunk.meta` are never published. Model messages are told apart by the thread and task that call back, since one model response always comes from one of them while sub-agents interleave. A tool call without a provider id gets one, and its result is matched by tool name and arguments. A result for a call the browser never saw is preceded by that call. Tool results that are content parts become their text, with `[ImageContent]` or `[FileContent]` in place of the rest.
 
 ## Which close line
 
@@ -211,19 +262,21 @@ A model message that a failing generator leaves open, as when `FallbackChatGener
 | --- | --- | --- |
 | completed, its answer saved in the block | `RUN_FINISHED` / `finish` | `end` |
 | raised, a tool with `raise_on_tool_invocation_failure=True` included, or the save raised | `RUN_ERROR` / `error` | `fail`, and the exception goes on |
-| cancelled (`task.cancel()`) | `RUN_FINISHED` `cancelled` / `abort` | `fail`, or `end` with `cancelled_close="end"`; the cancellation goes on |
+| cancelled (`task.cancel()`) | `RUN_FINISHED` `cancelled` / `abort` | `fail`, or `end` with `close_on_cancel="end"`; the cancellation goes on |
 | waiting for a human in a confirmation strategy | nothing: the stream stays open | none yet |
 | reached `max_agent_steps`, or its `exit_reason` is `length` or `content_filter` | `RUN_FINISHED` / `finish` | `end`: the run returned; raise in the block if you want `fail` |
 | a tool failed without `raise_on_tool_invocation_failure` | an error result, then the rest of the run | `end` |
-| publishing stopped (see below) | none | `fail` |
+| publishing stopped: the publisher gave up or failed (see below) | none | `fail` |
 
 A cancelled run closes with `fail` by default because its answer is incomplete, and a second tab watching the stream should not take it for a finished one; the `cancelled` outcome in the data tells the page that it was a stop.
 
 ## Errors and sizes
 
-Publishing never breaks the run. An exception in Haystack's callback would abort the run, so `callback`, `custom()` and `emit()` catch everything: the first error is reported to `on_error` (by default a warning on the `haystack_integrations.iq_stream` logger, with the error's type and never its text), publishing stops, later chunks are dropped without work, and the stream closes with `fail` when the block is left. Only a frame of your own that is too large is dropped alone, with the stream going on. When the core's publisher gives up, as when the server cannot be reached or the stream outgrew its limit, the core logs it, `on_error` gets its `IQError` as soon as the adapter sees it, and the adapter stops converting. Either way the run, its result and your save are unaffected, and `stream.failed` and `stream.error` say what happened.
+Publishing never breaks the run. An exception in Haystack's callback would abort the run, so `callback`, `custom()` and `emit()` catch everything. A chunk that cannot be converted, or a frame of your own that cannot be encoded or is too large, is skipped: `on_error` gets an `IQError` for it (code `encode_failed`, with the cause as `__cause__`, or a `FrameTooLarge`), and the stream goes on, closing with `end` when the run completes. By default each kind is logged once per stream as a warning on the `haystack_integrations.iq_stream` logger, with the cause's type and never its text or frame data.
 
-An application that would rather fail when publishing stops opens its client with `IQClient(on_error="raise")`. Nothing raises into the run even then, so that it reads to its end and your save in the block happens; leaving the block raises the publisher's `IQError` instead, unless the block raised an exception of its own, which goes on as it is.
+Publishing stops when the core's publisher gives up, as when the server cannot be reached or the stream outgrew its limit, or when the publisher fails in another way (code `publish_failed`). `on_error` gets that `IQError` once, as soon as the adapter sees it, later chunks are dropped without work, the run is read to its end, and the stream closes with `fail`. The core logs its own give-up; the run, its result and your save are unaffected, and `stream.failed` and `stream.error` say what happened.
+
+An application that would rather fail when the publisher gives up opens its client with `IQClient(on_error="raise")`. Nothing raises into the run even then, so that it reads to its end and your save in the block happens; leaving the block raises the publisher's `IQError` instead. When the block raised an exception of its own, that one goes on, and the adapter logs the publisher's error, which the core does not log in this mode. Skipped frames and a `publish_failed` stop never raise.
 
 Error text reaches a browser masked, as "An error occurred.": the message of `RUN_ERROR`, of the AI SDK's `error` and of an error tool result. `expose_errors=True` publishes it.
 
@@ -233,7 +286,7 @@ A frame must fit the publisher's `max_frame_bytes` (64 KiB by default, or the ap
 
 ```text
 IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=None, include_tool_results=True,
-         max_tool_result_bytes=32_768, expose_errors=False, cancelled_close="fail", close_timeout=10.0, on_error=None)
+         max_tool_result_bytes=32_768, expose_errors=False, close_on_cancel="fail", close_timeout=10.0, on_error=None)
 ```
 
 | Option | | |
@@ -245,9 +298,9 @@ IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=Non
 | `include_tool_results` | `True` | `False` publishes `[tool result omitted]` for every result. |
 | `max_tool_result_bytes` | `32_768` | UTF-8 bytes of a tool result before it is truncated. |
 | `expose_errors` | `False` | Publish error text instead of "An error occurred.". |
-| `cancelled_close` | `"fail"` | The close line of a cancelled run. |
-| `close_timeout` | `10.0` | Seconds the close waits for the server, after the core's `min_open`; finite, at least 0. |
-| `on_error` | log | Called once with the exception that stopped publishing, the adapter's or the core publisher's, and with the `FrameTooLarge` of each `custom()` or `emit()` frame that was dropped. |
+| `close_on_cancel` | `"fail"` | The close line of a cancelled run, an `iq_stream.Outcome`. |
+| `close_timeout` | `10.0` | Seconds the close waits for the server's answer, after the core's `min_open`; finite and above 0. A close that is not answered in time ends the stream failed, with `close_timeout`. |
+| `on_error` | log | Called with an `IQError` for each chunk or frame of your own that was skipped (`encode_failed`, or a `FrameTooLarge`), and once with the error that stopped publishing (the core publisher's, or `publish_failed`). |
 
 | Member | |
 | --- | --- |
@@ -256,9 +309,9 @@ IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=Non
 | `custom(name, value)`, `emit(payload, event=None)` | Frames of your own, in order with the run's. They return whether the frame was queued, and never raise. |
 | `ticket(ttl=3600)` | The core's `Ticket` for this stream: `stream_id`, `token`, `url`, `expires_at`, and `to_dict()`. |
 | `stream_id`, `publisher`, `failed`, `error`, `result` | The stream, its publisher once entered, whether publishing stopped and why, and the server's answer to the close line. |
-| `with`, `async with` | One run per `IQStream`. The async form closes off the event loop and is shielded from cancellation. Leaving raises only with a client opened with `on_error="raise"`. |
+| `with`, `async with` | One run per `IQStream`. The async form closes off the event loop and is shielded from cancellation. Leaving raises only the publisher's `IQError`, with a client opened with `on_error="raise"`. |
 
-`iq_streaming_callback`, `iq_streaming_callback_async` and `current_stream()` are module-level. `ChunkConverter` is the protocol a converter follows (`start`, `convert(chunk, source)`, `finish`, `error(exc)`, `cancelled`, `custom(name, value)`, each returning `Frame` objects), and `AGUIConverter`, `AISDKConverter` and `NativeConverter` are the built-in ones.
+`start_stream(client, target, run_args, *, before_close=None, ttl=3600, **stream_options)` and `start_stream_sync(...)` are in `haystack_integrations.iq_stream.hayhooks`. `iq_streaming_callback`, `iq_streaming_callback_async` and `current_stream()` are module-level. `ChunkConverter` is the protocol a converter follows (`start`, `convert(chunk, source)`, `finish`, `error(exc)`, `cancelled`, `custom(name, value)`, each returning `Frame` objects), and `AGUIConverter`, `AISDKConverter` and `NativeConverter` are the built-in ones.
 
 ## Limits worth knowing
 
@@ -296,7 +349,7 @@ def test_the_answer_reaches_the_browser() -> None:
 
 ## Requirements
 
-- Python 3.11 to 3.13, `haystack-ai` 3.x (tested with 3.5.0), `ag-ui-protocol` 1.x; `hayhooks` 2.3 or later for the extra.
+- Python 3.10 to 3.13, `haystack-ai` 3.x (tested with 3.5.0, with 3.3.0 on Python 3.10, whose last release it is, and the unit tests with 3.0.0), `ag-ui-protocol` 1.x; `hayhooks` 2.3 or later for the extra.
 - An IQ-Stream server 1.x.
 
 ## License

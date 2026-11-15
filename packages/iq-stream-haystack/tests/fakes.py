@@ -237,10 +237,11 @@ RESULTS_DONE = StreamingChunk(
 )
 
 
-def fallback_agent(kind: Literal["text", "tool"]) -> Agent:
+def fallback_agent(kind: Literal["text", "tool"], *, retry_in_a_thread: bool = False) -> Agent:
     """A FallbackChatGenerator whose first generator breaks mid-answer, the second answering instead with the same
     callback. ``text``: the first had streamed half a sentence. ``tool``: it had opened call_A and streamed half its
-    arguments; the second calls call_B."""
+    arguments; the second calls call_B. ``retry_in_a_thread``: the second has no ``run_async``, so in ``run_async``
+    the retry streams from a worker thread while the cut-off message was the agent's task's."""
     broken = RuntimeError("the provider's stream broke")
 
     @tool
@@ -261,5 +262,6 @@ def fallback_agent(kind: Literal["text", "tool"]) -> Agent:
     answer = text_turn(["It is sunny in Paris."])
     first = ScriptedChatGenerator([Turn(half, ChatMessage.from_assistant(""), broken, fail_after=2), answer])
     call_b = ToolCall(tool_name="get_weather", arguments={"city": "Paris"}, id="call_B")
-    second = ScriptedChatGenerator([tool_turn([call_b]), answer])
+    retry = SyncOnlyChatGenerator if retry_in_a_thread else ScriptedChatGenerator
+    second = retry([tool_turn([call_b]), answer])
     return Agent(chat_generator=FallbackChatGenerator([first, second]), tools=[get_weather])

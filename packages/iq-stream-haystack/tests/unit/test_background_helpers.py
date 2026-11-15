@@ -78,10 +78,12 @@ async def test_start_stream_answers_at_once_saves_before_the_close_and_keeps_the
     release = threading.Event()
     saved: list[tuple[str, object]] = []
 
-    async def on_result(stream_id: str, result: dict[str, Any]) -> None:
+    async def before_close(stream_id: str, result: dict[str, Any]) -> None:
         saved.append((stream_id, recorders[stream_id].outcome))
 
-    ticket = await start_stream(client, slow_agent(release), {"messages": QUESTION}, on_result=on_result, run_id="r1")
+    ticket = await start_stream(
+        client, slow_agent(release), {"messages": QUESTION}, before_close=before_close, run_id="r1"
+    )
     stream_id = str(ticket["streamId"])
     assert ticket["url"] == f"https://stream.example.com/{stream_id}?token={ticket['token']}"
     assert client.verify("sub", str(ticket["token"]), stream_id)
@@ -111,12 +113,12 @@ async def test_a_failing_run_closes_with_fail_and_is_logged(
 
 
 async def test_a_save_that_fails_closes_with_fail(client: IQClient, recorders: dict[str, RecordingPublisher]) -> None:
-    def on_result(stream_id: str, result: dict[str, Any]) -> None:
+    def before_close(stream_id: str, result: dict[str, Any]) -> None:
         raise OSError("database down")
 
     release = threading.Event()
     release.set()
-    ticket = await start_stream(client, slow_agent(release), {"messages": QUESTION}, on_result=on_result)
+    ticket = await start_stream(client, slow_agent(release), {"messages": QUESTION}, before_close=before_close)
     stream_id = str(ticket["streamId"])
     await finished(recorders, stream_id)
     assert recorders[stream_id].outcome == "fail"
@@ -198,7 +200,9 @@ async def test_an_agent_reaching_a_generator_without_run_async_gets_the_sync_cal
     else:
         agent = sub_agent_coordinator()
     saved: list[dict[str, Any]] = []
-    ticket = await start_stream(client, agent, {"messages": QUESTION}, on_result=lambda _, result: saved.append(result))
+    ticket = await start_stream(
+        client, agent, {"messages": QUESTION}, before_close=lambda _, result: saved.append(result)
+    )
     stream_id = str(ticket["streamId"])
     await finished(recorders, stream_id)
     assert recorders[stream_id].outcome == "end" and len(saved) == 1
@@ -217,7 +221,7 @@ def test_start_stream_sync_runs_in_a_thread_and_saves_before_the_close(
     saved: list[object] = []
     done = threading.Event()
 
-    def on_result(stream_id: str, result: dict[str, Any]) -> None:
+    def before_close(stream_id: str, result: dict[str, Any]) -> None:
         saved.append(
             (recorders[stream_id].outcome, result["agent"]["last_message"].text, threading.current_thread().name)
         )
@@ -225,7 +229,7 @@ def test_start_stream_sync_runs_in_a_thread_and_saves_before_the_close(
 
     pipe = Pipeline()
     pipe.add_component("agent", slow_agent(release))
-    ticket = start_stream_sync(client, pipe, {"agent": {"messages": QUESTION}}, on_result=on_result)
+    ticket = start_stream_sync(client, pipe, {"agent": {"messages": QUESTION}}, before_close=before_close)
     stream_id = str(ticket["streamId"])
     assert saved == []
     release.set()
@@ -253,3 +257,86 @@ def test_start_stream_sync_with_an_agent_tees_its_own_callback(
         time.sleep(0.01)
     assert recorders[stream_id].outcome == "end"
     assert "".join(mine).startswith("Let me check.")
+
+
+async def test_a_passthrough_agent_given_its_tools_at_run_time_gets_the_sync_callback(
+    client: IQClient, recorders: dict[str, RecordingPublisher]
+) -> None:
+    if AgentTool is None:
+        pytest.skip("this haystack-ai has no AgentTool")
+    sub = Agent(chat_generator=SyncOnlyChatGenerator([text_turn(["Sub-agent: ", "sunny."])]))
+    research = AgentTool(agent=sub, name="research", description="Research a question")
+    call = ToolCall(tool_name="research", arguments={"messages": [{"role": "user", "content": "q"}]}, id="r1")
+    agent = Agent(
+        chat_generator=ScriptedChatGenerator([tool_turn([call]), text_turn(["Done."])]),
+        tool_streaming_callback_passthrough=True,
+    )
+    saved: list[dict[str, Any]] = []
+    ticket = await start_stream(
+        client, agent, {"messages": QUESTION, "tools": [research]}, before_close=lambda _, result: saved.append(result)
+    )
+    stream_id = str(ticket["streamId"])
+    await finished(recorders, stream_id)
+    assert recorders[stream_id].outcome == "end" and len(saved) == 1
+    # The sub-agent answered, rather than failing on a coroutine callback.
+    assert verify_agui(recorders[stream_id].data).results == {"r1": "Sub-agent: sunny."}
+
+
+class GivesUpRaising(RecordingPublisher):
+    """A publisher of a client opened with on_error="raise", which gives up at its fourth frame."""
+
+    def __init__(self, stream_id: str) -> None:
+        super().__init__(stream_id, on_error="raise")
+
+    def send(self, data: str, event: str | None = None) -> bool:
+        if self.frames_sent == 3 and self.error is None:
+            self.fail()
+        return super().send(data, event)
+
+
+@pytest.fixture
+def raising(monkeypatch: pytest.MonkeyPatch) -> list[GivesUpRaising]:
+    """The publishers a client opened with on_error="raise" would have opened, giving up mid-run."""
+    opened: list[GivesUpRaising] = []
+
+    def publisher(self: IQClient, stream_id: str) -> GivesUpRaising:
+        opened.append(GivesUpRaising(stream_id))
+        return opened[-1]
+
+    monkeypatch.setattr(IQClient, "publisher", publisher)
+    return opened
+
+
+async def test_a_publishing_failure_of_a_completed_run_is_not_logged_as_a_failed_run(
+    client: IQClient, raising: list[GivesUpRaising], caplog: pytest.LogCaptureFixture
+) -> None:
+    opened = raising
+    release = threading.Event()
+    release.set()
+    saved: list[str] = []
+    with caplog.at_level(logging.WARNING, "haystack_integrations.iq_stream"):
+        await start_stream(
+            client, slow_agent(release), {"messages": QUESTION}, before_close=lambda i, _: saved.append(i)
+        )
+        await wait_for(lambda: bool(opened) and opened[0].close_calls > 0)
+        await wait_for(lambda: not hayhooks._TASKS)  # pyright: ignore[reportPrivateUsage]
+    assert saved == [opened[0].stream_id]
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("the run failed" in message for message in messages)
+    assert messages == [f"{opened[0].error}; the run itself completed, and before_close ran."]
+
+
+def test_start_stream_sync_tells_a_publishing_failure_from_a_failed_run(
+    client: IQClient, raising: list[GivesUpRaising], caplog: pytest.LogCaptureFixture
+) -> None:
+    opened = raising
+    release = threading.Event()
+    release.set()
+    with caplog.at_level(logging.WARNING, "haystack_integrations.iq_stream"):
+        ticket = start_stream_sync(client, slow_agent(release), {"messages": QUESTION})
+        name = f"iq-stream-haystack {ticket['streamId']}"
+        for thread in [thread for thread in threading.enumerate() if thread.name == name]:
+            thread.join(5)
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{opened[0].error}; the run itself completed, and before_close ran."
+    ]

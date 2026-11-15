@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Unpack
+from typing import TYPE_CHECKING
 
 from haystack.dataclasses import ToolCallResult
 
 from ._messages import Call, MessageConverter
 from .base import INVALID_ARGUMENTS, ConverterOptions, Frame, dumps
+
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
 
 # Haystack's finish reasons, in the AI SDK's spelling.
 _FINISH_REASONS = {"stop": "stop", "length": "length", "content_filter": "content-filter", "tool_calls": "tool-calls"}

@@ -2,17 +2,19 @@
 published from a background task of the Hayhooks process.
 
     hayhooks run --pipelines-dir examples/hayhooks
-    POST /weather_agent/run {"question": "Weather in Paris?"}
+    POST /weather_agent/run {"question": "Weather in Paris?", "thread_id": "chat-1"}
       -> {"result": {"streamId": "...", "token": "...", "url": "...", "expiresAt": ...}}
 
 The browser subscribes to ``url``. MockChatGenerator stands for your chat generator, and ``save`` for your database.
+``protocol`` lets one wrapper serve both bridges of @neuron-core/iq-stream, StreamAgent ("ag-ui") and chatTransport
+("ai-sdk"); an application publishes the one its page reads.
 """
 
 import json
 import os
 import time
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from hayhooks import BasePipelineWrapper
 from haystack.components.agents import Agent
@@ -53,6 +55,15 @@ class PipelineWrapper(BasePipelineWrapper):
         )
         self.agent = Agent(chat_generator=model, tools=[get_weather])
 
-    async def run_api_async(self, question: str) -> dict[str, Any]:
+    async def run_api_async(
+        self,
+        question: str,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        protocol: Literal["ag-ui", "ai-sdk"] = "ag-ui",
+    ) -> dict[str, Any]:
         """Starts the agent and returns what the browser needs to subscribe."""
-        return await start_stream(iq, self.agent, {"messages": [ChatMessage.from_user(question)]}, on_result=save)
+        run_args = {"messages": [ChatMessage.from_user(question)]}
+        return await start_stream(
+            iq, self.agent, run_args, before_close=save, thread_id=thread_id, run_id=run_id, protocol=protocol
+        )

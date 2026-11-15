@@ -6,11 +6,14 @@ from __future__ import annotations
 import json
 from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Literal, Unpack
+from typing import TYPE_CHECKING, Literal
 
 from haystack.dataclasses import StreamingChunk, ToolCall, ToolCallResult
 
-from .base import MODEL_FINISH, BaseConverter, ConverterOptions, Frame, new_id
+from .base import MODEL_FINISH, BaseConverter, ConverterOptions, Frame, dumps, new_id
+
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
 
 Block = Literal["reasoning", "text", "call"]
 
@@ -39,8 +42,9 @@ class Message:
     reasoning_id: str | None = None
     texts: int = 0
     calls: dict[int, Call] = field(default_factory=lambda: {})
-    #: The block indexes that carried something, by kind, and the highest: a provider numbers a message's blocks
-    #: upwards, so a block that starts again, or below the highest, belongs to another model call.
+    #: The chunk indexes that carried something, by kind, and the highest: a provider numbers a message's blocks
+    #: upwards, so a block that starts again, or below the highest, belongs to another model call. Tool calls are
+    #: also told apart by ``ToolCallDelta.index``, in ``calls``, which is another numbering.
     blocks: dict[Block, set[int]] = field(default_factory=lambda: {"reasoning": set(), "text": set(), "call": set()})
     top: int = -1
 
@@ -98,12 +102,18 @@ class MessageConverter(BaseConverter):
             if delta.arguments:
                 call.arguments.append(delta.arguments)
                 out += self._call_delta(call, delta.arguments)
+        if chunk.tool_call_result is not None or chunk.finish_reason == "tool_call_results":
+            # The agent streams tool results from the thread or task that called the model, once the model call has
+            # returned: a message still open there was cut off. Its generator failed, and FallbackChatGenerator
+            # retried with one that runs elsewhere (a generator without run_async runs in a worker thread).
+            stale = self._messages.pop(source, None)
+            if stale is not None:
+                out += self._close(stale)
         if chunk.tool_call_result is not None:
             out += self._result(chunk.tool_call_result)
         message = self._messages.get(source)
         if message is not None and chunk.index is not None and (reasoning or chunk.content or chunk.tool_calls):
             message.blocks[_block(chunk)].add(chunk.index)
-            message.blocks["call"].update(delta.index for delta in chunk.tool_calls or [])
             message.top = max(message.top, chunk.index)
         if chunk.finish_reason in MODEL_FINISH:
             message = self._messages.pop(source, None)
@@ -210,7 +220,7 @@ class MessageConverter(BaseConverter):
             call_id = self._answered(origin)
         if call_id is None or call_id not in self._started:
             call = Call(call_id or new_id("call"), origin.tool_name, generated=call_id is None)
-            call.arguments.append(json.dumps(origin.arguments, ensure_ascii=False))
+            call.arguments.append(dumps(origin.arguments))
             self._started.add(call.id)
             out += self._replay_call(call)
             call_id = call.id
@@ -239,21 +249,29 @@ def _block(chunk: StreamingChunk) -> Block:
 
 
 def _starts_another(message: Message, chunk: StreamingChunk) -> bool:
-    """Whether ``chunk``, from the caller whose ``message`` is open, begins another model message: a tool call delta
-    at an index the message used, with another provider id, or without ids but named again after its arguments; or a
-    block that starts at an index the message used for that kind (or for a tool call), or below its highest. OpenAI's
-    chat completions number text and tool calls apart, both from 0, so a tool call does not count the text's index;
-    some providers repeat a call's id and name on every fragment, so those alone mean nothing."""
+    """Whether ``chunk``, from the caller whose ``message`` is open, begins another model message.
+
+    A tool call delta at a ``ToolCallDelta.index`` the message used does when its chunk starts a block, when it
+    carries another provider id, or when, without ids, it names the call again after its arguments (some providers
+    repeat a call's id and name on every fragment, so those alone mean nothing). A block that starts below the highest
+    chunk index does.
+    A text or reasoning block that starts at a chunk index the message used for that kind, or for a tool call, does.
+    A tool call does not count the text's chunk index, since OpenAI's chat completions number text and tool calls
+    apart, both from 0; and chunk and delta indexes are never compared, since Ollama numbers its chunks by position
+    and its tool calls from 1."""
     for delta in chunk.tool_calls or []:
         call = message.calls.get(delta.index)
         if call is None:
             continue
+        if chunk.start:
+            return True
         if delta.id and not call.generated and delta.id != call.id:
             return True
         if not delta.id and call.generated and delta.tool_name and call.arguments:
             return True
     if not chunk.start or chunk.index is None or chunk.tool_call_result is not None:
         return False
+    if chunk.index < message.top:
+        return True
     kind = _block(chunk)
-    used = message.blocks[kind] if kind == "call" else message.blocks[kind] | message.blocks["call"]
-    return chunk.index < message.top or chunk.index in used
+    return kind != "call" and chunk.index in message.blocks[kind] | message.blocks["call"]

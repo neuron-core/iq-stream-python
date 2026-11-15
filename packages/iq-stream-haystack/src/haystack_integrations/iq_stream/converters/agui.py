@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Unpack
+from typing import TYPE_CHECKING
 
 from ag_ui.core import (
     BaseEvent,
@@ -30,10 +30,14 @@ from haystack.dataclasses import ToolCallResult
 from ._messages import Call, MessageConverter
 from .base import ConverterOptions, Frame, dumps, new_id
 
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
+
 
 def encode_event(event: BaseEvent) -> str:
-    """An event's JSON as the TypeScript client reads it: camelCase, unset fields left out."""
-    return event.model_dump_json(by_alias=True, exclude_none=True)
+    """An event's JSON as the TypeScript client reads it: camelCase, unset fields left out. A value JSON cannot hold
+    is written as its ``str()``, and a NaN or an infinity as ``null``, as ``dumps`` writes them."""
+    return event.model_dump_json(by_alias=True, exclude_none=True, fallback=str)
 
 
 class AGUIConverter(MessageConverter):
@@ -67,7 +71,7 @@ class AGUIConverter(MessageConverter):
         return self._frames([*self._close_all(), encode_event(RunErrorEvent(message=message, code="error"))])
 
     def custom(self, name: str, value: object) -> list[Frame]:
-        # Through the JSON the other protocols write, so that what JSON cannot hold becomes its str() here too.
+        # Through the JSON the other protocols write, so that the three write every value alike.
         event = CustomEvent(name=name, value=json.loads(dumps(value)))
         return [Frame(self.fit.whole(encode_event(event)))]
 
