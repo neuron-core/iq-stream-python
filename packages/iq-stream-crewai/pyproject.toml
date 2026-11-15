@@ -1,0 +1,103 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iq-stream-crewai"
+version = "0.1.0"
+description = "Publish a CrewAI run to browsers through an IQ-Stream server, as AG-UI events or CrewAI's own"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+# CrewAI's own range (crewai 1.15: >=3.10,<3.14).
+requires-python = ">=3.10,<3.14"
+authors = [{ name = "Neuron Core" }]
+keywords = ["crewai", "ag-ui", "sse", "server-sent-events", "streaming", "agents", "iq-stream"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "iq-stream>=0.1.0,<0.2",
+    # 1.15.2 is the first release with crewai.events.stream_context.
+    "crewai>=1.15.2,<2",
+    # The pydantic models of AG-UI events, which is the default protocol.
+    "ag-ui-protocol>=1.0,<2",
+]
+
+[project.urls]
+Repository = "https://github.com/neuron-core/iq-stream-python"
+Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-crewai"
+Issues = "https://github.com/neuron-core/iq-stream-python/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+    # The server-route example of the README, run over HTTP by the integration tests.
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[tool.uv]
+constraint-dependencies = [
+    # The versions the plan was researched against; the ranges above stay wide.
+    "crewai==1.15.41",
+    "ag-ui-protocol==1.0.0",
+    # chromadb's, through CrewAI: 1.24 declares Python 3.10 but publishes no wheel for it.
+    "onnxruntime<1.24 ; python_full_version < '3.11'",
+]
+
+[tool.uv.sources]
+iq-stream = { path = "../iq-stream", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iq_stream_crewai"]
+
+# The tests need the repository (its servers and the core), and the lockfile is for development: neither ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/iq_stream_crewai", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+filterwarnings = [
+    "error",
+    # CrewAI's own, at import: crewai.rag refuses the attribute Python sets for a child module.
+    "ignore:Cannot set an attribute on 'crewai.rag':ImportWarning",
+    # CrewAI reading its own deprecated fields.
+    "ignore:function_calling_llm is deprecated:DeprecationWarning:crewai",
+    "ignore:deprecated:DeprecationWarning:crewai",
+    # CrewAI's memory on Python 3.12 and later, partly through its models' default factories, which pydantic calls.
+    "ignore:datetime.datetime.utcnow:DeprecationWarning:(crewai|pydantic)",
+    # CrewAI 1.15.2, the lowest supported, leaves connections to its own sqlite databases open; Python 3.13 warns
+    # when one is collected.
+    "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+    "ignore:Exception ignored in. <sqlite3.Connection object:pytest.PytestUnraisableExceptionWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
