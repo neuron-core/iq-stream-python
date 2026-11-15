@@ -16,19 +16,31 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fakes import FINAL, FIRST, TOOL_RESULT, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
+from fakes import (
+    FINAL,
+    FIRST,
+    TOOL_RESULT,
+    USER,
+    FakeToolCallingModel,
+    booking_agent,
+    failing_agent,
+    research_supervisor,
+    tool_call,
+    weather_agent,
+)
 from iq_stream import IQClient
 from iq_stream.testing import TestServers, subscribe
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 from streams import publish_agui, recording, watch
 
 from iq_stream_langchain import MASKED_MESSAGE, apublish_run, publish_run
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
+README = Path(__file__).resolve().parents[2] / "README.md"
 JS_DIR = os.environ.get("IQ_STREAM_JS_DIR")
 
 
@@ -57,13 +69,17 @@ def node_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return directory
 
 
-def rebuild(node_dir: Path, check: str, received: dict[str, Any]) -> dict[str, Any]:
+def rebuild(node_dir: Path, check: str, received: dict[str, Any], *arguments: str) -> dict[str, Any]:
     """What the front-end library made of the recording."""
     path = node_dir / f"recording-{os.getpid()}-{id(received)}.json"
     path.write_text(json.dumps(received), encoding="utf-8")
     try:
         process = subprocess.run(
-            ["node", "contract.mjs", check, str(path)], cwd=node_dir, capture_output=True, text=True, timeout=60
+            ["node", "contract.mjs", check, str(path), *arguments],
+            cwd=node_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
     finally:
         path.unlink()
@@ -145,6 +161,28 @@ def test_use_stream_sees_the_interrupt(node_dir: Path, iq_client: IQClient, iq_s
     assert [item["value"] for item in result["interrupt"]] == [{"question": "book Turin?"}]
 
 
+def test_the_readme_use_stream_transport_starts_and_resumes_a_run(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    agent = booking_agent(checkpointer=InMemorySaver())
+    config: Any = {"configurable": {"thread_id": "resume"}}
+    assert "__interrupt__" in agent.invoke(USER, config), "the thread waits for a human"
+    ticket, subscription = watch(iq_client, iq_servers.default.url)
+    with iq_client.publisher(ticket.stream_id) as publisher:
+        publish_run(publisher, agent, Command(resume="yes"), config)
+
+    result = rebuild(node_dir, "transport", recording(subscription.result(10)), str(README))
+    assert result["posted"] == [
+        {"url": "/chat", "body": {"thread_id": "thread-1", "message": "Book a trip to Turin"}},
+        {"url": "/chat", "body": {"thread_id": "thread-1", "resume": "yes"}},
+    ]
+    assert result["error"] is None and result["finished"] is True
+    assert result["messages"] == [
+        {"type": "tool", "content": "booked Turin: yes", "tool_calls": []},
+        {"type": "ai", "content": "Booked.", "tool_calls": []},
+    ]
+
+
 def test_use_chat_rebuilds_the_answer_with_its_tool_call(
     node_dir: Path, iq_client: IQClient, iq_servers: TestServers
 ) -> None:
@@ -223,3 +261,16 @@ async def test_stream_agent_accepts_a_cancelled_run(
     assert result["outcome"] == {"type": "cancelled"}
     assert result["failures"] == [], "the client's checks accepted the events that closed what was open"
     assert result["events"][-1] == "RUN_FINISHED"
+
+
+async def test_stream_agent_accepts_a_run_cancelled_inside_a_sub_agent(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    received = await publish_agui(
+        iq_client, iq_servers.default.url, research_supervisor(), cancel_after=0.5, subagent_visibility="attributed"
+    )
+    events = [json.loads(frame.data)["type"] for frame in received.frames]
+    assert "SUBAGENT_STARTED" in events and "SUBAGENT_FINISHED" not in events, "cancelled while the sub-agent wrote"
+    result = rebuild(node_dir, "agui", recording(received))
+    assert result["outcome"] == {"type": "cancelled"}
+    assert result["failures"] == [], "the client's checks accepted the events that closed the sub-agent"

@@ -55,10 +55,12 @@ def run_input() -> RunAgentInput:
     )
 
 
-async def publish_agui(client: IQClient, url: str, graph: Any, *, cancel_after: float | None = None) -> Subscription:
+async def publish_agui(
+    client: IQClient, url: str, graph: Any, *, cancel_after: float | None = None, **agent_options: Any
+) -> Subscription:
     """Runs the graph through ag-ui-langgraph and the relay, and returns what a subscriber received."""
     ticket, subscription = watch(client, url)
-    agent = LangGraphAgent(name="weather", graph=graph, emit_raw_events=False)
+    agent = LangGraphAgent(name="weather", graph=graph, emit_raw_events=False, **agent_options)
 
     async def run() -> None:
         async with client.apublisher(ticket.stream_id) as publisher:

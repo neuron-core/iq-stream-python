@@ -1,6 +1,7 @@
 // Feeds what a real IQ subscriber received to the real front-end libraries and prints what they rebuilt, as JSON.
 //
 //   node contract.mjs <usestream|usechat|agui> <recording.json>
+//   node contract.mjs transport <recording.json> <README.md>
 //
 // The recording is the subscriber's frames and terminal event. A FakeEventSource replays them into the real
 // frames() of @neuron-core/iq-stream, so everything from the IQ client up is the code a page runs: the bridges of
@@ -14,7 +15,7 @@ import { MessageTupleManager, StreamManager } from '@langchain/langgraph-sdk/ui'
 import { AbstractChat } from 'ai';
 import { langGraphParts, uiMessageChunks, useStreamEvents } from './langgraph.mjs';
 
-const [check, file] = process.argv.slice(2);
+const [check, file, readme] = process.argv.slice(2);
 const recording = JSON.parse(readFileSync(file, 'utf8'));
 const URL = 'http://iq.test/stream?token=t';
 
@@ -32,11 +33,12 @@ class Replay extends FakeEventSource {
   }
 }
 
-async function useStream() {
+/** What StreamManager rebuilds from the events `open(signal)` returns, started as useStream starts a submit. */
+async function rebuildStream(open) {
   const manager = new StreamManager(new MessageTupleManager(), { throttle: false });
   let finished = false;
   let error = null;
-  await manager.start(async () => useStreamEvents(langGraphParts(URL, { EventSource: Replay })), {
+  await manager.start(open, {
     getMessages: (values) => (Array.isArray(values.messages) ? values.messages : []),
     setMessages: (current, messages) => ({ ...current, messages }),
     initialValues: {},
@@ -60,6 +62,39 @@ async function useStream() {
       tool_calls: (message.tool_calls ?? []).map((call) => ({ name: call.name, args: call.args, id: call.id })),
     })),
   };
+}
+
+const useStream = () => rebuildStream(async () => useStreamEvents(langGraphParts(URL, { EventSource: Replay })));
+
+/**
+ * The README's useStream transport, called as useStream 1.16 calls it (react/stream.custom.js): for
+ * thread.submit({ messages }), then for thread.submit(undefined, { command: { resume } }), whose events are read
+ * from the recording. Prints what it posted to the backend and what StreamManager rebuilt.
+ */
+async function useStreamTransport() {
+  const block = readFileSync(readme, 'utf8').match(/```ts\n(import \{ useStream \}[\s\S]*?)```/)[1];
+  const code = block
+    .split('\n')
+    .filter((line) => !line.startsWith('import ') && !line.startsWith('const thread = '))
+    .join('\n');
+  const posted = [];
+  const fetch = async (url, init) => {
+    posted.push({ url, body: JSON.parse(init.body) });
+    return { json: async () => ({ url: URL }) };
+  };
+  const transport = new Function('fetch', 'useStreamEvents', 'langGraphParts', `${code}\nreturn transport;`)(
+    fetch,
+    useStreamEvents,
+    langGraphParts,
+  );
+  globalThis.EventSource = Replay;
+  const config = { configurable: { thread_id: 'thread-1' } };
+  const question = { messages: [{ type: 'human', content: 'Book a trip to Turin' }] };
+  await transport.stream({ input: question, config, signal: new AbortController().signal });
+  const resumed = await rebuildStream((signal) =>
+    transport.stream({ input: undefined, command: { resume: 'yes' }, config, signal }),
+  );
+  return { posted, ...resumed };
 }
 
 class HeadlessChat extends AbstractChat {
@@ -160,5 +195,5 @@ async function agUi() {
   };
 }
 
-const checks = { usestream: useStream, usechat: useChat, agui: agUi };
+const checks = { usestream: useStream, transport: useStreamTransport, usechat: useChat, agui: agUi };
 process.stdout.write(`${JSON.stringify(await checks[check]())}\n`);

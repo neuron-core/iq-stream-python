@@ -20,6 +20,7 @@ from fakes import (
     FakeToolCallingModel,
     failing_agent,
     get_weather,
+    research_supervisor,
     scripted_model,
     tool_call,
     weather_agent,
@@ -330,30 +331,6 @@ async def test_an_event_that_cannot_be_encoded_is_dropped_and_the_run_completes(
     assert publisher.outcome == "end"
     warnings = [record.getMessage() for record in caplog.records]
     assert len(warnings) == 1 and "could not be encoded" in warnings[0]
-
-
-def research_supervisor() -> Any:
-    researcher = create_agent(
-        FakeToolCallingModel(
-            messages=iter([AIMessage(content="the researcher writes a long and slow answer here")]), token_delay=0.1
-        ),
-        [],
-        name="researcher",
-    )
-
-    @tool
-    async def research(topic: str, config: RunnableConfig) -> str:
-        """Ask the researcher."""
-        # The config carries the run's callbacks to the sub-agent: on Python 3.10 nothing else does.
-        answer = await researcher.ainvoke({"messages": [{"role": "user", "content": topic}]}, config)
-        return str(answer["messages"][-1].text)
-
-    model = FakeToolCallingModel(
-        messages=iter(
-            [AIMessage(content="", tool_calls=[tool_call("research", {"topic": "Turin"}, "c1")]), "done"]  # type: ignore[list-item]
-        )
-    )
-    return create_agent(model, [research], checkpointer=InMemorySaver(), name="supervisor")
 
 
 async def test_a_cancel_closes_the_sub_agents_that_are_open() -> None:

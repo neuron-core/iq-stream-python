@@ -50,12 +50,14 @@ with iq.publisher(ticket.stream_id) as publisher:
 
 ### In a FastAPI app
 
-`arelay()` and `apublish_run()` are the same over `graph.astream()`. The route answers with the ticket at once; the run is published while the page reads it. A second route cancels it.
+`arelay()` and `apublish_run()` are the same over `graph.astream()`. The route answers with the ticket at once; the run is published while the page reads it. The same route answers an interrupt, as a new run on a new stream. A second route cancels a run.
 
 ```python
 import asyncio
+from typing import Any
 
 from fastapi import FastAPI
+from langgraph.types import Command
 from pydantic import BaseModel
 
 from iq_stream import AsyncPublisher, IQClient
@@ -68,7 +70,8 @@ running: dict[str, asyncio.Task[None]] = {}  # stream id -> the task that publis
 
 class ChatIn(BaseModel):
     thread_id: str
-    message: str
+    message: str | None = None  # a question, or
+    resume: Any = None  # the answer to the interrupt the thread waits on
 
 
 @app.post("/chat")
@@ -96,9 +99,38 @@ async def history(thread_id: str) -> list[dict[str, str]]:
 
 async def run_agent(publisher: AsyncPublisher, body: ChatIn) -> None:
     config = {"configurable": {"thread_id": body.thread_id}}
-    question = {"messages": [{"role": "user", "content": body.message}]}
+    if body.resume is not None:
+        graph_input: Any = Command(resume=body.resume)
+    else:
+        graph_input = {"messages": [{"role": "user", "content": body.message}]}
     async with publisher:  # "end"; "fail" on an exception or a cancellation
-        await apublish_run(publisher, agent, question, config)
+        await apublish_run(publisher, agent, graph_input, config)
+```
+
+A graph whose async nodes block the event loop (a synchronous SDK called in an `async def` node) starves an `AsyncPublisher`'s keepalive. Give such a run a synchronous `Publisher`, whose keepalive has a thread of its own, and close it from a thread too: its `close()` waits for the server, which would stall every other task of the app.
+
+```python
+import asyncio
+
+from iq_stream import IQClient
+from iq_stream_langchain import apublish_run
+
+iq = IQClient()
+
+
+async def answer(question: dict[str, list[dict[str, str]]]) -> None:
+    ticket = iq.ticket()
+    publisher = iq.publisher(ticket.stream_id)
+    try:
+        final = await apublish_run(publisher, agent, question, config)
+        save_answer(final["messages"])
+    except BaseException:
+        await asyncio.to_thread(publisher.close, "fail")
+        raise
+    await asyncio.to_thread(publisher.close, "end")
+
+
+asyncio.run(answer(question))
 ```
 
 Async code that leaves a loop over `arelay()` early wraps it in `contextlib.aclosing()`, so that the stream is closed as a cancelled run at once. Without it Python finalizes the generator later, after the block has closed the stream with `end`.
@@ -227,23 +259,29 @@ With LangGraph's `useStream` (`npm install @neuron-core/iq-stream @langchain/lan
 ```ts
 import { useStream } from '@langchain/langgraph-sdk/react';
 
-const thread = useStream({
-  messagesKey: 'messages',
-  transport: {
-    async stream({ input, signal }) {
-      const message = input.messages.at(-1).content;
-      const response = await fetch('/chat', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ thread_id: threadId, message }), signal,
-      });
-      const ticket = await response.json();
-      return useStreamEvents(langGraphParts(ticket.url, { signal }));
-    },
+// stream() gets the input of thread.submit(input), or the command of thread.submit(undefined, { command }).
+const transport = {
+  async stream({ input, command, config, signal }) {
+    const response = await fetch('/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thread_id: config.configurable.thread_id,
+        message: input?.messages?.at(-1)?.content,
+        resume: command?.resume,
+      }),
+      signal,
+    });
+    const ticket = await response.json();
+    return useStreamEvents(langGraphParts(ticket.url, { signal }));
   },
-});
+};
+
+const thread = useStream({ threadId, messagesKey: 'messages', transport });
+// A run that waits for a human: thread.interrupt holds what it asks, and
+// thread.submit(undefined, { command: { resume: answer } }) answers it.
 ```
 
-A failed run reaches `useStream` as a `StreamError` named after the exception type, and a cancelled one as one named `Cancelled`; `useChat` gets an `error` chunk or an `abort` chunk. When a subscription ends with `iq:gone` (the stream is over and frames this tab missed are gone), load the thread from your backend, as the `/chat/{thread_id}` route above offers. The functions above and the transports ran in Node against what a real subscriber received, through `StreamManager` (the engine of `useStream`), `AbstractChat` (the class behind `useChat`) and `@ai-sdk/langchain` 3.0.172; the React hooks themselves were not run.
+A failed run reaches `useStream` as a `StreamError` named after the exception type, and a cancelled one as one named `Cancelled`; `useChat` gets an `error` chunk or an `abort` chunk. When a subscription ends with `iq:gone` (the stream is over and frames this tab missed are gone), load the thread from your backend, as the `/chat/{thread_id}` route above offers. The functions above and the transports ran in Node against what a real subscriber received, through `StreamManager` (the engine of `useStream`, driven as the hook drives it, a resume included), `AbstractChat` (the class behind `useChat`) and `@ai-sdk/langchain` 3.0.172; the React hooks themselves were not run.
 
 ## AG-UI
 
@@ -280,7 +318,7 @@ async def run(publisher: AsyncPublisher, run_input: RunAgentInput) -> None:
             pass
 ```
 
-Each event is one frame, its JSON as the AG-UI encoder writes it (camelCase). `ag_ui_langgraph` reports a failed run as a `RUN_ERROR` event instead of raising, so the relay closes the stream with `fail` as soon as it has sent one; its message is replaced by `An error occurred.` unless `expose_errors=True`. A cancelled run ends with `RUN_FINISHED` and the `cancelled` outcome, after the events that close what the client holds open (a message, a tool call, a step), which AG-UI clients require of a finished run. In the page, `new StreamAgent({ threadId, start: async (input) => (await fetch('/agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })).json() })` reads these frames as they are.
+`arelay_agui` clones the agent for each run, as `ag_ui_langgraph`'s own endpoint does (`LangGraphAgent` keeps the state of a run on itself), so one agent serves concurrent requests. Each event is one frame, its JSON as the AG-UI encoder writes it (camelCase). `ag_ui_langgraph` reports a failed run as a `RUN_ERROR` event instead of raising, so the relay closes the stream with `fail` as soon as it has sent one; its message is replaced by `An error occurred.` unless `expose_errors=True`. A cancelled run ends with `RUN_FINISHED` and the `cancelled` outcome, after the events that close what the client holds open (a message, a tool call, a step, a sub-agent), which AG-UI clients require of a finished run. In the page, `new StreamAgent({ threadId, start: async (input) => (await fetch('/agent', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })).json() })` reads these frames as they are.
 
 Construct the agent with `emit_raw_events=False`: raw events multiply the size of a stream (69 events and 60 kB against 32 events and 4 kB for one run with a tool call).
 
@@ -292,7 +330,7 @@ Run `graph.stream(input, config, subgraphs=True, version="v2")` (`astream` for `
 
 ### `publish_run(publisher, graph, input, config=None, **options)` and `apublish_run(...)`
 
-Relay the run to its end and return the final state of the root graph, its last `values`, which are requested from the graph and not published.
+Relay the run to its end and return the final state of the root graph, its last `values`, which are requested from the graph and not published. A run that waits for a human has its interrupts under `__interrupt__`, as `invoke()` returns them.
 
 | Option | Default | |
 | --- | --- | --- |
@@ -301,7 +339,7 @@ Relay the run to its end and return the final state of the root graph, its last 
 | `metadata` | `"slim"` | The metadata of a `messages` part: `"slim"` (the keys the browser clients read), `"full"`, or a list of keys. |
 | `expose_errors` | `False` | Publish the message of a failed run's exception and of a `tool-error` part. Otherwise the browser reads `An error occurred.`. |
 | `cancelled` | `"fail"` | The close line of a cancelled run, or `"end"` for an application that treats a stopped answer as final. |
-| `on_oversize` | `None` | Called with an `Oversize` (`part_type`, `size`, `limit`, `truncated`) for every part over the frame limit. Without it, the first one of a run is logged as a warning on the `iq_stream_langchain` logger. |
+| `on_oversize` | `None` | Called with an `Oversize` (`part_type`, `size`, `limit`, `truncated`) for every part over the frame limit. Without it, the first one of a run is logged as a warning on the `iq_stream_langchain` logger. A hook that raises is logged once and never fails the run. |
 | `**stream_kwargs` | | Passed to `graph.stream()`: `context`, `durability`, `interrupt_before`, `control`, ... |
 
 `encode_part(part, metadata="slim", expose_errors=False)` and `error_part(error, expose=False)` return the frame data the relay would send, for code of your own. `arelay_agui(publisher, agent, run_input, cancelled="fail", expose_errors=False, on_oversize=None)` in `iq_stream_langchain.agui` is the AG-UI relay.
@@ -313,15 +351,18 @@ Relay the run to its end and return the final state of the root graph, its last 
 | finishes | the run's last part | `end`, from the `with` block, after your save |
 | pauses on `interrupt()` | `updates` with `__interrupt__` | `end`: the answer waits for a human and resumes as a new run (`Command(resume=...)`) on a new stream |
 | raises | `error` part with the exception's type | `fail`, from the `with` block; the exception goes on to your code |
-| is cancelled: a cancelled task, a loop left early, `KeyboardInterrupt`, a drain request (`RunControl.request_drain()`) | `error` part named `Cancelled` | `fail` (or `cancelled="end"`), sent by the relay itself |
+| is cancelled: a cancelled task, `KeyboardInterrupt`, a drain request (`RunControl.request_drain()`) | `error` part named `Cancelled` | `fail` (or `cancelled="end"`), sent by the relay itself |
+| is left early: a `break`, `close()` / `aclose()` of the relay | `error` part named `Cancelled`, at once | `fail`, sent by the relay; with `cancelled="end"`, `end` from the `with` block |
 
-The adapter never closes a stream that finished: the `with` block does, so that what a late browser loads from you is saved before any browser is told the answer is complete.
+Except for a cancelled run with `cancelled="end"`, the adapter never closes a stream with `end` itself: the `with` block does, so that what a late browser loads from you is saved before any browser is told the answer is complete.
+
+A generator cannot tell a `break` from an exception raised by your own code inside the loop: the page reads the `Cancelled` part for both. The close line is still `fail` after an exception, from the relay or, with `cancelled="end"`, from your block. Catch your own errors inside the loop, or use `publish_run()`, when the page must tell them apart.
 
 ### Errors and limits
 
-Publishing never breaks the run. A publisher that gives up (the server is unreachable, it closed the stream) goes inert, the relay stops encoding parts and goes on reading the run, so that the run and its persistence complete. With the core's `on_error="raise"`, the publishing error leaves the relay like any exception of the run. A part that cannot be encoded is dropped and logged once; a value JSON cannot hold is encoded by its `repr`, never lost.
+Publishing never breaks the run. A publisher that gives up (the server is unreachable, it closed the stream) goes inert, the relay stops encoding parts and goes on reading the run, so that the run and its persistence complete. With the core's `on_error="raise"`, the publishing error leaves the relay like any exception of the run. A part that cannot be encoded is dropped and logged once. Dates and times are ISO 8601 strings, a `timedelta` its seconds, UUIDs, decimals and paths strings, an `Enum` its value, NaN and infinities `null` (a browser's `JSON.parse` refuses the bare constants); any other value JSON cannot hold is encoded by its `repr`, never lost.
 
-A part over the publisher's `max_frame_bytes` (64 KiB unless the app has a limit of its own): a `messages` part with text content, a large tool result usually, is sent with its content cut to fit, ending in `…[truncated]` and with `"truncated": true` in its metadata. Any other part (`updates`, `values`, a `tool-finished` event) is not sent: the result reaches the page in the `messages` part, and the whole of it is in the state your code saves. On the AG-UI path, a text or arguments delta is sent as several deltas of the same id, a tool result is cut, and a snapshot is not sent.
+A part over the publisher's `max_frame_bytes` (64 KiB unless the app has a limit of its own): a `messages` part with text content, a large tool result usually, is sent with its content cut to fit, ending in `…[truncated]` and with `"truncated": true` in its metadata. An `updates` part that carries an interrupt is the only one that tells the page the run waits for a human, so it is never dropped: it is sent with each interrupt's `id`, its `value` cut to fit when it is a string and `null` otherwise, and `"truncated": true`; load the rest from `graph.get_state(config).interrupts`. Any other part (`updates`, `values`, a `tool-finished` event) is not sent: the result reaches the page in the `messages` part, and the whole of it is in the state your code saves. On the AG-UI path, a text or arguments delta is sent as several deltas of the same id, a tool result is cut, and a snapshot is not sent.
 
 ## Limits worth knowing
 
@@ -330,7 +371,23 @@ A part over the publisher's `max_frame_bytes` (64 KiB unless the app has a limit
 - `useStream` ignores the `tools` parts (its tool events are the JavaScript runtime's), and so does `@ai-sdk/langchain`: tool calls and results still render from `messages`. Server features of `useStream` (history, branching, `joinStream`) need LangGraph Server.
 - Graphs served by LangGraph Server or LangGraph Platform are not covered: those stream themselves. An application that only calls `invoke()` has nothing to publish: switch to `stream()` or `publish_run()`.
 - `ag-ui-langgraph` 0.0.47 drops the arguments carried by the chunk that opens a tool call; providers that send a tool call's name and id first, with empty arguments, are not affected.
-- `iq_stream_langchain.experimental.iq_transformer(publisher, methods=...)` publishes the events of `stream_events(version="v3")`, which LangGraph marks as beta, while your code reads `run.output`. No browser client reads those events without LangGraph Server.
+- `iq_stream_langchain.experimental.iq_transformer(publisher, methods=...)` publishes the events of `stream_events(version="v3")`, which LangGraph marks as beta, while your code reads `run.output`. No browser client reads those events without LangGraph Server. A run your code stops early (a loop over a projection left, `run.abort()`, a cancelled task) looks to a transformer like one that finished, or is not reported to it at all: send the `Cancelled` part and the close line yourself.
+
+```python
+from iq_stream import IQClient
+from iq_stream_langchain import CANCELLED_PART
+from iq_stream_langchain.experimental import iq_transformer
+
+iq = IQClient()
+ticket = iq.ticket()
+with iq.publisher(ticket.stream_id) as publisher:
+    with agent.stream_events(question, config, version="v3", transformers=[iq_transformer(publisher)]) as run:
+        for count, message in enumerate(run.messages):
+            if count == 1:  # your own reason to stop
+                publisher.send(CANCELLED_PART)
+                publisher.close("fail")
+                break
+```
 
 ## Requirements
 

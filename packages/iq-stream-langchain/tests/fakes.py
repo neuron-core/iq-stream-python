@@ -22,7 +22,9 @@ from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackMana
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, message_chunk_to_message
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from typing_extensions import TypedDict
@@ -179,6 +181,31 @@ def booking_agent(**options: Any) -> Any:
         )
     )
     return create_agent(model, [book], **options)
+
+
+def research_supervisor() -> Any:
+    """A supervisor whose tool runs a `create_agent` sub-agent, which writes slowly."""
+    researcher = create_agent(
+        FakeToolCallingModel(
+            messages=iter([AIMessage(content="the researcher writes a long and slow answer here")]), token_delay=0.1
+        ),
+        [],
+        name="researcher",
+    )
+
+    @tool
+    async def research(topic: str, config: RunnableConfig) -> str:
+        """Ask the researcher."""
+        # The config carries the run's callbacks to the sub-agent: on Python 3.10 nothing else does.
+        answer = await researcher.ainvoke({"messages": [{"role": "user", "content": topic}]}, config)
+        return str(answer["messages"][-1].text)
+
+    model = FakeToolCallingModel(
+        messages=iter(
+            [AIMessage(content="", tool_calls=[tool_call("research", {"topic": "Turin"}, "c1")]), "done"]  # type: ignore[list-item]
+        )
+    )
+    return create_agent(model, [research], checkpointer=InMemorySaver(), name="supervisor")
 
 
 def failing_agent(**options: Any) -> Any:
