@@ -1,7 +1,7 @@
 // Feeds what a real IQ subscriber received to the real front-end libraries and prints what they rebuilt, as JSON.
 //
 //   node contract.mjs <usestream|usechat|agui> <recording.json>
-//   node contract.mjs transport <recording.json> <README.md>
+//   node contract.mjs <transport|chattransport> <recording.json> <README.md>
 //
 // The recording is the subscriber's frames and terminal event. A FakeEventSource replays them into the real
 // frames() of @neuron-core/iq-stream, so everything from the IQ client up is the code a page runs: the bridges of
@@ -152,6 +152,50 @@ async function useChat() {
   };
 }
 
+/**
+ * The README's useChat transport, as useChat({ resume: true }) drives it after a reload: resume() asks the backend for
+ * the run in flight and the recording is replayed into AbstractChat.resumeStream(); stop() and a resume with nothing
+ * in flight are called too. Prints what it asked the backend and what the chat rebuilt.
+ */
+async function chatTransportOfReadme() {
+  const block = readFileSync(readme, 'utf8').match(/```ts\n(import \{ useChat \}[\s\S]*?)```/)[1];
+  const code = block
+    .split('\n')
+    .filter((line) => !line.startsWith('import ') && !line.startsWith('const { messages'))
+    .join('\n');
+  const asked = [];
+  let inFlight = true;
+  const fetch = async (url, init = {}) => {
+    asked.push({ url, method: init.method ?? 'GET', body: init.body ? JSON.parse(init.body) : null });
+    const ticket = { streamId: 's-1', token: 'tok-1', url: URL, expiresAt: 0 };
+    if (url.endsWith('/stream') && !inFlight) return { status: 204, json: async () => null };
+    return { status: 200, json: async () => ticket };
+  };
+  let options;
+  const capture = (given) => {
+    options = given;
+    return chatTransport(given);
+  };
+  globalThis.EventSource = Replay;
+  const transport = new Function('fetch', 'chatTransport', 'uiMessageChunks', `${code}\nreturn transport;`)(
+    fetch,
+    capture,
+    uiMessageChunks,
+  );
+  const chat = new HeadlessChat({ id: 'thread-1', transport });
+  await chat.resumeStream();
+  options.stop({ streamId: 's-1', token: 'tok-1', url: URL });
+  inFlight = false;
+  const nothing = await options.resume({ chatId: 'thread-1' });
+  const answer = chat.messages.at(-1);
+  return {
+    asked,
+    nothing,
+    status: chat.status,
+    texts: (answer?.parts ?? []).filter((part) => part.type === 'text').map((part) => part.text),
+  };
+}
+
 async function agUi() {
   globalThis.EventSource = Replay; // StreamAgent's default open reads IQ frames through EventSource
   const agent = new StreamAgent({ threadId: 'thread-1', start: async () => ({ url: URL }) });
@@ -195,5 +239,11 @@ async function agUi() {
   };
 }
 
-const checks = { usestream: useStream, transport: useStreamTransport, usechat: useChat, agui: agUi };
+const checks = {
+  usestream: useStream,
+  transport: useStreamTransport,
+  chattransport: chatTransportOfReadme,
+  usechat: useChat,
+  agui: agUi,
+};
 process.stdout.write(`${JSON.stringify(await checks[check]())}\n`);

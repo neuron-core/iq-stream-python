@@ -163,14 +163,38 @@ def test_the_stop_route_cancels_a_run(chat_app: Served, iq_servers: TestServers)
     with httpx.Client(base_url=chat_app.url, trust_env=False, timeout=10) as http:
         ticket = http.post("/chat", json={"thread_id": "t-2", "message": "What is the weather in Turin?"}).json()
         time.sleep(0.2)
-        assert http.post(f"/chat/{ticket['streamId']}/stop").status_code == 200
+        other = http.post("/chat", json={"thread_id": "t-other", "message": "What is the weather in Turin?"}).json()
+        refused = http.post(f"/chat/{ticket['streamId']}/stop", json={"token": other["token"]})
+        assert refused.status_code == 403, "another stream's token"
+        assert http.post(f"/chat/{ticket['streamId']}/stop", json={"token": ticket["token"]}).status_code == 204
         received = subscribe(ticket["url"], timeout=20)
+        went_on = subscribe(other["url"], timeout=20)
+        assert went_on.terminal is not None and went_on.terminal.event == "iq:end", "the other run went on"
     assert received.terminal is not None and received.terminal.event == "iq:fail"
     assert received.data[-1] == CANCELLED_PART
     deadline = time.monotonic() + 5  # the task ends once the server has answered the close line
     while chat_app.namespace["running"]:
         assert time.monotonic() < deadline, "the cancelled task did not end"
         time.sleep(0.02)
+
+
+def test_a_reloaded_page_gets_the_run_in_flight_and_its_stream_from_the_first_frame(
+    chat_app: Served, iq_servers: TestServers
+) -> None:
+    with httpx.Client(base_url=chat_app.url, trust_env=False, timeout=10) as http:
+        assert http.get("/chat/t-4/stream").status_code == 204, "nothing in flight yet"
+        started = http.post("/chat", json={"thread_id": "t-4", "message": "What is the weather in Turin?"}).json()
+        time.sleep(0.3)  # the page reloads while the answer is written
+        ticket = http.get("/chat/t-4/stream").json()
+        assert ticket["streamId"] == started["streamId"]
+        received = subscribe(ticket["url"], timeout=20)
+        assert received.terminal is not None and received.terminal.event == "iq:end"
+        parts = [json.loads(data) for data in received.data]
+        assert parts[0]["type"] == "metadata" and text_of(parts) == FIRST + FINAL, "replayed from the first frame"
+        deadline = time.monotonic() + 5
+        while http.get("/chat/t-4/stream").status_code != 204:
+            assert time.monotonic() < deadline, "the finished run is still in flight"
+            time.sleep(0.05)
 
 
 def test_the_chat_route_resumes_a_run_that_waits_for_a_human(booking_app: Served, iq_servers: TestServers) -> None:
@@ -210,6 +234,8 @@ def test_the_ag_ui_route_publishes_ag_ui_events(agent_app: Served, iq_servers: T
     types = [json.loads(data)["type"] for data in received.data]
     assert types[0] == "RUN_STARTED" and types[-1] == "RUN_FINISHED"
     assert "TOOL_CALL_RESULT" in types
+    [messages] = agent_app.namespace["saved"]
+    assert messages[-1].content == FINAL, "before_close saved the answer"
 
 
 def test_the_ag_ui_route_serves_two_requests_at_once(agent_app: Served, iq_servers: TestServers) -> None:

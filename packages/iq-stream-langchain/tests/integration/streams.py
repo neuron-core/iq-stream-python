@@ -56,7 +56,14 @@ def run_input() -> RunAgentInput:
 
 
 async def publish_agui(
-    client: IQClient, url: str, graph: Any, *, cancel_after: float | None = None, **agent_options: Any
+    client: IQClient,
+    url: str,
+    graph: Any,
+    *,
+    cancel_after: float | None = None,
+    before_close: Any = None,
+    raises: type[BaseException] | None = None,
+    **agent_options: Any,
 ) -> Subscription:
     """Runs the graph through ag-ui-langgraph and the relay, and returns what a subscriber received."""
     ticket, subscription = watch(client, url)
@@ -64,13 +71,14 @@ async def publish_agui(
 
     async def run() -> None:
         async with client.apublisher(ticket.stream_id) as publisher:
-            async for _ in arelay_agui(publisher, agent, run_input()):
+            async for _ in arelay_agui(publisher, agent, run_input(), before_close=before_close):
                 pass
 
     task = asyncio.create_task(run())
     if cancel_after is not None:
         await asyncio.sleep(cancel_after)
         task.cancel()
-    with pytest.raises(asyncio.CancelledError) if cancel_after is not None else contextlib.nullcontext():
+        raises = asyncio.CancelledError
+    with pytest.raises(raises) if raises is not None else contextlib.nullcontext():
         await task
     return await subscription
