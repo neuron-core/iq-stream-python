@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iq-stream-agno"
+version = "0.1.0"
+description = "Publish Agno agent, team and workflow runs to browsers through an IQ-Stream server"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Neuron Core" }]
+keywords = ["agno", "agentos", "ag-ui", "sse", "server-sent-events", "streaming", "agents", "iq-stream"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = ["iq-stream>=0.1.0,<0.2", "agno>=2.9,<4"]
+
+[project.optional-dependencies]
+# Agno's own AG-UI converter and the ag-ui-protocol models it emits. The converter lives in agno.os, whose
+# package imports FastAPI.
+agui = ["agno[agui]>=2.9,<4", "fastapi"]
+# The AgentOS interface, iq_stream_agno.os.IQStream.
+os = ["agno[os]>=2.9,<4"]
+
+[project.urls]
+Repository = "https://github.com/neuron-core/iq-stream-python"
+Source = "https://github.com/neuron-core/iq-stream-python/tree/main/packages/iq-stream-agno"
+Issues = "https://github.com/neuron-core/iq-stream-python/issues"
+
+[dependency-groups]
+dev = [
+    "iq-stream-agno[agui,os]",
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+    "ruff",
+    "pyright",
+]
+
+[tool.uv]
+# The versions the plan (SDKs/agno.md) was researched and prototyped against; the ranges above stay wide. The
+# plan's jsonpatch, fastapi and starlette need Python 3.11, so 3.10 resolves the newest it can have.
+constraint-dependencies = [
+    "agno==3.2.0",
+    "ag-ui-protocol==1.0.0",
+    "jsonpatch==1.47 ; python_version >= '3.11'",
+    "fastapi==0.162.7 ; python_version >= '3.11'",
+    "starlette==1.10.0 ; python_version >= '3.11'",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.3",
+    "httpx==0.28.1",
+]
+
+[tool.uv.sources]
+iq-stream = { path = "../iq-stream", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iq_stream_agno"]
+
+# The tests need the repository (its servers and the JavaScript checkout), and the lockfile is for development:
+# neither ships.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/iq_stream_agno", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests/unit"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
