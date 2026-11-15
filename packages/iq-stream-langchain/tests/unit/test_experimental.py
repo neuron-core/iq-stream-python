@@ -8,7 +8,7 @@ from collections import Counter
 from typing import Any
 
 import pytest
-from fakes import FINAL, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
+from fakes import FINAL, LANGGRAPH_1_2, NEEDS_1_2, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
 from iq_stream.testing import RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
@@ -20,9 +20,13 @@ from typing_extensions import TypedDict
 from iq_stream_langchain import MASKED_MESSAGE, Oversize
 from iq_stream_langchain.experimental import iq_transformer
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:The v3 streaming protocol on Pregel is experimental:langchain_core._api.beta_decorator.LangChainBetaWarning"
-)
+pytestmark = [
+    pytest.mark.skipif(not LANGGRAPH_1_2, reason=NEEDS_1_2),
+    pytest.mark.filterwarnings(
+        "ignore:The v3 streaming protocol on Pregel is experimental"
+        ":langchain_core._api.beta_decorator.LangChainBetaWarning"
+    ),
+]
 
 
 def kinds(publisher: RecordingPublisher) -> Counter[tuple[str, Any]]:

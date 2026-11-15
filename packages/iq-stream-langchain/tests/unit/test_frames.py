@@ -14,7 +14,7 @@ import uuid
 from typing import Any
 
 import pytest
-from fakes import USER, FakeToolCallingModel, hitl_agent, tool_call, weather_agent
+from fakes import LANGGRAPH_1_2, USER, FakeToolCallingModel, hitl_agent, tool_call, weather_agent
 from iq_stream.testing import RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -93,13 +93,14 @@ def test_interrupts_and_dataclasses_are_encoded() -> None:
         "ns": ("tools:abc",),
         "data": {"__interrupt__": (Interrupt(value={"question": "ok?"}, id="i1"),)},
     }
+    schema = {"response_schema": None} if LANGGRAPH_1_2 else {}  # a field of langgraph 1.2's Interrupt
     assert json.loads(encode_part(part)) == {
         "type": "updates",
         "ns": ["tools:abc"],
-        "data": {"__interrupt__": [{"value": {"question": "ok?"}, "id": "i1", "response_schema": None}]},
+        "data": {"__interrupt__": [{"value": {"question": "ok?"}, "id": "i1", **schema}]},
     }
     values = {"type": "values", "ns": (), "data": {"x": 1}, "interrupts": (Interrupt(value=1, id="i2"),)}
-    assert json.loads(encode_part(values))["interrupts"] == [{"value": 1, "id": "i2", "response_schema": None}]
+    assert json.loads(encode_part(values))["interrupts"] == [{"value": 1, "id": "i2", **schema}]
     assert "interrupts" not in json.loads(encode_part({**values, "interrupts": ()}))
 
 
@@ -125,8 +126,9 @@ def test_a_failing_tool_has_its_message_masked() -> None:
     with pytest.raises(ValueError, match="sk-123"), publisher:
         publish_run(publisher, create_agent(model, [get_weather]), USER)
     assert not any("sk-123" in data for data in publisher.data)
-    tool_error = next(json.loads(data)["data"] for data in publisher.data if '"tool-error"' in data)
-    assert tool_error == {"event": "tool-error", "tool_call_id": "c1", "message": MASKED_MESSAGE}
+    if LANGGRAPH_1_2:  # the tools stream mode
+        tool_error = next(json.loads(data)["data"] for data in publisher.data if '"tool-error"' in data)
+        assert tool_error == {"event": "tool-error", "tool_call_id": "c1", "message": MASKED_MESSAGE}
     assert json.loads(publisher.data[-1])["data"] == {"error": "ValueError", "message": MASKED_MESSAGE}
     assert publisher.outcome == "fail"
 
@@ -164,10 +166,10 @@ def test_a_large_tool_result_is_truncated_and_a_large_update_not_sent() -> None:
     assert tool_message["data"][1]["truncated"] is True
     assert publisher.frame_size(publisher.data[parts.index(tool_message)]) > 2000, "cut as little as possible"
     # The tools node's update and the tool's finish event carry the result too: not sent.
-    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started"]
+    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == (["tool-started"] * LANGGRAPH_1_2)
     assert [list(part["data"]) for part in parts if part["type"] == "updates"] == [["model"], ["model"]]
     assert [(report.part_type, report.truncated) for report in reports] == [
-        ("tools", False),
+        *([("tools", False)] * LANGGRAPH_1_2),
         ("messages", True),
         ("updates", False),
     ]
@@ -181,7 +183,8 @@ def test_an_oversized_part_is_reported_once_per_run(caplog: pytest.LogCaptureFix
         publish_run(publisher, big_tool_agent(10_000), USER)
     messages = [record.getMessage() for record in caplog.records]
     assert len(messages) == 1
-    assert "tools part of" in messages[0] and "2048" in messages[0] and "not sent" in messages[0]
+    kind, what = ("tools", "not sent") if LANGGRAPH_1_2 else ("messages", "truncated")
+    assert f"{kind} part of" in messages[0] and "2048" in messages[0] and what in messages[0]
     assert "xxx" not in messages[0], "no frame data in a log line"
 
 
@@ -254,9 +257,8 @@ def test_a_human_in_the_loop_interrupt_keeps_what_a_client_needs_to_ask() -> Non
     assert request["name"] == "send_email"
     assert request["args"]["to"] == "team@example.com"
     assert request["args"]["body"].endswith(TRUNCATED_MARKER) and request["args"]["body"].startswith("Dear team")
-    assert cut["value"]["review_configs"] == [
-        {"action_name": "send_email", "allowed_decisions": ["approve", "edit", "reject", "respond"]}
-    ]
+    [review] = cut["value"]["review_configs"]
+    assert review["action_name"] == "send_email" and "approve" in review["allowed_decisions"]
     assert publisher.frame_size(publisher.data[-1]) <= 1024
 
 

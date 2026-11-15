@@ -15,9 +15,11 @@ import pytest
 from ag_ui.core import Event, RunAgentInput, RunErrorEvent, RunFinishedEvent, RunStartedEvent, UserMessage
 from ag_ui_langgraph import LangGraphAgent
 from fakes import (
+    ASYNC_INTERRUPTS,
     ASYNC_TOKENS,
     FINAL,
     FIRST,
+    NEEDS_3_11,
     USER,
     FakeToolCallingModel,
     failing_agent,
@@ -540,6 +542,7 @@ async def hitl_run(publisher: AsyncRecordingPublisher, **options: Any) -> list[s
         return [event.type.value async for event in arelay_agui(publisher, agent, run_input())]
 
 
+@pytest.mark.skipif(not ASYNC_INTERRUPTS, reason=NEEDS_3_11)
 async def test_an_interrupt_over_the_limit_still_asks_the_human() -> None:
     publisher = AsyncRecordingPublisher(max_frame_bytes=1024)
     seen = await hitl_run(publisher)
@@ -556,6 +559,7 @@ async def test_an_interrupt_over_the_limit_still_asks_the_human() -> None:
     assert publisher.outcome == "end"
 
 
+@pytest.mark.skipif(not ASYNC_INTERRUPTS, reason=NEEDS_3_11)
 async def test_an_interrupt_outcome_over_the_limit_keeps_run_finished_and_its_ids() -> None:
     publisher = AsyncRecordingPublisher(max_frame_bytes=1024)
     reports: list[Oversize] = []

@@ -11,14 +11,23 @@ import time
 from typing import Any
 
 import pytest
-from fakes import USER, FakeToolCallingModel, booking_agent, failing_agent, stubborn_agent, tool_call, weather_agent
+from fakes import (
+    LANGGRAPH_1_2,
+    NEEDS_1_2,
+    USER,
+    FakeToolCallingModel,
+    booking_agent,
+    failing_agent,
+    stubborn_agent,
+    tool_call,
+    weather_agent,
+)
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.errors import GraphDrained
-from langgraph.runtime import RunControl
+from langgraph.config import get_stream_writer
 from langgraph.types import Command
 
 from iq_stream_langchain import CANCELLED_PART, MASKED_MESSAGE, apublish_run, arelay, publish_run, relay
@@ -158,7 +167,11 @@ async def test_an_async_loop_left_early_without_aclosing_closes_end() -> None:
     assert publisher.outcome == "end"
 
 
+@pytest.mark.skipif(not LANGGRAPH_1_2, reason=NEEDS_1_2)
 def test_a_drain_request_is_a_cancelled_run() -> None:
+    from langgraph.errors import GraphDrained  # type: ignore[attr-defined, unused-ignore]
+    from langgraph.runtime import RunControl  # type: ignore[attr-defined, unused-ignore]
+
     control = RunControl()
 
     @tool
@@ -191,14 +204,15 @@ def test_a_run_that_waits_for_a_human_closes_end_and_resumes_on_a_new_stream() -
     assert parts[-1]["type"] == "updates"
     assert parts[-1]["data"]["__interrupt__"][0]["value"] == {"question": "book Turin?"}
     assert parts[-1]["data"]["__interrupt__"][0]["id"]
-    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started"]
+    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started"] * LANGGRAPH_1_2
     assert paused.outcome == "end"
 
     resumed = RecordingPublisher()
     with resumed:
         final = publish_run(resumed, agent, Command(resume="yes"), config)
     parts = [json.loads(data) for data in resumed.data]
-    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started", "tool-finished"]
+    tools = [part["data"]["event"] for part in parts if part["type"] == "tools"]
+    assert tools == ["tool-started", "tool-finished"] * LANGGRAPH_1_2
     assert final["messages"][-2].content == "booked Turin: yes"
     assert resumed.outcome == "end"
 
@@ -265,6 +279,7 @@ def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
     @tool
     def get_weather(city: str) -> str:
         """Get the weather for a city."""
+        get_stream_writer()({"looking up": city})
         time.sleep(1.5)
         return "sunny"
 
@@ -277,7 +292,7 @@ def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
     left = 0.0
     with publisher:
         for part in relay(publisher, create_agent(model, [get_weather]), USER):
-            if part["type"] == "tools":
+            if part["type"] == "custom":  # the tool runs
                 left = time.monotonic()
                 break
         assert publisher.outcome == "fail", "closed before the block's own close"
@@ -338,8 +353,8 @@ async def test_an_async_cancel_is_published_before_the_graph_has_stopped(stop: s
         relayed = arelay(publisher, stubborn_agent(1.0, entered), USER, {"configurable": {"thread_id": "slow"}})
         async with publisher, contextlib.aclosing(relayed):
             async for part in relayed:
-                if stop == "break" and part["type"] == "tools":
-                    await entered.wait()
+                if stop == "break" and part["type"] == "updates" and "model" in part["data"]:
+                    await entered.wait()  # the relay reads on meanwhile, and LangGraph runs the tool
                     break
 
     task = asyncio.create_task(run())

@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 import pytest
-from fakes import FINAL, USER, weather_agent
+from fakes import FINAL, LANGGRAPH_1_2, USER, weather_agent
 from iq_stream import IQError
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain_core.messages import AIMessage
@@ -51,7 +51,7 @@ def test_a_publisher_that_gives_up_halfway_stops_frames_and_the_run_goes_on() ->
             seen += 1
             if seen == 5:
                 publisher.fail()  # as after a fatal answer from the server
-    assert seen == 23, "the whole run was read"
+    assert seen == (23 if LANGGRAPH_1_2 else 21), "the whole run was read"
     assert len(publisher.frames) == 6, "the metadata part and five parts"
     assert publisher.outcome is None, "a publisher that gave up has no close line of its own"
 

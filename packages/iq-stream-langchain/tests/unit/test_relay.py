@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 import pytest
-from fakes import ASYNC_TOKENS, FINAL, FIRST, TOOL_RESULT, USER, text_of, weather_agent
+from fakes import ASYNC_TOKENS, FINAL, FIRST, LANGGRAPH_1_2, TOOL_RESULT, USER, text_of, weather_agent
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
 from iq_stream_langchain import DEFAULT_STREAM_MODE, apublish_run, arelay, publish_run, relay
@@ -16,6 +16,9 @@ EXPECTED_TYPES += [*["messages"] * 8, "updates"]
 # An async run streams whole messages on Python 3.10 (see fakes.ASYNC_TOKENS).
 EXPECTED_ASYNC_TYPES = EXPECTED_TYPES if ASYNC_TOKENS else ["metadata", "messages", "updates", "tools", "tools"]
 EXPECTED_ASYNC_TYPES += [] if ASYNC_TOKENS else ["messages", "updates", "messages", "updates"]
+if not LANGGRAPH_1_2:  # the tools stream mode is langgraph 1.2's
+    EXPECTED_TYPES = [kind for kind in EXPECTED_TYPES if kind != "tools"]
+    EXPECTED_ASYNC_TYPES = [kind for kind in EXPECTED_ASYNC_TYPES if kind != "tools"]
 
 
 def decoded(publisher: RecordingPublisher | AsyncRecordingPublisher) -> list[dict[str, Any]]:
@@ -34,11 +37,12 @@ def test_a_sync_run_publishes_every_part_in_order_and_ends() -> None:
     tool_messages = [part for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool"]
     assert [message["data"][0]["content"] for message in tool_messages] == [TOOL_RESULT]
     tools = [part["data"] for part in parts if part["type"] == "tools"]
-    assert [(tool["event"], tool["tool_call_id"]) for tool in tools] == [
-        ("tool-started", "call_1"),
-        ("tool-finished", "call_1"),
-    ]
-    assert tools[0]["input"] == {"city": "Turin"}
+    if LANGGRAPH_1_2:
+        assert [(tool["event"], tool["tool_call_id"]) for tool in tools] == [
+            ("tool-started", "call_1"),
+            ("tool-finished", "call_1"),
+        ]
+        assert tools[0]["input"] == {"city": "Turin"}
     assert all(part["ns"] == [] for part in parts)
     assert publisher.outcome == "end"
     # Every part was yielded, and each published one is the same part.

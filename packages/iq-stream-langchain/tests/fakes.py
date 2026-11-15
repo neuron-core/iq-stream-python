@@ -15,6 +15,7 @@ import sys
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from functools import reduce
+from importlib.metadata import version
 from typing import Annotated, Any
 
 from langchain.agents import create_agent
@@ -33,6 +34,15 @@ from typing_extensions import TypedDict
 #: in async code only from Python 3.11, whose asyncio.create_task takes a context. On 3.10 an async run streams whole
 #: messages, not tokens.
 ASYNC_TOKENS = sys.version_info >= (3, 11)
+
+#: langgraph 1.2 added the `tools` stream mode, drain requests, Interrupt.response_schema and
+#: stream_events(version="v3"). The unit tests run on the declared floor (1.1) too, where those are absent.
+LANGGRAPH_1_2 = tuple(int(number) for number in version("langgraph").split(".")[:2]) >= (1, 2)
+NEEDS_1_2 = "needs langgraph 1.2 (the tools stream mode, drain requests, stream_events v3)"
+#: The same limit for interrupt(): LangChain's HumanInTheLoopMiddleware fails an async run on Python 3.10 with
+#: "Called get_config outside of a runnable context", with or without the adapter.
+ASYNC_INTERRUPTS = ASYNC_TOKENS
+NEEDS_3_11 = "LangChain's async interrupt() needs Python 3.11 (asyncio.create_task with a context)"
 
 USER = {"messages": [{"role": "user", "content": "weather in Turin?"}]}
 FIRST = "Let me check the weather."
