@@ -24,6 +24,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, mess
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 from typing_extensions import TypedDict
 
 #: LangChain hands a run's callbacks to a model that a node calls without its config (create_agent's model node does)
@@ -161,6 +162,23 @@ def weather_agent(**options: Any) -> Any:
     """A `create_agent` agent with one tool call. Options go to `create_agent`, except the model's own."""
     model_options = {key: options.pop(key) for key in ("token_delay", "fail_after_tokens") if key in options}
     return create_agent(scripted_model(**model_options), [get_weather], **options)
+
+
+@tool
+def book(city: str) -> str:
+    """Book a trip; a human approves it first."""
+    approved = interrupt({"question": f"book {city}?"})
+    return f"booked {city}: {approved}"
+
+
+def booking_agent(**options: Any) -> Any:
+    """A `create_agent` agent whose tool waits for a human; with a checkpointer, `Command(resume=...)` resumes it."""
+    model = FakeToolCallingModel(
+        messages=iter(
+            [AIMessage(content="", tool_calls=[tool_call("book", {"city": "Turin"}, "c1")]), "Booked."]  # type: ignore[list-item]
+        )
+    )
+    return create_agent(model, [book], **options)
 
 
 def failing_agent(**options: Any) -> Any:

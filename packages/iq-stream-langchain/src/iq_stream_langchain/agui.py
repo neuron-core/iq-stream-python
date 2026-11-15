@@ -13,21 +13,31 @@ from typing import TYPE_CHECKING, Any
 from iq_stream import AsyncPublisherLike, FrameTooLarge, IQError, PublisherLike
 
 from ._encode import MASKED_MESSAGE, TRUNCATED_MARKER, dumps, longest_fit
-from ._relay import CancelledOutcome, Oversize, aclose_publisher, logger, stopped
+from ._relay import CancelledOutcome, aclose_publisher, stopped
+from ._reports import Oversize, Reports
 
 if TYPE_CHECKING:
     from ag_ui.core import BaseEvent, RunAgentInput
     from ag_ui_langgraph import LangGraphAgent  # pyright: ignore[reportMissingTypeStubs]
 
-# An event that opens something the client tracks, the event that closes it, and the field that names it.
-_OPENERS = {
-    "TEXT_MESSAGE_START": ("TEXT_MESSAGE_END", "messageId"),
-    "TOOL_CALL_START": ("TOOL_CALL_END", "toolCallId"),
-    "REASONING_START": ("REASONING_END", "messageId"),
-    "REASONING_MESSAGE_START": ("REASONING_MESSAGE_END", "messageId"),
-    "STEP_STARTED": ("STEP_FINISHED", "stepName"),
+_CANCELLED = "run cancelled"
+# An event that opens something the client tracks: the events that close it, the field that names it, and what else
+# the closing event the relay sends on a cancel needs.
+_OPENERS: dict[str, tuple[tuple[str, ...], str, dict[str, str]]] = {
+    "TEXT_MESSAGE_START": (("TEXT_MESSAGE_END",), "messageId", {}),
+    "TOOL_CALL_START": (("TOOL_CALL_END",), "toolCallId", {}),
+    "REASONING_START": (("REASONING_END",), "messageId", {}),
+    "REASONING_MESSAGE_START": (("REASONING_MESSAGE_END",), "messageId", {}),
+    "STEP_STARTED": (("STEP_FINISHED",), "stepName", {}),
+    # A sub-agent of LangGraphAgent(subagent_visibility="attributed"): ended by an error on a cancel, since it did
+    # not finish.
+    "SUBAGENT_STARTED": (
+        ("SUBAGENT_ERROR", "SUBAGENT_FINISHED"),
+        "subagentRunId",
+        {"message": _CANCELLED, "code": "cancelled"},
+    ),
 }
-_CLOSERS = {closer for closer, _ in _OPENERS.values()}
+_CLOSERS = {closer for closers, _, _ in _OPENERS.values() for closer in closers}
 # Events whose text may be sent as several events of the same id when one frame cannot hold it.
 _DELTAS = {"TEXT_MESSAGE_CONTENT", "TOOL_CALL_ARGS", "REASONING_MESSAGE_CONTENT"}
 # Fields an event can do without, dropped when it does not fit.
@@ -46,25 +56,25 @@ class _AguiRun:
         self.thread_id = run_input.thread_id
         self.run_id = run_input.run_id
         self.expose_errors = expose_errors
-        self.on_oversize = on_oversize
-        self.oversize_reported = False
+        self.reports = Reports(pub.stream_id, on_oversize, "event")
         self.started = False
         #: RUN_FINISHED or RUN_ERROR, once relayed.
         self.terminal: str | None = None
-        #: What the client holds open, as the events that would close it, in the order it was opened.
-        self.open: list[dict[str, Any]] = []
+        #: What the client holds open, in the order it was opened: the events that close it, the fields that name
+        #: it, and the event that closes it on a cancel.
+        self.open: list[tuple[tuple[str, ...], dict[str, Any], dict[str, Any]]] = []
 
     def track(self, kind: str, event: dict[str, Any]) -> None:
         if kind in _OPENERS:
-            closer, key = _OPENERS[kind]
-            closing = {"type": closer, key: event.get(key)}
-            if "subagentRunId" in event:
-                closing["subagentRunId"] = event["subagentRunId"]
-            self.open.append(closing)
+            closers, key, extra = _OPENERS[kind]
+            names = {key: event.get(key)}
+            if "subagentRunId" in event:  # attributed to a sub-agent: a step name repeats in each
+                names["subagentRunId"] = event["subagentRunId"]
+            self.open.append((closers, names, {"type": closers[0], **names, **extra}))
         elif kind in _CLOSERS:
             for index in range(len(self.open) - 1, -1, -1):
-                closing = self.open[index]
-                if closing["type"] == kind and all(closing[key] == event.get(key) for key in closing if key != "type"):
+                closers, names, _ = self.open[index]
+                if kind in closers and all(event.get(name) == value for name, value in names.items()):
                     del self.open[index]
                     break
 
@@ -77,15 +87,17 @@ class _AguiRun:
         # A publisher that gave up is not fed: nothing is encoded for the rest of the run, which goes on.
         if stopped(self.pub):
             return
-        fields = event.model_dump(mode="json", by_alias=True, exclude_none=True)
+        try:
+            fields = event.model_dump(mode="json", by_alias=True, exclude_none=True)
+            if kind.endswith("_ERROR") and not self.expose_errors:
+                fields = {**fields, "message": MASKED_MESSAGE}
+                fields.pop("rawEvent", None)
+            data = dumps(fields)
+        except Exception:
+            # ag_ui_langgraph passes custom values and the state as they are: one of them may not encode.
+            self.reports.unencodable(kind)
+            return
         self.track(kind, fields)
-        if kind.endswith("_ERROR") and not self.expose_errors:
-            fields = {**fields, "message": MASKED_MESSAGE}
-            fields.pop("rawEvent", None)
-        self.send(fields)
-
-    def send(self, fields: dict[str, Any]) -> None:
-        data = dumps(fields)
         try:
             self.pub.send(data)
         except FrameTooLarge as error:
@@ -113,31 +125,16 @@ class _AguiRun:
                 reduced = None
         if reduced is not None:
             self.pub.send(dumps(reduced))
-        self._report(Oversize(kind, error.size, error.limit, truncated=reduced is not None))
+        self.reports.oversize(Oversize(kind, error.size, error.limit, truncated=reduced is not None))
 
     def _split(self, fields: dict[str, Any], text: str, error: FrameTooLarge) -> None:
         while text:
             keep = longest_fit(len(text), lambda keep: self._fits({**fields, "delta": text[:keep]}))  # noqa: B023
             if keep == 0:  # a single character escaped beyond the limit
-                self._report(Oversize(str(fields["type"]), error.size, error.limit, truncated=True))
+                self.reports.oversize(Oversize(str(fields["type"]), error.size, error.limit, truncated=True))
                 return
             self.pub.send(dumps({**fields, "delta": text[:keep]}))
             text = text[keep:]
-
-    def _report(self, report: Oversize) -> None:
-        if self.on_oversize is not None:
-            self.on_oversize(report)
-        elif not self.oversize_reported:
-            self.oversize_reported = True
-            logger.warning(
-                "IQ stream %s: a %s event of %d bytes is over the frame limit of %d bytes and was %s; "
-                "later ones are not reported.",
-                self.pub.stream_id,
-                report.part_type,
-                report.size,
-                report.limit,
-                "truncated" if report.truncated else "not sent",
-            )
 
     def own(self, fields: dict[str, Any]) -> None:
         """Sends an event the adapter made, if the publisher still takes frames."""
@@ -149,19 +146,19 @@ class _AguiRun:
         if not self.started:
             self.own({"type": "RUN_STARTED", "threadId": self.thread_id, "runId": self.run_id})
 
-    def fail(self) -> None:
+    def fail(self, error: BaseException) -> None:
         """The run raised past ``ag_ui_langgraph``: the ``RUN_ERROR`` it did not send."""
         if self.terminal is None:
             self._start()
-            self.own({"type": "RUN_ERROR", "message": MASKED_MESSAGE})
+            self.own({"type": "RUN_ERROR", "message": str(error) if self.expose_errors else MASKED_MESSAGE})
 
     def cancel(self) -> None:
         """A ``RUN_FINISHED`` with the ``cancelled`` outcome. AG-UI clients refuse it while a message, a tool call,
-        a reasoning span or a step is open, so what is open is closed first, innermost first."""
+        a reasoning span, a step or a sub-agent is open, so what is open is closed first, innermost first."""
         if self.terminal is None:
             self._start()
-            for event in reversed(self.open):
-                self.own(event)
+            for _, _, closing in reversed(self.open):
+                self.own(closing)
             self.own(
                 {
                     "type": "RUN_FINISHED",
@@ -188,14 +185,18 @@ def arelay_agui(
     stream with ``fail`` as soon as one has been sent; the ``with`` block's own close then changes nothing. Its
     message is replaced by a fixed text unless ``expose_errors``. A cancelled run (a cancelled task, a loop left
     early under ``contextlib.aclosing()``) ends with ``RUN_FINISHED`` and a ``cancelled`` outcome, after the
-    events that close what was left open, and the stream closes with ``cancelled``. A run that finishes is left to
-    the ``with`` block, which closes with ``end`` after the application has saved the answer.
+    events that close what was left open, and the stream closes with ``cancelled``; for a loop left early, ``end``
+    is left to the ``with`` block, as in ``relay()``. A run that finishes is left to the ``with`` block, which
+    closes with ``end`` after the application has saved the answer.
 
-    Construct the agent with ``emit_raw_events=False``: raw events multiply the size of a stream.
+    The agent is cloned for the run, as ag_ui_langgraph's own endpoint does: ``LangGraphAgent`` keeps the state of
+    a run on itself, so one agent can serve concurrent requests. Construct it with ``emit_raw_events=False``: raw
+    events multiply the size of a stream.
     """
     if cancelled not in ("fail", "end"):
         raise ValueError('cancelled is "fail" or "end".')
-    return _arelay_agui(_AguiRun(pub, run_input, expose_errors, on_oversize), agent, run_input, cancelled)
+    run = _AguiRun(pub, run_input, expose_errors, on_oversize)
+    return _arelay_agui(run, agent.clone(), run_input, cancelled)
 
 
 async def _arelay_agui(
@@ -215,11 +216,13 @@ async def _arelay_agui(
             await events.aclose()
     except Exception as error:
         if error is not pub.error:  # with on_error="raise", the publisher's own error: nothing more can be sent
-            run.fail()
+            run.fail(error)
         raise
-    except BaseException:  # CancelledError, GeneratorExit from aclose(), KeyboardInterrupt
+    except BaseException as stop:  # CancelledError, GeneratorExit from aclose(), KeyboardInterrupt
         with contextlib.suppress(IQError):
             if run.terminal is None:
                 run.cancel()
-                await aclose_publisher(pub, cancelled)
+                # A loop left early may have been left by the caller's own exception: end is the block's to send.
+                if cancelled == "fail" or not isinstance(stop, GeneratorExit):
+                    await aclose_publisher(pub, cancelled)
         raise

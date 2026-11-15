@@ -3,8 +3,14 @@ that does not fit the frame limit."""
 
 from __future__ import annotations
 
+import datetime
+import decimal
+import enum
 import json
 import logging
+import math
+import pathlib
+import uuid
 from typing import Any
 
 import pytest
@@ -13,9 +19,13 @@ from iq_stream.testing import RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.tools import tool
-from langgraph.types import Interrupt
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Interrupt, interrupt
+from typing_extensions import TypedDict
 
 from iq_stream_langchain import MASKED_MESSAGE, SLIM_METADATA, Oversize, encode_part, error_part, publish_run, relay
+from iq_stream_langchain._encode import TRUNCATED_MARKER
 
 FULL_METADATA = {
     "langgraph_node": "model",
@@ -178,3 +188,149 @@ def test_a_message_without_text_content_that_does_not_fit_is_not_sent() -> None:
     assert final["messages"][-1].content == blocks
     assert [json.loads(data)["type"] for data in publisher.data] == ["metadata"]
     assert reports == [Oversize("updates", reports[0].size, 1024, truncated=False)]
+
+
+def interrupting_agent(value: Any) -> Any:
+    @tool
+    def book(city: str) -> str:
+        """Book a trip; a human approves it first."""
+        return f"booked: {interrupt(value)}"
+
+    model = FakeToolCallingModel(
+        messages=iter([AIMessage(content="", tool_calls=[tool_call("book", {"city": "Turin"}, "c1")])])  # type: ignore[list-item]
+    )
+    return create_agent(model, [book], checkpointer=InMemorySaver())
+
+
+def test_an_interrupt_over_the_limit_is_cut_and_never_dropped() -> None:
+    """It is the only part that tells the page the run waits for a human."""
+    config: Any = {"configurable": {"thread_id": "big-draft"}}
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    reports: list[Oversize] = []
+    with publisher:
+        final = publish_run(
+            publisher,
+            interrupting_agent({"question": "send it?", "draft": "d" * 1800}),
+            USER,
+            config,
+            on_oversize=reports.append,
+        )
+    last = json.loads(publisher.data[-1])
+    assert last["type"] == "updates"
+    assert last["data"] == {
+        "__interrupt__": [{"value": None, "id": final["__interrupt__"][0].id, "truncated": True}]
+    }, "a value that is not a string is left out; the id resumes the run"
+    assert reports == [Oversize("updates", reports[0].size, 1024, truncated=True)]
+    assert publisher.outcome == "end"
+
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with publisher:
+        publish_run(publisher, interrupting_agent("Approve this draft: " + "d" * 3000), USER, config)
+    value = json.loads(publisher.data[-1])["data"]["__interrupt__"][0]["value"]
+    assert value.startswith("Approve this draft: ddd") and value.endswith(TRUNCATED_MARKER)
+    assert 900 < publisher.frame_size(publisher.data[-1]) <= 1024, "cut as little as possible"
+
+
+def test_non_finite_floats_are_null() -> None:
+    """A browser's JSON.parse refuses NaN and Infinity, and the whole stream with them."""
+    part = {"type": "custom", "ns": (), "data": {"score": math.nan, "max": math.inf, "min": -math.inf, "ok": 1.5}}
+
+    def refuse(constant: str) -> None:
+        raise ValueError(constant)
+
+    frame = encode_part(part)
+    assert json.loads(frame, parse_constant=refuse) == {
+        "type": "custom",
+        "ns": [],
+        "data": {"score": None, "max": None, "min": None, "ok": 1.5},
+    }
+    message = {
+        "type": "messages",
+        "ns": (),
+        "data": (AIMessageChunk(content="Hi", response_metadata={"p": math.nan}), {}),
+    }
+    assert json.loads(encode_part(message), parse_constant=refuse)["data"][0]["response_metadata"] == {"p": None}
+
+
+class Status(enum.Enum):
+    DONE = "done"
+
+
+def test_standard_types_are_written_as_langgraph_server_writes_them() -> None:
+    at = datetime.datetime(2026, 11, 14, 21, 0, tzinfo=datetime.timezone.utc)
+    part = {
+        "type": "custom",
+        "ns": (),
+        "data": {
+            "at": at,
+            "day": at.date(),
+            "time": datetime.time(21, 30),
+            "took": datetime.timedelta(seconds=1.5),
+            "id": uuid.UUID(int=1),
+            "status": Status.DONE,
+            "price": decimal.Decimal("10.50"),
+            "path": pathlib.PurePosixPath("/tmp/x"),
+        },
+    }
+    assert json.loads(encode_part(part))["data"] == {
+        "at": "2026-11-14T21:00:00+00:00",
+        "day": "2026-11-14",
+        "time": "21:30:00",
+        "took": 1.5,
+        "id": "00000000-0000-0000-0000-000000000001",
+        "status": "done",
+        "price": "10.50",
+        "path": "/tmp/x",
+    }
+    message = {"type": "messages", "ns": (), "data": (AIMessage(content="Hi", response_metadata={"created": at}), {})}
+    assert json.loads(encode_part(message))["data"][0]["response_metadata"] == {"created": "2026-11-14T21:00:00+00:00"}
+
+
+def test_an_on_oversize_hook_that_raises_never_breaks_the_run(caplog: pytest.LogCaptureFixture) -> None:
+    def broken(report: Oversize) -> None:
+        raise ConnectionError("statsd is down at 10.0.0.1")
+
+    publisher = RecordingPublisher(max_frame_bytes=2048)
+    with caplog.at_level(logging.WARNING, logger="iq_stream_langchain"), publisher:
+        final = publish_run(publisher, big_tool_agent(10_000), USER, on_oversize=broken)
+    assert final["messages"][-1].content == "Done."
+    assert all(json.loads(data)["type"] != "error" for data in publisher.data)
+    assert publisher.outcome == "end"
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1 and "on_oversize raised ConnectionError" in messages[0]
+    assert "statsd" not in messages[0]
+
+
+class State(TypedDict):
+    value: Any
+
+
+def test_an_exposed_error_too_large_for_a_frame_is_sent_masked() -> None:
+    def node(state: State) -> dict[str, Any]:
+        raise RuntimeError("x" * 2000)
+
+    graph = StateGraph(State)
+    graph.add_node("node", node)
+    graph.add_edge(START, "node")
+    graph.add_edge("node", END)
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with pytest.raises(RuntimeError), publisher:
+        publish_run(publisher, graph.compile(), {"value": None}, expose_errors=True)
+    assert json.loads(publisher.data[-1])["data"] == {"error": "RuntimeError", "message": MASKED_MESSAGE}
+    assert publisher.outcome == "fail"
+
+
+def test_the_error_of_a_task_result_is_masked() -> None:
+    def node(state: State) -> dict[str, Any]:
+        raise ValueError("the API key sk-123 was refused")
+
+    graph = StateGraph(State)
+    graph.add_node("node", node)
+    graph.add_edge(START, "node")
+    graph.add_edge("node", END)
+    for expose, error in ((False, MASKED_MESSAGE), (True, {"error": "ValueError"})):
+        publisher = RecordingPublisher()
+        with pytest.raises(ValueError), publisher:
+            publish_run(publisher, graph.compile(), {"value": None}, stream_mode=("tasks",), expose_errors=expose)
+        results = [json.loads(data)["data"] for data in publisher.data if json.loads(data)["type"] == "tasks"]
+        assert [result["error"] for result in results if result.get("error") is not None] == [error]

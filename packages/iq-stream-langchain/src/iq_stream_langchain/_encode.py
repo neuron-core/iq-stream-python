@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
+import enum
 import json
+import uuid
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import PurePath
 from typing import Any, Literal, cast
 
 #: The modes ``relay`` requests and publishes unless told otherwise. ``values`` is left out: each part repeats the
@@ -46,13 +51,36 @@ def _default(value: object) -> object:
         return list(cast("set[object]", value))
     if isinstance(value, BaseException):
         return {"error": type(value).__name__}
+    # The standard types as LangGraph Server's orjson writes them, and a Decimal as pydantic's JSON mode does.
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, datetime.timedelta):
+        return value.total_seconds()
+    if isinstance(value, enum.Enum):
+        return cast("object", value.value)
+    if isinstance(value, (uuid.UUID, decimal.Decimal, PurePath)):
+        return str(value)
     # One odd value in a state never costs the frame.
     return repr(value)
 
 
+_SEPARATORS = (",", ":")
+
+
+def _null(constant: str) -> None:
+    return None
+
+
 def dumps(value: object) -> str:
-    """Compact JSON, non-ASCII unescaped, with LangGraph Server's handling of pydantic objects and dataclasses."""
-    return json.dumps(value, default=_default, ensure_ascii=False, separators=(",", ":"))
+    """Compact JSON, non-ASCII unescaped, with LangGraph Server's handling of pydantic objects and dataclasses. A float
+    JSON cannot hold (NaN, an infinity) is ``null``, as orjson writes it: a browser's ``JSON.parse`` refuses the bare
+    constants, and with them the whole stream."""
+    try:
+        return json.dumps(value, default=_default, ensure_ascii=False, separators=_SEPARATORS, allow_nan=False)
+    except ValueError:
+        # Rare: the bare constants are written, then read back as null. A circular value raises here again.
+        text = json.dumps(value, default=_default, ensure_ascii=False, separators=_SEPARATORS)
+        return json.dumps(json.loads(text, parse_constant=_null), ensure_ascii=False, separators=_SEPARATORS)
 
 
 def check_metadata(metadata: Metadata) -> None:
@@ -155,6 +183,39 @@ def truncated_messages_part(shaped: Mapping[str, Any], fits: Callable[[str], boo
     if not fits(frame(0)):
         return None
     return frame(longest_fit(len(content), lambda keep: fits(frame(keep))))
+
+
+def truncated_interrupt_part(shaped: Mapping[str, Any], fits: Callable[[str], bool]) -> str | None:
+    """An ``updates`` part that pauses the run, reduced to its interrupts: each keeps its ``id``, a string ``value`` is
+    cut to fit and ends in a marker, any other value is ``null``, and each has ``"truncated": true``. The part is the
+    only one that tells the browser the run waits for a human, so it is never dropped while its ids fit. ``None``
+    when the part holds no interrupt or even its ids do not fit."""
+    data = shaped.get("data")
+    if shaped.get("type") != "updates" or not isinstance(data, Mapping):
+        return None
+    pending = cast("Mapping[str, Any]", data).get("__interrupt__")
+    if not isinstance(pending, (list, tuple)) or not pending:
+        return None
+    interrupts: list[Mapping[str, Any]] = []
+    for item in cast("Sequence[object]", pending):
+        plain = cast("object", item) if isinstance(item, Mapping) else _default(item)
+        interrupts.append(cast("Mapping[str, Any]", plain) if isinstance(plain, Mapping) else {})
+
+    def frame(keep: int | None) -> str:
+        reduced: list[dict[str, Any]] = []
+        for fields in interrupts:
+            value = fields.get("value")
+            if isinstance(value, str) and keep is not None:
+                cut: str | None = value if len(value) <= keep else value[:keep] + TRUNCATED_MARKER
+            else:
+                cut = None
+            reduced.append({"value": cut, "id": fields.get("id"), "truncated": True})
+        return dumps({**shaped, "data": {"__interrupt__": reduced}})
+
+    longest = max((len(value) for fields in interrupts if isinstance(value := fields.get("value"), str)), default=0)
+    if longest and fits(frame(0)):
+        return frame(longest_fit(longest, lambda keep: fits(frame(keep))))
+    return frame(None) if fits(frame(None)) else None
 
 
 def longest_fit(length: int, fits: Callable[[int], bool]) -> int:

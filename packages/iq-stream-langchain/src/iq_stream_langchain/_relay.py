@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Iterator, Mapping, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import langgraph.errors
@@ -22,15 +20,15 @@ from ._encode import (
     error_part,
     metadata_part,
     shape,
+    truncated_interrupt_part,
     truncated_messages_part,
 )
+from ._reports import Oversize, Reports
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from langgraph.pregel import Pregel  # pyright: ignore[reportMissingTypeStubs]
     from langgraph.types import StreamPart
-
-logger = logging.getLogger("iq_stream_langchain")
 
 #: The close line of a cancelled run.
 CancelledOutcome = Literal["fail", "end"]
@@ -41,19 +39,6 @@ _DRAINED: tuple[type[BaseException], ...] = tuple(
     for kind in (getattr(langgraph.errors, "GraphDrained", None),)
     if isinstance(kind, type) and issubclass(kind, BaseException)
 )
-
-
-@dataclass(frozen=True)
-class Oversize:
-    """A part whose frame was over the publisher's ``max_frame_bytes``."""
-
-    #: The part's ``type``: ``messages``, ``updates``, ...
-    part_type: str
-    #: Bytes of the frame that did not fit.
-    size: int
-    limit: int
-    #: True when it was sent with its message content cut; False when it was not sent.
-    truncated: bool
 
 
 def stopped(pub: PublisherLike | AsyncPublisherLike) -> bool:
@@ -90,9 +75,7 @@ class _Run:
         self.metadata: Metadata = metadata
         self.expose_errors = expose_errors
         self.cancelled: CancelledOutcome = cancelled
-        self.on_oversize = on_oversize
-        self.unencodable_reported = False
-        self.oversize_reported = False
+        self.reports = Reports(pub.stream_id, on_oversize, "part")
 
     def send(self, data: str) -> None:
         """Sends a part the adapter made. They are small: one that is too large is dropped."""
@@ -108,14 +91,7 @@ class _Run:
             shaped = shape(part, metadata=self.metadata, expose_errors=self.expose_errors)
             data = dumps(shaped)
         except Exception:
-            # One frame is lost, never the run.
-            if not self.unencodable_reported:
-                self.unencodable_reported = True
-                logger.warning(
-                    "IQ stream %s: a %s part could not be encoded and was not sent; later ones are not reported.",
-                    self.pub.stream_id,
-                    part["type"],
-                )
+            self.reports.unencodable(str(part["type"]))
             return
         try:
             self.pub.send(data)
@@ -124,23 +100,14 @@ class _Run:
 
     def _oversize(self, shaped: Mapping[str, Any], error: FrameTooLarge) -> None:
         limit = self.pub.max_frame_bytes
-        cut = truncated_messages_part(shaped, lambda data: self.pub.frame_size(data) <= limit)
+
+        def fits(data: str) -> bool:
+            return self.pub.frame_size(data) <= limit
+
+        cut = truncated_messages_part(shaped, fits) or truncated_interrupt_part(shaped, fits)
         if cut is not None:
             self.pub.send(cut)
-        report = Oversize(str(shaped["type"]), error.size, error.limit, truncated=cut is not None)
-        if self.on_oversize is not None:
-            self.on_oversize(report)
-        elif not self.oversize_reported:
-            self.oversize_reported = True
-            logger.warning(
-                "IQ stream %s: a %s part of %d bytes is over the frame limit of %d bytes and was %s; "
-                "later ones are not reported.",
-                self.pub.stream_id,
-                report.part_type,
-                report.size,
-                report.limit,
-                "truncated" if report.truncated else "not sent",
-            )
+        self.reports.oversize(Oversize(str(shaped["type"]), error.size, error.limit, truncated=cut is not None))
 
     def fail(self, error: BaseException) -> None:
         """The run raised: its ``error`` part, before the exception closes the stream with ``fail``."""
@@ -156,6 +123,22 @@ class _Run:
         with contextlib.suppress(IQError):
             self.send(CANCELLED_PART)
             cast("PublisherLike", self.pub).close(self.cancelled)
+
+    def left(self) -> None:
+        """The loop over the relay was left: the ``Cancelled`` part, and the close line when it is ``fail``. An
+        exception raised by the caller's own code in the loop arrives here the same way, and a generator cannot tell
+        it from a ``break``; so ``end`` is left to the caller's block, which closes ``fail`` instead after an
+        exception."""
+        with contextlib.suppress(IQError):
+            self.send(CANCELLED_PART)
+            if self.cancelled == "fail":
+                cast("PublisherLike", self.pub).close("fail")
+
+    async def aleft(self) -> None:
+        with contextlib.suppress(IQError):
+            self.send(CANCELLED_PART)
+            if self.cancelled == "fail":
+                await aclose_publisher(self.pub, "fail")
 
     async def acancel(self) -> None:
         with contextlib.suppress(IQError):
@@ -192,8 +175,10 @@ def relay(
     The first frame is a ``metadata`` part with the config's ``run_id`` and ``thread_id``. ``also_yield`` modes are
     requested from the graph and yielded, not published. A run that raises publishes an ``error`` part and the
     exception goes on, so that the publisher's ``with`` block closes the stream with ``fail``. A run that is
-    cancelled (the loop is left early, a ``KeyboardInterrupt``, a drain request) publishes a ``Cancelled`` error
-    part and closes the publisher with ``cancelled`` itself. A run that finishes, or pauses on an interrupt, is left
+    cancelled (a ``KeyboardInterrupt``, a drain request) publishes a ``Cancelled`` error part and closes the
+    publisher with ``cancelled`` itself. A loop left early publishes the ``Cancelled`` part too, at once, and closes
+    with ``fail``; with ``cancelled="end"`` the ``with`` block closes, with ``end``, or with ``fail`` when the loop
+    was left by an exception of the caller's code. A run that finishes, or pauses on an interrupt, is left
     to the ``with`` block, which closes with ``end`` after the application has saved the answer.
 
     ``stream_kwargs`` go to ``graph.stream()``: ``context``, ``durability``, ``interrupt_before``, ``control``, ...
@@ -216,19 +201,26 @@ def _relay(
         try:
             for part in parts:
                 run.publish(part)
-                yield part
+                try:
+                    yield part
+                except GeneratorExit:
+                    # Before the graph is stopped, which waits for the node that is running: the page hears now.
+                    run.left()
+                    raise
         finally:
             # The run stops now when the loop is left, not when the generator is collected.
             close = getattr(parts, "close", None)
             if callable(close):
                 close()
+    except GeneratorExit:
+        raise
     except _DRAINED:
         run.cancel()
         raise
     except Exception as error:
         run.fail(error)
         raise
-    except BaseException:  # GeneratorExit when the loop is left early, KeyboardInterrupt
+    except BaseException:  # KeyboardInterrupt
         run.cancel()
         raise
 
@@ -248,7 +240,7 @@ def arelay(
     **stream_kwargs: Any,
 ) -> AsyncGenerator[StreamPart[Any, Any], None]:
     """``relay()`` over ``graph.astream()``. A cancelled task publishes the ``Cancelled`` part and closes the
-    stream as a cancelled run, like a loop that is left early under ``contextlib.aclosing()``.
+    stream with ``cancelled``. A loop left early under ``contextlib.aclosing()`` is handled as by ``relay()``.
 
     ``pub`` is usually an ``AsyncPublisher``. A synchronous ``Publisher`` fits too, for graphs whose nodes block the
     loop and would starve the asynchronous publisher's keepalive: ``send()`` is the same call.
@@ -274,19 +266,32 @@ async def _arelay(
             aclose = getattr(parts, "aclose", None)
             if callable(aclose):
                 await cast("Callable[[], Awaitable[None]]", aclose)()
+    except GeneratorExit:  # aclose(): the loop was left, or the caller's code in it raised
+        await run.aleft()
+        raise
     except _DRAINED:
         await run.acancel()
         raise
     except Exception as error:
         run.fail(error)
         raise
-    except BaseException:  # CancelledError, GeneratorExit from aclose(), KeyboardInterrupt
+    except BaseException:  # CancelledError, KeyboardInterrupt
         await run.acancel()
         raise
 
 
 def _final_state(part: Mapping[str, Any], final: Any) -> Any:
-    return part["data"] if part["type"] == "values" and not part["ns"] else final
+    """The root graph's last state, with its pending interrupts under ``__interrupt__``, as ``invoke()`` returns it."""
+    if part["type"] != "values" or part["ns"]:
+        return final
+    data = part["data"]
+    interrupts = part.get("interrupts")
+    if not interrupts:
+        return data
+    pending = list(cast("Sequence[Any]", interrupts))
+    if isinstance(data, Mapping):
+        return {**cast("Mapping[str, Any]", data), "__interrupt__": pending}
+    return {"__interrupt__": pending}
 
 
 def publish_run(
@@ -304,7 +309,8 @@ def publish_run(
     **stream_kwargs: Any,
 ) -> Any:
     """Relays the run to its end and returns the final state of the root graph (its last ``values``, which are
-    requested from the graph and not published). Save the answer after it returns, inside the publisher's block."""
+    requested from the graph and not published), with ``__interrupt__`` when the run waits for a human, as
+    ``invoke()`` returns it. Save the answer after it returns, inside the publisher's block."""
     final: Any = None
     parts = relay(
         pub,

@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from typing import Any
 
 import pytest
-from fakes import FINAL, USER, failing_agent, weather_agent
+from fakes import FINAL, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
 from iq_stream.testing import RecordingPublisher
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+from langgraph.config import get_stream_writer
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
 
 from iq_stream_langchain import MASKED_MESSAGE, Oversize
 from iq_stream_langchain.experimental import iq_transformer
@@ -75,3 +82,74 @@ def test_an_event_over_the_limit_is_not_sent() -> None:
         assert weather_agent().stream_events(USER, version="v3", transformers=[transformer]).output
     assert publisher.frames == []
     assert [report.part_type for report in reports] == ["updates"] * 3
+
+
+class State(TypedDict):
+    value: Any
+
+
+def writer_graph(*values: Any) -> Any:
+    def node(state: State) -> dict[str, Any]:
+        writer = get_stream_writer()
+        for value in values:
+            writer(value)
+        return {"value": "done"}
+
+    graph = StateGraph(State)
+    graph.add_node("node", node)
+    graph.add_edge(START, "node")
+    graph.add_edge("node", END)
+    return graph.compile()
+
+
+def test_an_event_that_cannot_be_encoded_is_dropped_and_the_run_completes(caplog: pytest.LogCaptureFixture) -> None:
+    circular: dict[str, Any] = {"name": "root"}
+    circular["parent"] = circular
+    graph = writer_graph({("Turin", "2026-11-14"): 21.0}, circular, {"after": "the bad ones"})
+    publisher = RecordingPublisher()
+    with caplog.at_level(logging.WARNING, logger="iq_stream_langchain"), publisher:
+        run = graph.stream_events({"value": None}, version="v3", transformers=[iq_transformer(publisher)])
+        assert run.output == {"value": "done"}
+    custom = [json.loads(data)["params"]["data"] for data in publisher.data if json.loads(data)["method"] == "custom"]
+    assert custom == [{"after": "the bad ones"}]
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 1 and "custom event could not be encoded" in warnings[0]
+    assert publisher.outcome == "end"
+
+
+def test_a_failing_tool_has_its_message_masked() -> None:
+    @tool
+    def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        raise ValueError("the API key sk-123 was refused")
+
+    def agent() -> Any:
+        model = FakeToolCallingModel(
+            messages=iter([AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")])])  # type: ignore[list-item]
+        )
+        return create_agent(model, [get_weather])
+
+    publisher = RecordingPublisher()
+    with pytest.raises(ValueError), publisher:
+        assert agent().stream_events(USER, version="v3", transformers=[iq_transformer(publisher)]).output
+    assert not any("sk-123" in data for data in publisher.data)
+    tool_error = next(json.loads(data)["params"]["data"] for data in publisher.data if '"tool-error"' in data)
+    assert tool_error["message"] == MASKED_MESSAGE
+
+    exposed = RecordingPublisher()
+    with pytest.raises(ValueError), exposed:
+        transformer = iq_transformer(exposed, expose_errors=True)
+        assert agent().stream_events(USER, version="v3", transformers=[transformer]).output
+    assert any('"tool-error"' in data and "sk-123" in data for data in exposed.data)
+
+
+def test_an_on_oversize_hook_that_raises_never_breaks_the_run() -> None:
+    def broken(report: Oversize) -> None:
+        raise ConnectionError("statsd is down")
+
+    publisher = RecordingPublisher(max_frame_bytes=200)
+    with publisher:
+        transformer = iq_transformer(publisher, methods=["updates"], on_oversize=broken)
+        final = weather_agent().stream_events(USER, version="v3", transformers=[transformer]).output
+    assert final["messages"][-1].text == FINAL
+    assert publisher.outcome == "end"

@@ -4,7 +4,9 @@ told apart by namespace and tool call id."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import time
 from typing import Any
 
 import pytest
@@ -18,6 +20,7 @@ from fakes import (
     two_sub_agents,
     weather_agent,
 )
+from iq_stream import Outcome, PublishResult
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
@@ -122,3 +125,45 @@ async def test_two_runs_at_once_keep_their_own_frames() -> None:
     assert text_of([json.loads(data) for data in first.data]) == "alpha one two three"
     assert text_of([json.loads(data) for data in second.data]).endswith("21 degrees.")
     assert first.outcome == second.outcome == "end"
+
+
+class SlowClosePublisher(RecordingPublisher):
+    """A synchronous publisher whose close waits for the server, as the real one does."""
+
+    def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+        time.sleep(1.0)
+        return super().close(outcome, timeout)
+
+
+async def test_a_synchronous_publisher_is_closed_off_the_event_loop() -> None:
+    """arelay() takes a synchronous Publisher; closing it on a cancel must not stall the application's other tasks."""
+    publisher = SlowClosePublisher()
+    started = asyncio.Event()
+    gaps: list[float] = []
+
+    async def tick() -> None:
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(0.02)
+            now = time.monotonic()
+            gaps.append(now - last)
+            last = now
+
+    async def run() -> None:
+        async for part in arelay(publisher, weather_agent(token_delay=0.05), USER):
+            if part["type"] == "messages":
+                started.set()
+
+    ticker = asyncio.create_task(tick())
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(started.wait(), 5)
+    gaps.clear()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    ticker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await ticker
+    assert publisher.outcome == "fail"
+    assert sum(gaps) > 0.9, "the close took its second"
+    assert max(gaps) < 0.5, "and the loop went on meanwhile"

@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Any, cast
 from iq_stream import AsyncPublisherLike, FrameTooLarge, PublisherLike
 
 from ._encode import MASKED_MESSAGE, dumps, error_part
-from ._relay import Oversize, logger, stopped
+from ._relay import stopped
+from ._reports import Oversize, Reports
 
 if TYPE_CHECKING:
     from langgraph.stream import ProtocolEvent, StreamTransformer  # pyright: ignore[reportMissingTypeStubs]
@@ -47,7 +48,12 @@ def iq_transformer(
     ``{"type": "event", "method", "params": {"namespace", "timestamp", "data"}}``, with the metadata half of a
     ``messages`` payload left out. A run that fails publishes the same ``error`` part as ``relay()``. The
     transformer never closes the stream: the publisher's ``with`` block does, after ``run.output`` returned (or
-    raised) and the application saved the answer. An event over the frame limit is not sent.
+    raised) and the application saved the answer. An event over the frame limit, or one that cannot be encoded, is
+    not sent; the run goes on.
+
+    A run stopped early (a loop over a projection left, ``run.abort()``, a cancelled task) looks to a transformer
+    like one that finished, or is not reported to it at all: the code that stops it sends ``CANCELLED_PART`` and
+    closes the stream with ``fail`` itself.
     """
     try:
         from langgraph.stream import StreamTransformer  # pyright: ignore[reportMissingTypeStubs]
@@ -56,7 +62,7 @@ def iq_transformer(
 
     published = frozenset(methods)
     required = tuple(method for method in methods if method in _STREAM_MODES)
-    reported: list[bool] = [False]
+    reports = Reports(pub.stream_id, on_oversize, "event")
 
     class IQTransformer(StreamTransformer):
         required_stream_modes = required
@@ -78,29 +84,26 @@ def iq_transformer(
                 data = cast("Sequence[Any]", data)[0]
             if not expose_errors:
                 data = _masked(data)
-            frame = dumps(
-                {
-                    "type": "event",
-                    "method": event["method"],
-                    "params": {"namespace": list(params["namespace"]), "timestamp": params["timestamp"], "data": data},
-                }
-            )
+            try:
+                frame = dumps(
+                    {
+                        "type": "event",
+                        "method": event["method"],
+                        "params": {
+                            "namespace": list(params["namespace"]),
+                            "timestamp": params["timestamp"],
+                            "data": data,
+                        },
+                    }
+                )
+            except Exception:
+                # LangGraph fails the run when process() raises: one frame is lost instead.
+                reports.unencodable(str(event["method"]))
+                return True
             try:
                 pub.send(frame)
             except FrameTooLarge as error:
-                report = Oversize(str(event["method"]), error.size, error.limit, truncated=False)
-                if on_oversize is not None:
-                    on_oversize(report)
-                elif not reported[0]:
-                    reported[0] = True
-                    logger.warning(
-                        "IQ stream %s: a %s event of %d bytes is over the frame limit of %d bytes and was not sent; "
-                        "later ones are not reported.",
-                        pub.stream_id,
-                        report.part_type,
-                        report.size,
-                        report.limit,
-                    )
+                reports.oversize(Oversize(str(event["method"]), error.size, error.limit, truncated=False))
             return True
 
         def fail(self, err: BaseException) -> None:

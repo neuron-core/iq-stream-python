@@ -14,7 +14,8 @@ from ._encode import (
     encode_part,
     error_part,
 )
-from ._relay import CancelledOutcome, Oversize, apublish_run, arelay, publish_run, relay
+from ._relay import CancelledOutcome, apublish_run, arelay, publish_run, relay
+from ._reports import Oversize
 
 __all__ = [
     "CANCELLED_PART",

@@ -6,10 +6,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import time
 from typing import Any
 
 import pytest
-from fakes import USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
+from fakes import USER, FakeToolCallingModel, booking_agent, failing_agent, tool_call, weather_agent
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
@@ -17,7 +18,7 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphDrained
 from langgraph.runtime import RunControl
-from langgraph.types import Command, interrupt
+from langgraph.types import Command
 
 from iq_stream_langchain import CANCELLED_PART, MASKED_MESSAGE, arelay, publish_run, relay
 
@@ -178,24 +179,8 @@ def test_a_drain_request_is_a_cancelled_run() -> None:
     assert publisher.outcome == "fail"
 
 
-@tool
-def book(city: str) -> str:
-    """Book a trip; a human approves it first."""
-    approved = interrupt({"question": f"book {city}?"})
-    return f"booked {city}: {approved}"
-
-
-def booking_agent() -> Any:
-    model = FakeToolCallingModel(
-        messages=iter(
-            [AIMessage(content="", tool_calls=[tool_call("book", {"city": "Turin"}, "c1")]), "Booked."]  # type: ignore[list-item]
-        )
-    )
-    return create_agent(model, [book], checkpointer=InMemorySaver())
-
-
 def test_a_run_that_waits_for_a_human_closes_end_and_resumes_on_a_new_stream() -> None:
-    agent = booking_agent()
+    agent = booking_agent(checkpointer=InMemorySaver())
     config: Any = {"configurable": {"thread_id": "hitl"}}
 
     paused = RecordingPublisher()
@@ -215,3 +200,87 @@ def test_a_run_that_waits_for_a_human_closes_end_and_resumes_on_a_new_stream() -
     assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started", "tool-finished"]
     assert final["messages"][-2].content == "booked Turin: yes"
     assert resumed.outcome == "end"
+
+
+def test_publish_run_returns_the_interrupt_as_invoke_does() -> None:
+    final = publish_run(
+        RecordingPublisher(), booking_agent(checkpointer=InMemorySaver()), USER, {"configurable": {"thread_id": "a"}}
+    )
+    invoked = booking_agent(checkpointer=InMemorySaver()).invoke(USER, {"configurable": {"thread_id": "b"}})
+    assert set(final) == set(invoked) == {"messages", "__interrupt__"}
+    assert isinstance(final["__interrupt__"], list)
+    assert [item.value for item in final["__interrupt__"]] == [item.value for item in invoked["__interrupt__"]]
+    assert final["__interrupt__"][0].value == {"question": "book Turin?"}
+
+    finished = publish_run(RecordingPublisher(), weather_agent(), USER)
+    assert "__interrupt__" not in finished
+
+
+class SaveFailed(Exception):
+    pass
+
+
+@pytest.mark.parametrize("cancelled", ["fail", "end"])
+def test_an_exception_of_the_callers_loop_never_closes_end(cancelled: Any) -> None:
+    """A generator cannot tell it from a break, so the page reads the Cancelled part; the close line stays fail."""
+    publisher = RecordingPublisher()
+    with pytest.raises(SaveFailed), publisher:
+        for part in relay(publisher, weather_agent(), USER, cancelled=cancelled):
+            if part["type"] == "updates":
+                raise SaveFailed("the database is down")
+    assert publisher.data[-1] == CANCELLED_PART
+    assert publisher.outcome == "fail"
+
+
+@pytest.mark.parametrize("cancelled", ["fail", "end"])
+async def test_an_exception_of_the_callers_async_loop_never_closes_end(cancelled: Any) -> None:
+    publisher = AsyncRecordingPublisher()
+    with pytest.raises(SaveFailed):
+        async with (
+            publisher,
+            contextlib.aclosing(arelay(publisher, weather_agent(), USER, cancelled=cancelled)) as parts,
+        ):
+            async for part in parts:
+                if part["type"] == "updates":
+                    raise SaveFailed("the database is down")
+    assert publisher.data[-1] == CANCELLED_PART
+    assert publisher.outcome == "fail"
+
+
+class TimedPublisher(RecordingPublisher):
+    """Notes when the Cancelled part went out."""
+
+    cancelled_at: float | None = None
+
+    def send(self, data: str, event: str | None = None) -> bool:
+        if data == CANCELLED_PART:
+            self.cancelled_at = time.monotonic()
+        return super().send(data, event)
+
+
+def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
+    """Stopping the graph waits for the node that runs in its thread; the page hears of the cancel before that."""
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        time.sleep(1.5)
+        return "sunny"
+
+    model = FakeToolCallingModel(
+        messages=iter(
+            [AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")]), "Sunny."]  # type: ignore[list-item]
+        )
+    )
+    publisher = TimedPublisher()
+    left = 0.0
+    with publisher:
+        for part in relay(publisher, create_agent(model, [get_weather]), USER):
+            if part["type"] == "tools":
+                left = time.monotonic()
+                break
+        assert publisher.outcome == "fail", "closed before the block's own close"
+        stopped = time.monotonic()
+    assert publisher.cancelled_at is not None
+    assert publisher.cancelled_at - left < 0.5
+    assert stopped - left > 1.0, "the graph was stopped after its node ended"
