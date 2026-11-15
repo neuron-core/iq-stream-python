@@ -27,6 +27,7 @@ jobs:
     outputs:
       unit: ${{ steps.matrix.outputs.unit }}
       integration: ${{ steps.matrix.outputs.integration }}
+      floor: ${{ steps.matrix.outputs.floor }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: matrix
@@ -59,6 +60,33 @@ jobs:
       - run: uv run pytest tests/unit
       - run: uv build
 
+  # Each package's unit tests on its lowest Python with the lowest versions of its dependencies it declares
+  # ([tool.iq-stream] floor in its pyproject.toml), so that the ranges in its metadata are ranges that were run.
+  floor:
+    name: ${{ matrix.package }} at its floor on Python ${{ matrix.python }}
+    needs: matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.floor) }}
+    defaults:
+      run:
+        working-directory: packages/${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          working-directory: packages/${{ matrix.package }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          cache-suffix: ${{ matrix.package }}-floor
+      - run: uv sync --locked
+      - run: uv pip install $PINS
+        env:
+          PINS: ${{ matrix.pins }}
+      - run: uv run --no-sync pytest tests/unit
+
   # Each package against two real IQ-Stream servers, on its lowest and its highest Python.
   integration:
     name: ${{ matrix.package }} integration on Python ${{ matrix.python }}
@@ -90,6 +118,25 @@ jobs:
             echo "::error::Cannot pull $IQ_STREAM_TEST_IMAGE. Give this repository read access to the package (its settings on GitHub, 'Manage Actions access'), or make the image public."
             exit 1
           }
+      # The adapters' front-end contract tests give what a subscriber received to the browser libraries
+      # (@neuron-core/iq-stream, @ag-ui/client, ai and the frameworks' own clients), from the JavaScript repository.
+      - if: matrix.package != 'iq-stream'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neuron-core/iq-stream-js
+          path: .iq-stream-js
+          persist-credentials: false
+      - if: matrix.package != 'iq-stream'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - if: matrix.package != 'iq-stream'
+        name: Build the browser side
+        working-directory: .iq-stream-js
+        run: |
+          npm ci
+          npm run build -w packages/iq-stream
+          echo "IQ_STREAM_JS_DIR=$PWD" >> "$GITHUB_ENV"
       - run: python3 scripts/servers.py start
       - run: uv sync --locked
         working-directory: packages/${{ matrix.package }}

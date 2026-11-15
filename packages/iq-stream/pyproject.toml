@@ -43,6 +43,10 @@ dev = [
     "uvloop>=0.21 ; sys_platform != 'win32'",
 ]
 
+# The lowest versions of the dependencies CI runs the unit tests against (scripts/ci_matrix.py).
+[tool.iq-stream]
+floor = ["httpx==0.27.2"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/iq_stream"]
 

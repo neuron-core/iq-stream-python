@@ -19,34 +19,34 @@ updates:
     cooldown:
       default-days: 5
 
-  # The adapters, as each is added:
-  # - package-ecosystem: uv
-  #   directory: /packages/iq-stream-langchain
-  #   schedule:
-  #     interval: monthly
-  #   cooldown:
-  #     default-days: 5
-  # - package-ecosystem: uv
-  #   directory: /packages/iq-stream-agno
-  #   schedule:
-  #     interval: monthly
-  #   cooldown:
-  #     default-days: 5
-  # - package-ecosystem: uv
-  #   directory: /packages/iq-stream-crewai
-  #   schedule:
-  #     interval: monthly
-  #   cooldown:
-  #     default-days: 5
-  # - package-ecosystem: uv
-  #   directory: /packages/iq-stream-llamaindex
-  #   schedule:
-  #     interval: monthly
-  #   cooldown:
-  #     default-days: 5
-  # - package-ecosystem: uv
-  #   directory: /packages/iq-stream-haystack
-  #   schedule:
-  #     interval: monthly
-  #   cooldown:
-  #     default-days: 5
+  # The adapters.
+  - package-ecosystem: uv
+    directory: /packages/iq-stream-langchain
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+  - package-ecosystem: uv
+    directory: /packages/iq-stream-agno
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+  - package-ecosystem: uv
+    directory: /packages/iq-stream-crewai
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+  - package-ecosystem: uv
+    directory: /packages/iq-stream-llamaindex
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
+  - package-ecosystem: uv
+    directory: /packages/iq-stream-haystack
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 5
