@@ -6,11 +6,11 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from iq_stream import IQError
 
-Protocol = Literal["agno", "agui"]
+Protocol = Literal["agno", "ag-ui"]
 """The wire format of the frames: Agno's own event JSON, or AG-UI events."""
 
 #: One frame to send: its SSE event name (``None`` for an unnamed frame) and its data.
@@ -44,6 +44,36 @@ ERROR_TEXT = {
 }
 #: Events whose ``tool`` holds a failed tool's error text as its result.
 TOOL_EVENTS = frozenset({"ToolCallCompleted", "TeamToolCallCompleted", "ToolCallError", "TeamToolCallError"})
+#: The root run's events that end it, which the native protocol holds back until ``before_close`` has run.
+ROOT_COMPLETIONS = frozenset({"RunCompleted", "TeamRunCompleted", "WorkflowCompleted"})
+ROOT_ENDINGS = ROOT_COMPLETIONS | ROOT_ERRORS | ROOT_CANCELS | ROOT_PAUSES
+
+
+def mask_errors(value: object) -> Any:
+    """A copy of an event's JSON, nested runs included, without error text: the text field of each error event in
+    it, the ``error`` of a failed workflow step, the ``result`` of a failed tool and the ``content`` of the tool
+    message that repeats it. A team's ``member_responses`` and a workflow's ``step_results`` and
+    ``step_executor_runs`` carry the nested runs' tools and messages."""
+    if isinstance(value, list):
+        return [mask_errors(item) for item in cast("list[object]", value)]
+    if not isinstance(value, dict):
+        return value
+    masked: dict[str, Any] = {key: mask_errors(item) for key, item in cast("dict[str, object]", value).items()}
+    name = masked.get("event")
+    field = ERROR_TEXT.get(name) if isinstance(name, str) else None
+    if field is not None:
+        if masked.get(field) is not None:
+            masked[field] = MASKED_ERROR
+        masked.pop("additional_data", None)
+    error = masked.get("error")
+    if isinstance(error, str) and error:
+        masked["error"] = MASKED_ERROR
+    if masked.get("tool_call_error"):
+        if masked.get("result") is not None:
+            masked["result"] = MASKED_ERROR
+        if masked.get("role") == "tool" and masked.get("content") is not None:
+            masked["content"] = MASKED_ERROR
+    return masked
 
 
 @dataclass(frozen=True)

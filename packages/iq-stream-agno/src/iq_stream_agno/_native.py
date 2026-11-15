@@ -11,14 +11,16 @@ from agno.run.base import BaseRunOutputEvent
 from agno.utils.serialize import json_serializer
 from iq_stream import FrameTooLarge
 
-from ._common import ERROR_TEXT, EVENT_NAME, MASKED_ERROR, TOOL_EVENTS, Fits, Frame, Report, event_name, longest_prefix
+from ._common import ERROR_TEXT, EVENT_NAME, MASKED_ERROR, Fits, Frame, Report, event_name, longest_prefix, mask_errors
 
 Transform = Callable[[BaseRunOutputEvent], "Mapping[str, Any] | None"]
 """Turns an event into the dictionary to publish, or ``None`` to publish nothing for it."""
 
-#: What the shrink policy removes, group by group, until the line fits: nested runs, media, then context.
+#: What the shrink policy removes, group by group, until the line fits: nested runs, the requirements of a paused
+#: run (which repeat its ``tools``), media, then context.
 _REMOVABLE = (
     ("member_responses", "step_executor_runs", "step_results", "step_response"),
+    ("requirements",),
     ("images", "videos", "audio", "files", "response_audio", "image"),
     ("additional_input", "reasoning_messages", "references", "session_state"),
 )
@@ -31,17 +33,14 @@ def dumps(payload: Mapping[str, Any]) -> str:
 
 
 def masked(name: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """The payload with the error text of an error event, or of a failed tool's result, replaced."""
+    """The payload without error text: its own, found by the event's name (a transform may leave ``event`` out),
+    and that of the runs nested in it (``mask_errors``)."""
+    payload = cast("dict[str, Any]", mask_errors(payload))
     field = ERROR_TEXT.get(name)
     if field is not None:
         if payload.get(field) is not None:
             payload[field] = MASKED_ERROR
         payload.pop("additional_data", None)
-    tool: object = payload.get("tool")
-    if name in TOOL_EVENTS and isinstance(tool, dict):
-        tool = cast("dict[str, Any]", tool)
-        if tool.get("tool_call_error") and tool.get("result") is not None:
-            payload["tool"] = {**tool, "result": MASKED_ERROR}
     return payload
 
 
@@ -149,13 +148,17 @@ def shrink(payload: dict[str, Any], fits: Callable[[str], bool]) -> str | None:
 
 
 def _places(payload: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
-    """Where to cut, in order. A tool event's own text is a one-line summary, cut before the tool's arguments go; the
-    text of an event that lists its tools, such as ``RunCompleted``, is the answer, cut last."""
+    """Where to cut, in order. A tool event's texts (the tool's result, and Agno's one-line summary, which repeats the
+    tool's name and arguments) are cut longest first, so that a short one is not emptied while a long one keeps
+    room, and its arguments go last; the text of an event that lists its tools, such as ``RunCompleted``, is the
+    answer, cut last."""
     texts = [(payload, key, key) for key in ("content", "reasoning_content")]
     tool: object = payload.get("tool")
     if isinstance(tool, dict):
         tool = cast("dict[str, Any]", tool)
-        return [(tool, "result", "tool.result"), *texts, (tool, "tool_args", "tool.tool_args")]
+        own = [(tool, "result", "tool.result"), *texts]
+        own.sort(key=lambda place: len(str(place[0].get(place[1]) or "")), reverse=True)
+        return [*own, (tool, "tool_args", "tool.tool_args")]
     tools: object = payload.get("tools")
     listed = cast("list[Any]", tools) if isinstance(tools, list) else []
     items = [cast("dict[str, Any]", item) for item in listed if isinstance(item, dict)]
@@ -163,3 +166,30 @@ def _places(payload: dict[str, Any]) -> list[tuple[dict[str, Any], str, str]]:
     found = [(item, "result", "tools[].result") for item in items]
     found.extend((item, "tool_args", "tools[].tool_args") for item in items)
     return [*found, *texts]
+
+
+#: What an error event of each kind copies from the root event it stands in for.
+_IDENTITY = ("agent_id", "agent_name", "team_id", "team_name", "workflow_id", "workflow_name")
+
+
+def error_event(ending: BaseRunOutputEvent, text: str) -> BaseRunOutputEvent:
+    """The error event of the root run's kind (``RunError``, ``TeamRunError``, ``WorkflowError``), with ``text``: what
+    the native protocol publishes instead of a root event that turned out not to end the run, because the iterator
+    raised after it or ``before_close`` failed."""
+    name = event_name(ending)
+    fields: dict[str, Any] = {key: getattr(ending, key, None) for key in ("run_id", "session_id")}
+    if name.startswith("Workflow"):
+        from agno.run.workflow import WorkflowErrorEvent as Error
+
+        fields["error"] = text
+    elif name.startswith("Team"):
+        from agno.run.team import RunErrorEvent as Error
+
+        fields["content"] = text
+    else:
+        from agno.run.agent import RunErrorEvent as Error
+
+        fields["content"] = text
+    known = Error.__dataclass_fields__
+    fields.update({key: getattr(ending, key) for key in _IDENTITY if key in known and hasattr(ending, key)})
+    return Error(**fields)

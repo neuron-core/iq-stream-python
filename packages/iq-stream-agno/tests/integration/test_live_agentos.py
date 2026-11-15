@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ import httpx
 import pytest
 import uvicorn
 from ag_ui.core import Event
+from agno.agent import Agent
 from agno.db.in_memory import InMemoryDb
 from agno.os import AgentOS
 from agno.os.interfaces.base import BaseInterface
@@ -18,7 +20,7 @@ from iq_stream import IQClient
 from iq_stream.testing import TestServers, free_port, subscribe, subscribe_in_background
 from live import delivered
 from pydantic import TypeAdapter
-from scripted_model import SLOW, weather_agent
+from scripted_model import SLOW, ScriptedModel, weather_agent
 
 from iq_stream_agno.os import IQStream
 
@@ -138,6 +140,49 @@ def test_an_ag_ui_resume_is_cancelled_by_the_run_id_of_its_ticket(iq_servers: Te
         frames = delivered(subscription.result(15), "iq:fail")
         assert frames[0] == {"type": "RUN_STARTED", "threadId": "t-live-resume", "runId": "live-leg-2"}
         assert frames[-1]["type"] == "RUN_FINISHED" and frames[-1]["outcome"] == {"type": "cancelled"}
+    finally:
+        server.stop()
+
+
+def read_until_finished(url: str) -> tuple[dict[str, Any], float]:
+    """Reads a stream as a browser does, until RUN_FINISHED: the TOOL_CALL_START it saw, and when it saw the end."""
+    call: dict[str, Any] = {}
+    with httpx.stream("GET", url, timeout=15, trust_env=False) as response:
+        for line in response.iter_lines():
+            if line.startswith("data:"):
+                row = json.loads(line[5:])
+                call = row if row.get("type") == "TOOL_CALL_START" else call
+                if row.get("type") == "RUN_FINISHED":
+                    return call, time.monotonic()
+    raise AssertionError("no RUN_FINISHED")
+
+
+def test_a_frontend_tool_is_answered_at_once_though_the_first_stream_is_still_closing(iq_servers: TestServers) -> None:
+    # The client's default min_open (3 s) holds the first leg's close line back; the page answers at RUN_FINISHED.
+    client = IQClient(iq_servers.default.url, iq_servers.app_key, iq_servers.app_secret)
+    agent = Agent(
+        id="ui-agent",
+        model=ScriptedModel(tool_name="change_color", tool_args={"color": "red"}),
+        db=InMemoryDb(),
+        telemetry=False,
+    )
+    server = Served(IQStream(client, agent=agent, shutdown_timeout=5.0))
+    tool = {"name": "change_color", "description": "Change the page colour.", "parameters": {"type": "object"}}
+    try:
+        user = {"id": "m1", "role": "user", "content": "Make it red"}
+        first = server.post("/iq/agui", {**agui_body("ui-leg-1", "t-ui-fast", [user]), "tools": [tool]})[0].json()
+        started = time.monotonic()
+        call, seen = read_until_finished(first["url"])
+        tool_call = {"id": call["toolCallId"], "type": "function", "function": {"name": "change_color"}}
+        tool_call["function"]["arguments"] = '{"color": "red"}'
+        assistant = {"id": "a1", "role": "assistant", "content": "", "toolCalls": [tool_call]}
+        answer = {"id": "t1", "role": "tool", "toolCallId": call["toolCallId"], "content": "done"}
+        body = {**agui_body("ui-leg-2", "t-ui-fast", [user, assistant, answer]), "tools": [tool]}
+        response, _ = server.post("/iq/agui", body)
+        assert response.status_code == 200 and time.monotonic() - started < 3.0, response.text
+        frames = delivered(subscribe(response.json()["url"], timeout=15), "iq:end")
+        assert frames[0]["type"] == "RUN_STARTED" and frames[-1]["type"] == "RUN_FINISHED"
+        assert seen - started < 3.0
     finally:
         server.stop()
 

@@ -43,7 +43,7 @@ def test_a_sync_run_in_ag_ui_arrives_valid_and_ends(iq_client: IQClient, iq_serv
     ticket = iq_client.ticket()
     subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
     with iq_client.publisher(ticket.stream_id) as publisher:
-        for _ in publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher, protocol="agui"):
+        for _ in publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui"):
             pass
     rows = delivered(subscription.result(10), "iq:end")
     for frame in subscription.result().frames:
@@ -74,7 +74,7 @@ async def test_a_tool_silent_past_the_read_timeout_stays_on_one_request(iq_serve
     subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
     publisher = client.apublisher(ticket.stream_id)
     stream = weather_agent(tool_name="slow_weather").arun("Weather?", stream=True, stream_events=True)
-    async for _ in apublish(stream, publisher, protocol="agui", exclude=QUIET):
+    async for _ in apublish(stream, publisher, protocol="ag-ui", exclude=QUIET):
         pass
     rows = delivered(await subscription, "iq:end")
     assert rows[-1]["type"] == "RUN_FINISHED" and publisher.requests == 1
@@ -87,7 +87,7 @@ async def test_without_keepalives_the_core_continues_the_stream_after_the_408(iq
     subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
     publisher = client.apublisher(ticket.stream_id)
     stream = weather_agent(tool_name="slow_weather").arun("Weather?", stream=True, stream_events=True)
-    async for _ in apublish(stream, publisher, protocol="agui", exclude=QUIET):
+    async for _ in apublish(stream, publisher, protocol="ag-ui", exclude=QUIET):
         pass
     rows = delivered(await subscription, "iq:end")
     assert rows[-1]["type"] == "RUN_FINISHED" and publisher.requests >= 2

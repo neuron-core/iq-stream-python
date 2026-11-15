@@ -14,9 +14,19 @@ from typing import TYPE_CHECKING, Literal, TypeVar, cast
 from agno.run.base import BaseRunOutputEvent
 from iq_stream import AsyncPublisherLike, FrameTooLarge, IQError, Outcome, PublisherLike, PublishResult
 
-from ._common import ROOT_CANCELS, ROOT_ERRORS, ROOT_PAUSES, AguiRequest, Frame, event_name, nested
+from ._common import (
+    MASKED_ERROR,
+    ROOT_CANCELS,
+    ROOT_ENDINGS,
+    ROOT_ERRORS,
+    ROOT_PAUSES,
+    AguiRequest,
+    Frame,
+    event_name,
+    nested,
+)
 from ._common import Protocol as WireProtocol
-from ._native import NativeEncoder, Transform
+from ._native import NativeEncoder, Transform, error_event
 
 if TYPE_CHECKING:
     from ._agui import AguiEncoder
@@ -25,11 +35,18 @@ E = TypeVar("E")
 
 RunStatus = Literal["completed", "paused", "error", "cancelled", "interrupted"]
 """How a run ended: Agno completed it, paused it for a human, failed it, cancelled it; or it was ``interrupted``,
-because the consumer stopped iterating or its task was cancelled."""
+because the consumer stopped iterating, its task was cancelled or the process was interrupted."""
 
 logger = logging.getLogger("iq_stream_agno")
 
-_INTERRUPTIONS = (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt)
+#: A run stopped from outside: its task cancelled, the process interrupted. Closed with ``close_on_cancel``.
+_CANCELLATIONS = (asyncio.CancelledError, KeyboardInterrupt)
+#: The same, and a loop over the wrapper left early, which a generator cannot tell from an exception raised in the
+#: loop's body: that one closes with ``fail``.
+_INTERRUPTIONS = (GeneratorExit, *_CANCELLATIONS)
+
+# Closes scheduled for publishers handed to a refused call: the loop keeps only weak references to tasks.
+_closing: set[asyncio.Task[None]] = set()
 
 
 @dataclass(frozen=True)
@@ -63,11 +80,13 @@ class Options:
     include: frozenset[str] | None
     exclude: frozenset[str]
     root_run_id: str | None
-    cancelled: Outcome
+    close_on_cancel: Outcome
     shrink: bool
     transform: Transform | None
     expose_errors: bool
-    on_error: ErrorHandler | None
+    on_dropped: ErrorHandler | None
+    #: Whether the native protocol holds the root run's ending back until ``before_close`` has run.
+    hold_ending: bool
 
 
 def options(
@@ -77,36 +96,41 @@ def options(
     include: Collection[str] | None,
     exclude: Collection[str],
     root_run_id: str | None,
-    cancelled: str,
-    on_oversize: str,
+    close_on_cancel: str,
+    oversize: str,
     transform: Transform | None,
     expose_errors: bool,
-    on_error: ErrorHandler | None,
+    on_dropped: ErrorHandler | None,
+    hold_ending: bool,
 ) -> Options:
     """The options, checked when ``publish()`` is called rather than at the first event."""
-    if protocol not in ("agno", "agui"):
-        raise ValueError('protocol is "agno" or "agui".')
-    if cancelled not in ("fail", "end"):
-        raise ValueError('cancelled is "fail" or "end".')
-    if on_oversize not in ("shrink", "drop"):
-        raise ValueError('on_oversize is "shrink" or "drop".')
+    if protocol not in ("agno", "ag-ui"):
+        raise ValueError('protocol is "agno" or "ag-ui".')
+    if close_on_cancel not in ("fail", "end"):
+        raise ValueError('close_on_cancel is "fail" or "end".')
+    if oversize not in ("shrink", "drop"):
+        raise ValueError('oversize is "shrink" or "drop".')
     if transform is not None and protocol != "agno":
         raise ValueError("transform applies to the native protocol only.")
+    if event_names and protocol != "agno":
+        # StreamAgent subscribes without event names, and an EventSource hands a named frame only to its listener.
+        raise ValueError("event_names applies to the native protocol only: AG-UI frames are unnamed.")
     if isinstance(include, str) or isinstance(exclude, str):
         raise ValueError("include and exclude are collections of Agno event names.")
-    if protocol == "agui":
+    if protocol == "ag-ui":
         require_agui()
     return Options(
-        protocol="agui" if protocol == "agui" else "agno",
+        protocol="ag-ui" if protocol == "ag-ui" else "agno",
         event_names=bool(event_names),
         include=None if include is None else frozenset(include),
         exclude=frozenset(exclude),
         root_run_id=root_run_id,
-        cancelled="end" if cancelled == "end" else "fail",
-        shrink=on_oversize == "shrink",
+        close_on_cancel="end" if close_on_cancel == "end" else "fail",
+        shrink=oversize == "shrink",
         transform=transform,
         expose_errors=bool(expose_errors),
-        on_error=on_error,
+        on_dropped=on_dropped,
+        hold_ending=hold_ending,
     )
 
 
@@ -115,13 +139,13 @@ def require_agui() -> None:
         from . import _agui  # noqa: F401  # pyright: ignore[reportUnusedImport]
     except ImportError as error:
         raise ImportError(
-            "The AG-UI protocol needs the agui extra: pip install 'iq-stream-agno[agui]'"
+            "The AG-UI protocol needs the ag-ui extra: pip install 'iq-stream-agno[ag-ui]'"
             f" ({error.name or error} is missing)."
         ) from error
 
 
 class Reporter:
-    """Adapter-level problems: to ``on_error``, else to the ``iq_stream_agno`` logger once per kind and run. Never
+    """Adapter-level problems: to ``on_dropped``, else to the ``iq_stream_agno`` logger once per kind and run. Never
     with frame data in the message."""
 
     def __init__(self, handler: ErrorHandler | None) -> None:
@@ -160,11 +184,16 @@ class AgnoTrack:
         self._paused = False
         self._root_error: BaseRunOutputEvent | None = None
         self._unsupported = False
+        #: Whether the root run's ending has passed: a pause, a completion, an error or a cancel.
+        self.ended = False
+        # The native frames of the root's ending, held back until before_close has run, and the event they encode.
+        self._held: list[Frame] = []
+        self._held_event: BaseRunOutputEvent | None = None
 
         def fits(data: str, event: str | None) -> bool:
             return publisher.frame_size(data, event) <= publisher.max_frame_bytes
 
-        if options.protocol == "agui":
+        if options.protocol == "ag-ui":
             from ._agui import AguiEncoder, AguiFramer
 
             framer = AguiFramer(
@@ -233,6 +262,7 @@ class AgnoTrack:
                 self._cancelled = True
             elif name in ROOT_PAUSES:
                 self._paused = True
+            self.ended = self.ended or name in ROOT_ENDINGS
         if not encode or name in self._options.exclude:
             return []
         if self._options.include is not None and name not in self._options.include:
@@ -241,10 +271,17 @@ class AgnoTrack:
             if self._agui is not None:
                 return self._agui.encode(item, root=root, thread_id=self.session_id, run_id=self.run_id)
             assert self._native is not None
-            return self._native.encode(item)
+            frames = self._native.encode(item)
         except Exception as cause:
             self._report(self._encoding_error(name, cause))
             return []
+        held = self._held
+        if self._options.hold_ending and root and name in ROOT_ENDINGS:
+            # A page that takes RunCompleted for done must not read it before the answer is saved.
+            self._held, self._held_event = frames, item
+            return held
+        self._held, self._held_event = [], None
+        return [*held, *frames]
 
     def status(self) -> str:
         if self._unsupported or self._failed:
@@ -253,9 +290,15 @@ class AgnoTrack:
             return "cancelled"
         return "paused" if self._paused else "completed"
 
-    def final_frames(self, status: str, error: BaseException | None) -> list[Frame]:
-        if self._agui is None or self._unsupported:
+    def final_frames(self, status: str, error: BaseException | None, unsaved: bool) -> list[Frame]:
+        """What ends the stream's data: AG-UI's terminal events; in the native protocol, the root's ending held back.
+        A completion or a pause that the run turned out to fail after (the iterator raised, ``before_close`` raised) is
+        replaced by an error event of its kind, and dropped when ``before_close`` was interrupted (``unsaved``: it did
+        not complete); an error or a cancel goes out as it is."""
+        if self._unsupported:
             return []
+        if self._agui is None:
+            return self._native_ending(status, error, unsaved)
         try:
             return self._agui.finish(
                 status, error=error, root_error=self._root_error, thread_id=self.session_id, run_id=self.run_id
@@ -263,6 +306,20 @@ class AgnoTrack:
         except Exception as cause:
             self._report(self._encoding_error("the end of the run", cause))
             return []
+
+    def _native_ending(self, status: str, error: BaseException | None, unsaved: bool) -> list[Frame]:
+        held, ending = self._held, self._held_event
+        self._held, self._held_event = [], None
+        if ending is None or self._native is None or event_name(ending) in ROOT_ERRORS | ROOT_CANCELS:
+            return held  # true whether or not the answer was saved
+        if status == "error":
+            text = (str(error) or type(error).__name__) if error is not None and self._options.expose_errors else None
+            try:
+                return self._native.encode(error_event(ending, text or MASKED_ERROR))
+            except Exception as cause:
+                self._report(self._encoding_error("the end of the run", cause))
+                return []
+        return [] if unsaved else held
 
     def _encoding_error(self, what: str, cause: Exception) -> IQError:
         error = IQError(
@@ -278,17 +335,31 @@ class _Run:
     """The per-run state the two drivers share: frames queued, and the ending."""
 
     def __init__(
-        self, publisher: PublisherLike | AsyncPublisherLike, track: AgnoTrack, cancelled_outcome: Outcome
+        self, publisher: PublisherLike | AsyncPublisherLike, track: AgnoTrack, close_on_cancel: Outcome
     ) -> None:
         self.publisher = publisher
         self.track = track
-        self.cancelled_outcome: Outcome = cancelled_outcome
+        self.close_on_cancel: Outcome = close_on_cancel
         self.frames = 0
+        #: Called once, when the root run's ending has passed or the iterator ended, before the frames that tell the
+        #: browser: a route lets a paused run be continued from then on, not only once its close line was answered.
+        self.on_settled: Callable[[], object] | None = None
+
+    def settle(self) -> None:
+        callback, self.on_settled = self.on_settled, None
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                logger.exception("on_settled raised")
 
     def take(self, item: object) -> None:
         """Encodes one item and queues its frames. Fails open: a frame that cannot go is reported and skipped. The
         publisher's own error leaves only with the client's ``on_error="raise"``, as the application asked."""
-        for event, data in self.track.frames(item, self.publisher.alive):
+        frames = self.track.frames(item, self.publisher.alive)
+        if self.track.ended:
+            self.settle()
+        for event, data in frames:
             if not self._send(event, data):
                 return
 
@@ -303,19 +374,22 @@ class _Run:
 
     def ending(self, error: BaseException | None) -> tuple[str, Outcome]:
         if error is not None:
+            if isinstance(error, _CANCELLATIONS):
+                return "interrupted", self.close_on_cancel
             return _failure_status(error), "fail"
         status = self.track.status()
         if status == "error":
             return status, "fail"
         if status == "cancelled":
-            return status, self.cancelled_outcome
+            return status, self.close_on_cancel
         return status, "end"
 
-    def finish_frames(self, status: str, error: BaseException | None) -> None:
+    def finish_frames(self, status: str, error: BaseException | None, unsaved: bool) -> None:
         if self.publisher.alive:
-            for event, data in self.track.final_frames(status, error):
+            for event, data in self.track.final_frames(status, error, unsaved):
                 if not self._send(event, data):
-                    return
+                    break
+        self.settle()
 
     def summary(
         self,
@@ -403,8 +477,8 @@ def drive(
                 before_close(run.summary(outcome, status, None))
             except BaseException as caught:
                 failure = caught
-                status, outcome = _failure_status(caught), "fail"
-        run.finish_frames(status, error or failure)
+                status, outcome = run.ending(caught)
+        run.finish_frames(status, error or failure, failure is not None)
         result: PublishResult | None = None
         try:
             result = publisher.close(outcome)
@@ -419,16 +493,18 @@ def drive(
 
 
 async def adrive(
-    source: AsyncIterable[E],
+    source: Callable[[], AsyncIterable[E]],
     run: _Run,
     before_close: BeforeClose | None,
     on_summary: Callable[[RunSummary], object] | None = None,
 ) -> AsyncIterator[E]:
+    """Drives the iterator that ``source()`` returns; ``source`` is called inside the ``try``, so that a run that
+    raises when it is started (``arun()`` refusing its input) still ends its frames and closes the stream."""
     iterator: AsyncIterator[E] | None = None
     error: BaseException | None = None
     exhausted = False
     try:
-        iterator = _aiterate(source)
+        iterator = _aiterate(source())
         while True:
             try:
                 item = await iterator.__anext__()
@@ -455,8 +531,8 @@ async def adrive(
                     await cast("Awaitable[object]", pending)
             except BaseException as caught:
                 failure = caught
-                status, outcome = _failure_status(caught), "fail"
-        run.finish_frames(status, error or failure)
+                status, outcome = run.ending(caught)
+        run.finish_frames(status, error or failure, failure is not None)
         result: PublishResult | None = None
         try:
             result = await aclose(run.publisher, outcome)
@@ -487,32 +563,38 @@ def publish(
     include: Collection[str] | None = None,
     exclude: Collection[str] = (),
     root_run_id: str | None = None,
-    cancelled: Outcome = "fail",
-    on_oversize: Literal["shrink", "drop"] = "shrink",
+    close_on_cancel: Outcome = "fail",
+    oversize: Literal["shrink", "drop"] = "shrink",
     transform: Transform | None = None,
     expose_errors: bool = False,
-    on_error: ErrorHandler | None = None,
+    on_dropped: ErrorHandler | None = None,
     before_close: Callable[[RunSummary], object] | None = None,
 ) -> Iterator[E]:
     """Yields every item of ``events`` (from ``Agent.run``, ``Team.run``, ``Workflow.run`` or ``continue_run`` with
     ``stream=True``) unchanged, publishes each Agno event as frames, and closes the stream when the iterator ends:
-    ``fail`` when the root run errored or was cancelled, the iterator raised or the caller stopped early, ``end``
-    otherwise. Iterate it to the end, or close it, so that the stream is closed."""
-    if inspect.iscoroutinefunction(publisher.close):
-        raise TypeError("publish() takes a synchronous publisher; an AsyncPublisher goes with apublish().")
-    checked = options(
-        protocol=protocol,
-        event_names=event_names,
-        include=include,
-        exclude=exclude,
-        root_run_id=root_run_id,
-        cancelled=cancelled,
-        on_oversize=on_oversize,
-        transform=transform,
-        expose_errors=expose_errors,
-        on_error=on_error,
-    )
-    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(on_error)), checked.cancelled)
+    ``end`` when the run completed or paused; ``close_on_cancel`` when Agno cancelled it or the process was
+    interrupted; ``fail`` when it failed, the iterator raised or the caller stopped early. Iterate it to the end, or
+    close it, so that the stream is closed. A call refused for its arguments closes the stream with ``fail``."""
+    try:
+        if inspect.iscoroutinefunction(publisher.close):
+            raise TypeError("publish() takes a synchronous publisher; an AsyncPublisher goes with apublish().")
+        checked = options(
+            protocol=protocol,
+            event_names=event_names,
+            include=include,
+            exclude=exclude,
+            root_run_id=root_run_id,
+            close_on_cancel=close_on_cancel,
+            oversize=oversize,
+            transform=transform,
+            expose_errors=expose_errors,
+            on_dropped=on_dropped,
+            hold_ending=before_close is not None,
+        )
+    except BaseException:
+        close_refused(publisher)
+        raise
+    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(on_dropped)), checked.close_on_cancel)
     return drive(events, run, before_close)
 
 
@@ -525,26 +607,55 @@ def apublish(
     include: Collection[str] | None = None,
     exclude: Collection[str] = (),
     root_run_id: str | None = None,
-    cancelled: Outcome = "fail",
-    on_oversize: Literal["shrink", "drop"] = "shrink",
+    close_on_cancel: Outcome = "fail",
+    oversize: Literal["shrink", "drop"] = "shrink",
     transform: Transform | None = None,
     expose_errors: bool = False,
-    on_error: ErrorHandler | None = None,
+    on_dropped: ErrorHandler | None = None,
     before_close: Callable[[RunSummary], Awaitable[object] | object] | None = None,
 ) -> AsyncIterator[E]:
     """``publish()`` for ``arun`` and ``acontinue_run``. The publisher is an ``AsyncPublisher``, or a synchronous
-    ``Publisher`` when async tools may block the event loop and starve the asyncio writer's keepalives."""
-    checked = options(
-        protocol=protocol,
-        event_names=event_names,
-        include=include,
-        exclude=exclude,
-        root_run_id=root_run_id,
-        cancelled=cancelled,
-        on_oversize=on_oversize,
-        transform=transform,
-        expose_errors=expose_errors,
-        on_error=on_error,
-    )
-    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(on_error)), checked.cancelled)
-    return adrive(events, run, before_close)
+    ``Publisher`` when async tools may block the event loop and starve the asyncio writer's keepalives. A cancelled
+    task closes the stream with ``close_on_cancel``."""
+    try:
+        checked = options(
+            protocol=protocol,
+            event_names=event_names,
+            include=include,
+            exclude=exclude,
+            root_run_id=root_run_id,
+            close_on_cancel=close_on_cancel,
+            oversize=oversize,
+            transform=transform,
+            expose_errors=expose_errors,
+            on_dropped=on_dropped,
+            hold_ending=before_close is not None,
+        )
+    except BaseException:
+        close_refused(publisher)
+        raise
+    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(on_dropped)), checked.close_on_cancel)
+    return adrive(lambda: events, run, before_close)
+
+
+def close_refused(publisher: PublisherLike | AsyncPublisherLike) -> None:
+    """Closes with ``fail`` the stream of a call refused for its arguments: its request is open since the publisher
+    was made, and would otherwise be held open by keepalives with no close line for the page. In a running loop the
+    close is scheduled, since neither kind of publisher may block the loop while the server answers."""
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        if not inspect.iscoroutinefunction(publisher.close):  # an AsyncPublisher without its loop cannot be closed
+            with contextlib.suppress(Exception):
+                cast("PublisherLike", publisher).close("fail")
+        return
+
+    async def closing() -> None:
+        with contextlib.suppress(Exception):
+            await aclose(publisher, "fail")
+
+    task = loop.create_task(closing())
+    _closing.add(task)
+    task.add_done_callback(_closing.discard)

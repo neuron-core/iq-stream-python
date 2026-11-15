@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
 
-from iq_stream import AsyncPublisherLike, IQClient, IQError, Outcome, Ticket
+from iq_stream import IQClient, IQError, Outcome, Ticket
 
 from ._common import AguiRequest, Protocol
 from ._native import Transform
@@ -33,11 +33,11 @@ class PublishOptions(TypedDict, total=False):
     event_names: bool
     include: Collection[str] | None
     exclude: Collection[str]
-    cancelled: Outcome
-    on_oversize: Literal["shrink", "drop"]
+    close_on_cancel: Outcome
+    oversize: Literal["shrink", "drop"]
     transform: Transform | None
     expose_errors: bool
-    on_error: Callable[[IQError], object] | None
+    on_dropped: Callable[[IQError], object] | None
     before_close: Callable[[RunSummary], Awaitable[object] | object] | None
 
 
@@ -48,7 +48,8 @@ class StreamHandle:
     ticket: Ticket
     run_id: str
     session_id: str
-    #: Its result is the run's ``RunSummary``. Cancelling it cancels the run and closes the stream with ``fail``.
+    #: Its result is the run's ``RunSummary``. Cancelling it cancels the run and closes the stream with the
+    #: ``close_on_cancel`` publish option (``fail`` by default).
     task: asyncio.Task[RunSummary] = field(repr=False)
 
     @property
@@ -97,6 +98,36 @@ def start_run(
     once. Called on a running event loop. The publisher is created first, so its request is open before Agno's
     setup begins; the run id is chosen here, so the run can be cancelled by it before its first event. The stream id is
     recorded in the run's metadata under ``iq_stream_id``."""
+    return begin_run(
+        client,
+        entity,
+        input,
+        session_id=session_id,
+        run_id=run_id,
+        stream_id=stream_id,
+        ttl=ttl,
+        protocol=protocol,
+        publish_options=publish_options,
+        run_kwargs=run_kwargs,
+    )
+
+
+def begin_run(
+    client: IQClient,
+    entity: Agent | Team | Workflow,
+    input: Any,
+    *,
+    session_id: str | None,
+    run_id: str | None,
+    stream_id: str | None,
+    ttl: float,
+    protocol: Protocol,
+    publish_options: PublishOptions | None,
+    run_kwargs: dict[str, Any],
+    on_settled: Callable[[StreamHandle], object] | None = None,
+) -> StreamHandle:
+    """``start_run()``, with what the AgentOS interface needs: ``on_settled``, called when the run's ending has
+    passed (``_Run.on_settled``)."""
     run_id = run_id or str(uuid4())
     session_id = session_id or str(uuid4())
     checked = checked_options(protocol, publish_options, run_id)
@@ -116,7 +147,8 @@ def start_run(
             **run_kwargs,
         )
 
-    return launch(client, ticket, events, run_id, session_id, checked, (publish_options or {}).get("before_close"))
+    before_close = (publish_options or {}).get("before_close")
+    return launch(client, ticket, events, run_id, session_id, checked, before_close, on_settled=on_settled)
 
 
 def continue_run(
@@ -134,6 +166,34 @@ def continue_run(
 ) -> StreamHandle:
     """One more leg of a paused run, published on a new stream: ``entity.acontinue_run(run_id=..., requirements=...,
     stream=True, stream_events=True)``. The first leg's stream closed at the pause; the run keeps its id."""
+    return begin_continue(
+        client,
+        entity,
+        run_id=run_id,
+        session_id=session_id,
+        requirements=requirements,
+        stream_id=stream_id,
+        ttl=ttl,
+        protocol=protocol,
+        publish_options=publish_options,
+        run_kwargs=run_kwargs,
+    )
+
+
+def begin_continue(
+    client: IQClient,
+    entity: Agent | Team,
+    *,
+    run_id: str,
+    session_id: str,
+    requirements: list[RunRequirement] | None,
+    stream_id: str | None,
+    ttl: float,
+    protocol: Protocol,
+    publish_options: PublishOptions | None,
+    run_kwargs: dict[str, Any],
+    on_settled: Callable[[StreamHandle], object] | None = None,
+) -> StreamHandle:
     checked = checked_options(protocol, publish_options, run_id)
     ticket = client.ticket(stream_id, ttl)
 
@@ -149,7 +209,8 @@ def continue_run(
             **run_kwargs,
         )
 
-    return launch(client, ticket, events, run_id, session_id, checked, (publish_options or {}).get("before_close"))
+    before_close = (publish_options or {}).get("before_close")
+    return launch(client, ticket, events, run_id, session_id, checked, before_close, on_settled=on_settled)
 
 
 def checked_options(protocol: Protocol, publish_options: PublishOptions | None, root_run_id: str | None) -> Options:
@@ -160,11 +221,12 @@ def checked_options(protocol: Protocol, publish_options: PublishOptions | None, 
         include=chosen.get("include"),
         exclude=chosen.get("exclude", ()),
         root_run_id=root_run_id,
-        cancelled=chosen.get("cancelled", "fail"),
-        on_oversize=chosen.get("on_oversize", "shrink"),
+        close_on_cancel=chosen.get("close_on_cancel", "fail"),
+        oversize=chosen.get("oversize", "shrink"),
         transform=chosen.get("transform"),
         expose_errors=chosen.get("expose_errors", False),
-        on_error=chosen.get("on_error"),
+        on_dropped=chosen.get("on_dropped"),
+        hold_ending=chosen.get("before_close") is not None,
     )
 
 
@@ -177,20 +239,23 @@ def launch(
     checked: Options,
     before_close: Callable[[RunSummary], Awaitable[object] | object] | None,
     agui: AguiRequest | None = None,
+    on_settled: Callable[[StreamHandle], object] | None = None,
 ) -> StreamHandle:
     publisher = client.apublisher(ticket.stream_id)  # its request opens before Agno's setup starts
-    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(checked.on_error), agui), checked.cancelled)
+    run = _Run(publisher, AgnoTrack(checked, publisher, Reporter(checked.on_dropped), agui), checked.close_on_cancel)
     run.track.session_id = session_id
     task = asyncio.get_running_loop().create_task(
-        publish_task(publisher, run, events, before_close), name=f"iq-stream-agno {run_id}"
+        publish_task(run, events, before_close), name=f"iq-stream-agno {run_id}"
     )
     _running.add(task)
     task.add_done_callback(_running.discard)
-    return StreamHandle(ticket, run_id, session_id, task)
+    handle = StreamHandle(ticket, run_id, session_id, task)
+    if on_settled is not None:
+        run.on_settled = lambda: on_settled(handle)  # the task has not started: it runs at the loop's next turn
+    return handle
 
 
 async def publish_task(
-    publisher: AsyncPublisherLike,
     run: _Run,
     events: Callable[[], AsyncIterable[object]],
     before_close: Callable[[RunSummary], Awaitable[object] | object] | None,
@@ -199,13 +264,7 @@ async def publish_task(
     nothing unretrieved; a cancellation is the task's."""
     summaries: list[RunSummary] = []
     try:
-        source = events()
-    except Exception as error:
-        logger.error("The run could not be started", exc_info=error)
-        result = await publisher.close("fail")
-        return run.summary("fail", "error", error, result)
-    try:
-        async for _ in adrive(source, run, before_close, summaries.append):
+        async for _ in adrive(events, run, before_close, summaries.append):
             pass
     except asyncio.CancelledError:
         raise
