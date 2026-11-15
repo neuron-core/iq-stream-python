@@ -15,13 +15,16 @@ from fakes import (
     TOOL_RESULT,
     ScriptedLLM,
     broken_weather,
+    direct_agent,
     get_weather,
     handoff_workflow,
     parallel_agent,
+    repeated_id_agent,
+    tool_call,
     weather_agent,
 )
 from iq_stream.testing import AsyncRecordingPublisher
-from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.core.agent.workflow import AgentStream, FunctionAgent, ToolCall
 from llama_index.core.agent.workflow.workflow_events import AgentStreamStructuredOutput
 from llama_index.core.base.llms.types import TextBlock
 from llama_index.protocols.ag_ui.agent import AGUIChatWorkflow
@@ -194,3 +197,105 @@ def test_without_ag_ui_protocol_the_encoder_says_which_extra_to_install(monkeypa
 def test_max_field_bytes_is_positive() -> None:
     with pytest.raises(ValueError, match="max_field_bytes"):
         AGUIEncoder(thread_id="t", max_field_bytes=0)
+
+
+async def test_a_return_direct_tools_result_is_the_assistants_answer() -> None:
+    events = await run(direct_agent().run(user_msg="Weather in Paris?"))
+    assert_well_formed(events)
+    kinds = types(events)
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == FIRST_TEXT + TOOL_RESULT
+    assert kinds.index("TOOL_CALL_RESULT") < kinds.index("TEXT_MESSAGE_START", kinds.index("TOOL_CALL_RESULT"))
+    assert kinds[-2:] == ["STEP_FINISHED", "RUN_FINISHED"]
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["two-steps", "one-step"])
+async def test_tool_calls_that_share_an_id_are_each_announced_under_an_id_of_their_own(parallel: bool) -> None:
+    events = await run(repeated_id_agent(parallel=parallel).run(user_msg="Paris and Rome?"))
+    assert_well_formed(events)
+    starts = [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"]
+    assert sorted(starts) == ["get_weather", "get_weather#2"]  # type: ignore[type-var]
+    cities = {e["toolCallId"]: json.loads(str(e["delta"]))["city"] for e in events if e["type"] == "TOOL_CALL_ARGS"}
+    results = {event["toolCallId"]: event["content"] for event in events if event["type"] == "TOOL_CALL_RESULT"}
+    assert sorted(cities.values()) == ["Paris", "Rome"]
+    assert results == {call: f"21 °C and sunny in {city}" for call, city in cities.items()}  # each its own result
+
+
+async def test_one_encoder_serves_runs_one_after_another() -> None:
+    encoder = AGUIEncoder(thread_id="thread-1")
+    for n in (1, 2):
+        publisher = AsyncRecordingPublisher()
+        await publish(
+            weather_agent().run(user_msg="Weather?", run_id=f"run-{n}-000000000000"), publisher, encoder=encoder
+        )
+        events = agui_events(publisher.data)
+        assert_well_formed(events)
+        assert events[0]["runId"] == events[-1]["runId"] == f"run-{n}-000000000000"
+        assert [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"] == ["call_1"]
+    fixed = AGUIEncoder(thread_id="thread-1", run_id="chosen")
+    for _ in (1, 2):
+        assert json.loads(next(iter(fixed.start("handler-run")))[1])["runId"] == "chosen"
+
+
+async def test_a_lone_surrogate_in_the_answer_becomes_a_replacement_character_and_the_run_stays_well_formed() -> None:
+    agent = weather_agent(answer_tokens=["Sunny \ud83d", "\ude00 in ", "Paris."])
+    events = await run(agent.run(user_msg="Weather?"))
+    assert_well_formed(events)
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == FIRST_TEXT + "Sunny �� in Paris."
+
+
+async def test_a_lone_surrogate_in_a_tool_result_does_not_lose_the_result() -> None:
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        return "21 \udcc3C in Paris"  # decoded with surrogateescape
+
+    events = await run(weather_agent(tool=get_weather).run(user_msg="Weather?"))
+    (result,) = (event for event in events if event["type"] == "TOOL_CALL_RESULT")
+    assert result["content"] == "21 �C in Paris"
+
+
+class Flaky(AGUIEncoder):
+    """Fails once, on the first text delta, after it has built its frames."""
+
+    failed = False
+
+    def _stream(self, event: AgentStream) -> list[tuple[str | None, str]]:
+        frames = super()._stream(event)
+        if event.delta and not self.failed:
+            self.failed = True
+            raise ValueError("cannot encode this")
+        return frames
+
+
+async def test_an_event_that_fails_to_encode_leaves_no_trace_in_the_encoders_state() -> None:
+    publisher = AsyncRecordingPublisher()
+    await publish(weather_agent().run(user_msg="Weather?"), publisher, encoder=Flaky(thread_id="t"))
+    events = agui_events(publisher.data)
+    assert_well_formed(events)  # the next delta opens the message the failed one did not
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == FIRST_TEXT[len("Let ") :] + ANSWER
+
+
+async def test_a_tool_call_of_a_step_without_text_has_no_parent_message() -> None:
+    llm = ScriptedLLM(
+        script=[
+            [TextBlock(text="Let me check."), tool_call("get_weather", "c1", city="Paris")],
+            [tool_call("get_weather", "c2", city="Rome")],
+            [TextBlock(text="Both sunny.")],
+        ]
+    )
+    events = await run(FunctionAgent(name="assistant", tools=[get_weather], llm=llm).run(user_msg="Paris, Rome?"))
+    first, second = (event for event in events if event["type"] == "TOOL_CALL_START")
+    assert first["parentMessageId"] == next(e["messageId"] for e in events if e["type"] == "TEXT_MESSAGE_START")
+    assert "parentMessageId" not in second
+
+
+def test_non_finite_numbers_are_null_in_custom_events() -> None:
+    encoder = AGUIEncoder(thread_id="t")
+    (frame,) = encoder.encode(AgentStreamStructuredOutput(output={"confidence": float("nan"), "max": float("inf")}))
+    assert json.loads(frame[1], parse_constant=_refuse)["value"] == {"confidence": None, "max": None}
+    (start, arguments, _) = encoder.encode(ToolCall(tool_name="t", tool_kwargs={"x": float("-inf")}, tool_id="c"))
+    assert json.loads(json.loads(arguments[1])["delta"], parse_constant=_refuse) == {"x": None}
+    assert json.loads(start[1])["toolCallName"] == "t"
+
+
+def _refuse(constant: str) -> None:
+    raise AssertionError(f"{constant} is not JSON")

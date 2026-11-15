@@ -10,7 +10,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from typing import Any
 
-from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent
+from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent, ReActAgent
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
@@ -21,6 +21,7 @@ from llama_index.core.base.llms.types import (
 )
 from llama_index.core.llms.callbacks import llm_chat_callback
 from llama_index.core.llms.mock import MockFunctionCallingLLM
+from llama_index.core.tools import FunctionTool
 from llama_index.core.workflow import Context, HumanResponseEvent, InputRequiredEvent
 from pydantic import Field
 
@@ -204,3 +205,39 @@ def handoff_workflow() -> AgentWorkflow:
         llm=ScriptedLLM(script=[[tool_call("get_weather", "t1", city="Rome")], [TextBlock(text="Sunny in Rome.")]]),
     )
     return AgentWorkflow(agents=[triage, weather], root_agent="triage")
+
+
+REACT_ANSWER = "It is sunny in Paris."
+
+
+def react_agent(*, streaming: bool = False) -> ReActAgent:
+    """A ReActAgent: one tool step, then its answer, which llama-index-core strips of "Answer:" once written."""
+    llm = ScriptedLLM(
+        script=[
+            [TextBlock(text='Thought: I need the weather.\nAction: get_weather\nAction Input: {"city": "Paris"}')],
+            [TextBlock(text=f"Thought: I can answer.\nAnswer: {REACT_ANSWER}")],
+        ]
+    )
+    return ReActAgent(name="react", tools=[get_weather], llm=llm, streaming=streaming)
+
+
+def direct_agent() -> FunctionAgent:
+    """An agent whose tool has return_direct=True: its result ends the run as the answer."""
+    tool = FunctionTool.from_defaults(async_fn=get_weather, return_direct=True)
+    return FunctionAgent(name="direct", tools=[tool], llm=FakeStreamingLLM(tool_name="get_weather"))
+
+
+def repeated_id_agent(*, parallel: bool = False) -> FunctionAgent:
+    """A model without tool-call ids, as Ollama's integration is: the id is the tool's name. It calls one tool twice,
+    in two steps, or twice at once in one step, where both calls are open together and the second ends first."""
+
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        await asyncio.sleep(0.2 if city == "Paris" else 0.05)
+        return f"21 °C and sunny in {city}"
+
+    paris = tool_call("get_weather", "get_weather", city="Paris")
+    rome = tool_call("get_weather", "get_weather", city="Rome")
+    calls = [[paris, rome]] if parallel else [[paris], [rome]]
+    llm = ScriptedLLM(script=[*calls, [TextBlock(text="Paris and Rome are sunny.")]])
+    return FunctionAgent(name="assistant", tools=[get_weather], llm=llm)

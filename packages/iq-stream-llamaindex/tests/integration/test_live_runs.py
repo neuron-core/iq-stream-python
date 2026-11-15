@@ -17,7 +17,7 @@ from fakes import (
     slow_weather,
     weather_agent,
 )
-from iq_stream import IQClient
+from iq_stream import IQClient, Outcome, PublishResult
 from iq_stream.testing import TestServers, asubscribe, start_server, subscribe_in_background
 from live import assert_delivered, named, payloads
 from llama_index.core.agent.workflow import ToolCall
@@ -202,14 +202,19 @@ async def test_the_answer_is_saved_before_the_close_so_a_late_browser_finds_it(
         await asyncio.sleep(0.2)  # a database write
         store.update(answer=str(outcome.result), at=time.monotonic())
 
-    outcome = await publish(
-        weather_agent().run(user_msg="Weather?"), iq_client.apublisher(ticket.stream_id), before_close=save_answer
-    )
-    closed_at = time.monotonic()
+    publisher = iq_client.apublisher(ticket.stream_id)
+    close = publisher.close
+
+    async def timed_close(outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+        store["closing_at"] = time.monotonic()  # the moment the close line is sent
+        return await close(outcome, timeout)
+
+    publisher.close = timed_close  # type: ignore[method-assign]
+    outcome = await publish(weather_agent().run(user_msg="Weather?"), publisher, before_close=save_answer)
     late = await asubscribe(iq_servers.default.url, ticket.stream_id, ticket.token, timeout=10)
     assert late.terminal is not None and late.terminal.event == "iq:gone"
     assert late.terminal.data["outcome"] == "end" and late.frames == []
-    assert store["answer"] == ANSWER and float(store["at"]) < closed_at  # type: ignore[arg-type]
+    assert store["answer"] == ANSWER and float(store["at"]) < float(store["closing_at"])  # type: ignore[arg-type]
     assert outcome.publish_result is not None and outcome.publish_result.outcome == "end"
 
 

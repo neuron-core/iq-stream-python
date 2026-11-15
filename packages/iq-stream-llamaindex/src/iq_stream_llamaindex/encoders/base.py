@@ -23,13 +23,17 @@ MASKED_ERROR = "An error occurred."
 DEFAULT_MAX_FIELD_BYTES = 16_384
 
 _EVENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class Encoder(Protocol):
-    """Turns a run's events into frames. ``publish()`` calls it from one task, in the order of the stream."""
+    """Turns a run's events into frames. ``publish()`` calls it from one task, in the order of the stream. An encoder
+    serves one run at a time: ``start()`` begins a run, so one instance may serve runs one after another, not two at
+    once."""
 
     def start(self, run_id: str) -> Iterable[Frame]:
-        """The frames that open the stream, before the first event."""
+        """The frames that open the stream, before the first event. It begins a new run: the state an encoder keeps
+        about the previous one is dropped here."""
         ...
 
     def encode(self, event: Event) -> Iterable[Frame]:
@@ -49,8 +53,28 @@ class Encoder(Protocol):
 
 
 def dumps(value: object) -> str:
-    """Compact JSON, non-ASCII kept, anything JSON has no type for as its ``str()``."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    """Compact JSON, non-ASCII kept, anything JSON has no type for as its ``str()``, a non-finite float as ``null``
+    and a lone surrogate as U+FFFD."""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    if "NaN" in text or "Infinity" in text:
+        # Python writes non-finite floats as bare words that JSON.parse refuses; strings are left as they are.
+        plain = json.loads(text, parse_constant=lambda _: None)
+        text = json.dumps(plain, ensure_ascii=False, separators=(",", ":"))
+    return scrub(text)
+
+
+def scrub(text: str) -> str:
+    """``text`` with each lone surrogate, which has no UTF-8 form, as U+FFFD, as the server would read it. They come
+    from a surrogate pair split across two streamed chunks, or from text decoded with ``surrogateescape``."""
+    if text.isascii():
+        return text
+    return _SURROGATE.sub("�", text)
+
+
+def call_key(tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> tuple[str, str, str]:
+    """What tells a tool call apart from another with the same id: some providers have no ids and use the tool's name
+    (Ollama, sometimes Gemini), so a model that calls one tool twice gives two calls with one id."""
+    return tool_id, tool_name, json.dumps(kwargs, sort_keys=True, default=str)
 
 
 def event_name(event: object) -> str:

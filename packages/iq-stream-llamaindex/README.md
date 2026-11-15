@@ -91,7 +91,7 @@ async def chat(request: ChatRequest) -> dict[str, str | int]:
 
 ## Reading the events too
 
-`stream_events()` has one reader. Code that still needs the events, to answer a human-input request or to log, reads them from `published()`, which yields each event after publishing it:
+`stream_events()` has one reader. Code that still needs the events, to answer a human-input request or to log, reads them from `published()`, which yields each event after publishing it, except the terminal one, which it yields before its frames: those go out when the block is left, after `before_close`, so nothing tells the browser the run ended before your code has seen it:
 
 ```python
 import asyncio
@@ -121,7 +121,7 @@ asyncio.run(run_with_approval())
 
 `approval_agent` stands for an agent whose tool calls `ctx.wait_for_event(HumanResponseEvent, waiter_event=InputRequiredEvent(...))`, and `answer_from_the_browser()` for your endpoint that receives the answer. The stream stays open while the run waits, on keepalives, and the same stream goes on once it is answered; keep the handler reachable by stream id for that, as the example app does. A `ToolCall` that the wait replays is announced once.
 
-Breaking out of the loop early does not cut the browser's stream short: leaving the block reads and publishes the rest of the run. Leaving it with an exception stops the run (`handler.cancel_run()`) and closes the stream with `fail`. `publish(..., on_event=...)` is the same with a callback.
+Breaking out of the loop early does not cut the browser's stream short: leaving the block reads and publishes the rest of the run. Leaving it with an exception stops the run (`handler.cancel_run()`) and closes the stream with `fail`. `publish(..., on_event=...)` is the same with a callback. An `AgentOutput` is yielded, and published, once the next event has arrived: llama-index-core changes it after writing it to the stream (a `ReActAgent` strips its `Answer:` scaffolding, the last one gains the run's tool calls), and it is published as finalized, as your result has it.
 
 ## What the browser needs
 
@@ -138,14 +138,14 @@ Either way the stream ends with `iq:end` or `iq:fail`, or `iq:gone` for a browse
 | (before the first) | `RunStarted` `{run_id}` | `RUN_STARTED` |
 | `AgentInput`, `AgentSetup` | not published: prompts and history stay on the server | a new agent: `STEP_FINISHED` of the previous one, `STEP_STARTED` |
 | `AgentStream` | `AgentStream` `{delta, agent}`, with `thinking_delta` when there is one | `REASONING_*` for a thinking delta, `TEXT_MESSAGE_START` / `CONTENT` for a text delta |
-| `AgentOutput` | `AgentOutput` `{agent, content, tool_calls}` | `TEXT_MESSAGE_END`; the whole text, for an agent built with `streaming=False` |
-| `ToolCall` (once per id) | `ToolCall` `{tool_id, tool_name, tool_kwargs}` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END` |
+| `AgentOutput` | `AgentOutput` `{agent, content, tool_calls}`; the last one's `tool_calls` are the run's, as in the result | `TEXT_MESSAGE_END`; the whole text, for an agent built with `streaming=False` |
+| `ToolCall` (a replay left out) | `ToolCall` `{tool_id, tool_name, tool_kwargs}` | `TOOL_CALL_START`, `TOOL_CALL_ARGS`, `TOOL_CALL_END` |
 | `ToolCallResult` | `ToolCallResult` `{tool_id, tool_name, content, is_error, return_direct}` | `TOOL_CALL_RESULT` |
 | `AgentStreamStructuredOutput` | `{output}` | `CUSTOM` `structured_output` |
 | `InputRequiredEvent` | its fields | `CUSTOM` `input_required` |
 | An AG-UI event (from `AGUIChatWorkflow`) | its AG-UI JSON | passed through unchanged |
 | Your own event | its fields, undeclared ones included | `CUSTOM` named after its class (`custom_events=False` drops it) |
-| `StopEvent` | `{result}` | `STEP_FINISHED`, `RUN_FINISHED` |
+| `StopEvent` | `{result}` | `STEP_FINISHED`, `RUN_FINISHED`; first the answer as a text message when a `return_direct` tool gave it |
 | `WorkflowFailedEvent` | `{step_name, message}` | `RUN_ERROR` code `failed` |
 | `WorkflowTimedOutEvent` | `{timeout, active_steps}` | `RUN_ERROR` code `timeout` |
 | `WorkflowCancelledEvent` | `{}` | `RUN_FINISHED` with outcome `cancelled` |
@@ -161,6 +161,7 @@ Either way the stream ends with `iq:end` or `iq:fail`, or `iq:gone` for a browse
 | waiting for a human | nothing: the stream stays open | none yet |
 | the task running `publish()` was cancelled | the encoder's abort frames | `fail`; the run is stopped and the cancellation goes on |
 | `before_close` raised | the encoder's abort frames instead of the terminal ones | `fail`, and the exception goes on |
+| the run ended, but no terminal event came through its stream | the encoder's abort frames | `fail` |
 | the publisher gave up | none | none: the core client already closed the stream with `fail` |
 
 A cancelled run closes with `fail` by default because its answer is incomplete, and a second tab watching the stream should not take it for a finished one; the `cancelled` outcome in the data tells the page that it was a stop.
@@ -178,7 +179,7 @@ published(handler, publisher, *, encoder=None, before_close=None, cancelled_clos
 | `handler` | What `workflow.run(...)` or `agent.run(...)` returned, whose events nothing has read yet. |
 | `publisher` | `iq.apublisher(stream_id)`, created on the running loop; any `AsyncPublisherLike`. |
 | `encoder` | `NativeEncoder()` by default, `AGUIEncoder(thread_id=...)`, or your own `Encoder`. |
-| `on_event` | Called with each event after its frames were sent; may be async. Its exceptions propagate. |
+| `on_event` | Called with each event after its frames were sent, the terminal event before its frames (they follow `before_close`); may be async. Its exceptions propagate. |
 | `before_close` | Called with the `RunOutcome` before the terminal frames and the close line; may be async. Its exceptions propagate, the stream closed with `fail`. |
 | `cancelled_close` | The close line of a cancelled run: `"fail"` or `"end"`. |
 | `raise_run_errors` | Raise the run's exception after the close instead of returning it. |
@@ -189,20 +190,25 @@ published(handler, publisher, *, encoder=None, before_close=None, cancelled_clos
 
 `AGUIEncoder(*, thread_id, run_id=None, emit_steps=True, custom_events=True, max_field_bytes=16_384, expose_errors=False)`: `run_id` defaults to the handler's; `emit_steps` publishes a step per agent; `custom_events` publishes your own events as `CUSTOM`.
 
-Both mask an exception's text, a failing tool's included, as `"An error occurred."` unless `expose_errors=True`: an error message can carry what a browser should not see. An `Encoder` of your own has four methods, each returning frames, `(event_name_or_None, data)`: `start(run_id)`, `encode(event)` for every event the terminal one included, `abort(error)` for a stream that ends without one, and `fit(frame, fits)`, what to send instead of a frame over the line limit (several frames, a shorter one, or none).
+Both mask the text of the exceptions they encode, a failing tool's included, as `"An error occurred."` unless `expose_errors=True`: an error message can carry what a browser should not see. Events that already are AG-UI events, which `AGUIChatWorkflow` writes itself, pass through as they are: its `MESSAGES_SNAPSHOT` carries each tool message, and for a backend tool that raised, `AGUIChatWorkflow` stores the exception's text as that message, so such a tool should catch its own exceptions and return what the browser may see.
+
+Tool calls: a `ToolCall` that a human-input wait replays (the same id, tool and arguments, with no result yet) is announced once. Some model integrations have no tool-call ids and use the tool's name (Ollama, Gemini at times), so two calls can share an id: `NativeEncoder` keeps LlamaIndex's ids, and `AGUIEncoder` publishes the second call of a run under `<id>#2`, the third under `<id>#3`, with its result under the same id.
+
+An encoder serves one run at a time: `start()` begins a run and drops what the encoder kept about the previous one, so one instance can serve runs one after another, not two at once. An `Encoder` of your own has four methods, each returning frames, `(event_name_or_None, data)`: `start(run_id)`, `encode(event)` for every event the terminal one included, `abort(error)` for a stream that ends without one, and `fit(frame, fits)`, what to send instead of a frame over the line limit (several frames, a shorter one, or none).
 
 ## Sizes
 
 - **Large fields are cut.** Tool arguments, tool results and final answers longer than `max_field_bytes` (16 KiB) are cut, with `"truncated": true` in native frames and an ellipsis in AG-UI ones. Tool arguments stay JSON.
 - **Frames fit the publisher's limit.** A frame over the client's `max_frame_bytes` (65,536 by default; set it to your app's limit if the server has a lower one) is handed to the encoder's `fit()`: a long delta or tool-argument text is sent as several frames, which a page concatenates as it would the original; a tool result is cut further. What cannot be made to fit, such as an `AGUIChatWorkflow` `MESSAGES_SNAPSHOT` of a long conversation, is dropped with a warning on the `iq_stream_llamaindex` logger that names the event, never its data.
 - **Text deltas are small.** The native `AgentStream` frame carries the delta, not the cumulative `response` LlamaIndex repeats in every event, so a stream grows with the answer, not with its square.
+- **Every frame is JSON a browser parses.** A non-finite float (`NaN`, `Infinity`) is published as `null`, and a lone surrogate (half of a pair split across two streamed chunks, text decoded with `surrogateescape`) as U+FFFD, which is what the server would make of it.
 
 ## Limits worth knowing
 
-- One reader: a handler whose events something else read is refused with an error that says so.
+- One reader: a handler whose events something else read, or whose stream a generator of `stream_events()` that was not closed still holds, is refused with an error that says so, and the stream closes with `fail`.
 - The server's stream limits (10 MiB and 30 minutes by default) apply to a run waiting for a human too; `ctx.wait_for_event()` has its own timeout.
 - Tool arguments are published whole at `ToolCall`: LlamaIndex parses them before the step starts, so there is no argument stream to relay.
-- `ReActAgent` text deltas include its `Thought:` and `Action:` scaffolding, as LlamaIndex streams them.
+- A `ReActAgent`'s text includes its `Thought:` and `Action:` scaffolding, as LlamaIndex streams it, and as its tool steps' `AgentOutput` carries it with `streaming=False`; its last answer is published without `Answer:`, as LlamaIndex saves it, unless it was streamed.
 - A workflow that a tool starts on its own (an agent used as a tool) has its own handler; its events are in the stream only if the tool forwards them with `ctx.write_event_to_stream()`.
 - Reasoning deltas appear when the model integration puts `thinking_delta` in its chunks, as the Anthropic one does.
 

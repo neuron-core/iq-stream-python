@@ -19,6 +19,7 @@ from workflows.events import Event, StopEvent
 from workflows.handler import WorkflowHandler
 
 from ._outcome import RunOutcome, classify, close_line
+from .encoders._types import agent_events
 from .encoders.base import Encoder, Frame
 from .encoders.native import NativeEncoder
 
@@ -31,8 +32,9 @@ GRACE = 1.0
 SETTLE = 10.0
 
 CONSUMED = (
-    "The handler's events were already read: handler.stream_events() has a single consumer. Pass the handler to "
-    "publish() before anything reads its events, and read them from published() if the application needs them too."
+    "The handler's events were read elsewhere: handler.stream_events() has a single consumer, and a generator of it "
+    "that was not closed keeps the stream. Pass the handler to publish() before anything reads its events, and read "
+    "them from published() if the application needs them too."
 )
 
 EventHook = Callable[[Event], "Awaitable[None] | None"]
@@ -46,10 +48,12 @@ class PublishedStream:
     """A run's events, each published before it is handed on: ``published()`` returns one.
 
     ``async with`` it and iterate it. The start frames go out on entering; every event of the stream is encoded and
-    sent, then yielded, the terminal one last. Leaving the block normally reads and publishes the rest of the run,
-    waits for its result, calls ``before_close``, sends the terminal frames and closes the stream. Leaving it with an
-    exception, a cancellation included, stops the run (``cancel_run()``), sends the encoder's abort frames and closes
-    the stream with ``fail``. ``outcome`` is set once the block has exited.
+    sent, then yielded, except the terminal one, which is yielded last and before its frames: they go out when the
+    block is left, after ``before_close``, so that nothing tells the browser the run ended before the application has
+    saved its answer, in ``before_close`` or in the loop. Leaving the block normally reads and publishes the rest of
+    the run, waits for its result, calls ``before_close``, sends the terminal frames and closes the stream. Leaving it
+    with an exception, a cancellation included, stops the run (``cancel_run()``), sends the encoder's abort frames and
+    closes the stream with ``fail``. ``outcome`` is set once the block has exited.
     """
 
     def __init__(
@@ -72,6 +76,7 @@ class PublishedStream:
         self._events: AsyncGenerator[Event, None] | None = None
         self._result: asyncio.Task[StopEvent] | None = None
         self._reading: asyncio.Task[Event | None] | None = None
+        self._ahead: tuple[Event | None] | None = None  # the event read after an AgentOutput, not yet handled
         self._read_any = False
         self._ended = False
         self._terminal: StopEvent | None = None
@@ -130,7 +135,10 @@ class PublishedStream:
 
     async def _next(self) -> Event | None:
         """Reads one event and publishes it; the terminal event is held back until the answer is saved."""
-        event = await self._read()
+        if self._ahead is not None:
+            (event,), self._ahead = self._ahead, None
+        else:
+            event = await self._read()
         if event is None:
             self._ended = True
             return None
@@ -138,9 +146,14 @@ class PublishedStream:
         if isinstance(event, StopEvent):
             self._terminal = event
             self._ended = True
-        else:
-            what = type(event).__name__
-            self._send(self._encoded(lambda: self._encoder.encode(event), what), what)
+            return event
+        agents = agent_events()
+        if agents is not None and isinstance(event, agents.AgentOutput):
+            # llama-index-core changes an AgentOutput after writing it to the stream: ReActAgent strips its "Answer:"
+            # scaffolding, the last one gains the run's tool calls. The next event comes once that step is over.
+            self._ahead = (await self._read(),)
+        what = type(event).__name__
+        self._send(self._encoded(lambda: self._encoder.encode(event), what), what)
         return event
 
     async def _read(self) -> Event | None:
@@ -155,6 +168,10 @@ class PublishedStream:
             if not reading.done():
                 reading.cancel()
                 await asyncio.wait((reading,))
+                if not self._read_any and not self._result.cancelled():
+                    # The run ended, so its stream holds a terminal event; none reached this reader: something else
+                    # reads the stream, or holds a generator of it that it has not closed.
+                    raise RuntimeError(CONSUMED)
                 return None
             return reading.result()
         except WorkflowRuntimeError as error:
@@ -202,7 +219,9 @@ class PublishedStream:
             reason = asyncio.CancelledError() if status == "cancelled" else error or RuntimeError("no terminal event")
             frames = self._encoded(lambda: self._encoder.abort(reason), "the abort")
         self._send(frames, "the end")
-        answer = await self._close(close_line(status, self._cancelled_close))
+        # Abort frames never go with end: a run that ended without its terminal event in the stream did not end there.
+        line = close_line(status, self._cancelled_close) if terminal is not None or status == "cancelled" else "fail"
+        answer = await self._close(line)
         published = self._live and (answer is None or answer.error is None)
         self._outcome = replace(outcome, frames=self._frames, published=published, publish_result=answer)
 
@@ -381,9 +400,10 @@ async def publish(
     """Publishes a run to the browser and returns how it ended.
 
     It is the one reader of ``handler.stream_events()``: each event is encoded (``NativeEncoder`` by default) and
-    sent, then given to ``on_event``. When the stream ends it awaits the run's result, calls ``before_close`` with the
-    outcome (where the application saves the answer), sends the terminal frames and closes the stream: ``end`` for a
-    completed run, ``fail`` for a failed or timed-out one, ``cancelled_close`` for a cancelled one.
+    sent, then given to ``on_event``; the terminal event is given to ``on_event`` before its frames, which go out after
+    ``before_close``. When the stream ends it awaits the run's result, calls ``before_close`` with the outcome (where
+    the application saves the answer), sends the terminal frames and closes the stream: ``end`` for a completed run,
+    ``fail`` for a failed or timed-out one, ``cancelled_close`` for a cancelled one.
 
     A failed run is returned, not raised, unless ``raise_run_errors`` is true: ``publish()`` usually runs in a task
     of its own. Exceptions from ``on_event`` and ``before_close`` propagate, the stream then closed with ``fail``. A

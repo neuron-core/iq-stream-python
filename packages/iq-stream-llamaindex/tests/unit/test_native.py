@@ -14,6 +14,7 @@ from fakes import (
     big_weather,
     get_weather,
     opaque_weather,
+    repeated_id_agent,
     tool_call,
     weather_agent,
 )
@@ -204,3 +205,71 @@ def test_a_tool_result_carries_its_flags() -> None:
 def test_max_field_bytes_is_positive() -> None:
     with pytest.raises(ValueError, match="max_field_bytes"):
         NativeEncoder(max_field_bytes=0)
+
+
+@pytest.mark.parametrize("parallel", [False, True], ids=["two-steps", "one-step"])
+async def test_tool_calls_that_share_an_id_are_all_published(parallel: bool) -> None:
+    frames = await frames_of(repeated_id_agent(parallel=parallel).run(user_msg="Paris and Rome?"))
+    calls = payloads(frames, "ToolCall")
+    assert sorted(call["tool_kwargs"]["city"] for call in calls) == ["Paris", "Rome"]  # type: ignore[index]
+    assert {call["tool_id"] for call in calls} == {"get_weather"}  # LlamaIndex's id, as the provider gave it
+    contents = sorted(str(result["content"]) for result in payloads(frames, "ToolCallResult"))
+    assert contents == ["21 °C and sunny in Paris", "21 °C and sunny in Rome"]
+    if parallel:  # both calls were announced before either result
+        assert [event for event, _ in frames].index("ToolCallResult") > [event for event, _ in frames].index(
+            "ToolCall"
+        ) + 1
+
+
+def test_a_call_like_an_earlier_one_that_has_its_result_is_a_new_call() -> None:
+    from llama_index.core.tools import ToolOutput
+
+    encoder = NativeEncoder()
+    call = ToolCall(tool_name="get_weather", tool_kwargs={"city": "Paris"}, tool_id="get_weather")
+    output = ToolOutput(tool_name="get_weather", content="sunny", raw_input={}, raw_output="sunny")
+    result = ToolCallResult(**call.model_dump(), tool_output=output, return_direct=False)
+    published = [name for event in (call, call, result, call) for name, _ in encoder.encode(event)]
+    assert published == ["ToolCall", "ToolCallResult", "ToolCall"]  # the replay is left out, the new call is not
+
+
+async def test_one_encoder_serves_runs_one_after_another() -> None:
+    encoder = NativeEncoder()
+    for n in (1, 2):
+        frames = await frames_of(weather_agent().run(user_msg="Weather?", run_id=f"run-{n}-000000000000"), encoder)
+        assert json.loads(frames[0][1]) == {"run_id": f"run-{n}-000000000000"}
+        assert [event for event, _ in frames].count("ToolCall") == 1
+    call = ToolCall(tool_name="get_weather", tool_kwargs={"city": "Paris"}, tool_id="call_1")
+    assert len(list(encoder.encode(call))) == 1  # a run stopped before this call had its result
+    list(encoder.start("run-3"))
+    assert len(list(encoder.encode(call))) == 1
+
+
+async def test_lone_surrogates_become_replacement_characters_and_no_frame_is_lost() -> None:
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        return "21 \udcc3C in Paris"  # decoded with surrogateescape
+
+    agent = weather_agent(tool=get_weather, answer_tokens=["Sunny \ud83d", "\ude00."])
+    frames = await frames_of(agent.run(user_msg="Weather?"))
+    assert [event for event, _ in frames][-3:] == ["AgentStream", "AgentOutput", "StopEvent"]
+    assert payloads(frames, "ToolCallResult")[0]["content"] == "21 �C in Paris"
+    assert payloads(frames, "AgentOutput")[-1]["content"] == "Sunny ��."
+    assert payloads(frames, "StopEvent") == [{"result": "Sunny ��."}]
+
+
+def test_non_finite_numbers_are_null_so_that_every_frame_is_json() -> None:
+    def strict(data: str) -> object:
+        return json.loads(data, parse_constant=lambda constant: pytest.fail(f"{constant} is not JSON"))
+
+    encoder = NativeEncoder()
+    (stop,) = encoder.encode(StopEvent(result={"mean": float("nan"), "max": float("inf"), "n": 0}))
+    assert strict(stop[1]) == {"result": {"mean": None, "max": None, "n": 0}}
+    (bare,) = encoder.encode(StopEvent(result=float("nan")))
+    assert strict(bare[1]) == {"result": None}
+    (structured,) = encoder.encode(AgentStreamStructuredOutput(output={"confidence": float("nan")}))
+    assert strict(structured[1]) == {"output": {"confidence": None}}
+    (call,) = encoder.encode(ToolCall(tool_name="t", tool_kwargs={"x": float("-inf")}, tool_id="c"))
+    assert strict(call[1]) == {"tool_id": "c", "tool_name": "t", "tool_kwargs": {"x": None}}
+    (custom,) = encoder.encode(type("Stats", (Event,), {})(mean=float("nan")))
+    assert strict(custom[1]) == {"mean": None}
+    assert encoder.encode(StopEvent(result={"label": "NaN"})) == [("StopEvent", '{"result":{"label":"NaN"}}')]

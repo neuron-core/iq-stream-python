@@ -15,11 +15,15 @@ import pytest
 from fakes import (
     ANSWER,
     FIRST_TEXT,
+    REACT_ANSWER,
     THINKING,
     TOOL_RESULT,
+    direct_agent,
     get_weather,
     handoff_workflow,
     hitl_agent,
+    react_agent,
+    repeated_id_agent,
     slow_weather,
     weather_agent,
 )
@@ -203,3 +207,41 @@ async def test_split_frames_rebuild_the_whole_answer_and_arguments_in_stream_age
     assert (
         seen["types"].count("TOOL_CALL_ARGS") > 1 and seen["types"].count("TEXT_MESSAGE_CONTENT") >= 5 + 1 + 2
     )  # the long delta split
+
+
+async def test_ag_ui_frames_of_a_return_direct_tool_rebuild_its_result_as_the_answer(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    handler = direct_agent().run(user_msg="Weather in Paris?")
+    seen = check(await published(iq_client, iq_servers.default.url, handler, agui()), tmp_path)
+    assert seen["rejected"] is None and seen["failures"] == []
+    assert seen["text"] == FIRST_TEXT + TOOL_RESULT and seen["roles"][-1] == "assistant"
+
+
+async def test_ag_ui_frames_of_calls_that_share_an_id_rebuild_each_call_with_its_own_result(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    handler = repeated_id_agent(parallel=True).run(user_msg="Paris and Rome?")
+    seen = check(await published(iq_client, iq_servers.default.url, handler, agui()), tmp_path)
+    assert seen["rejected"] is None and seen["failures"] == []
+    cities = {call["id"]: call["args"]["city"] for call in seen["toolCalls"]}
+    assert sorted(cities.values()) == ["Paris", "Rome"] and len(cities) == 2
+    results = {result["toolCallId"]: result["content"] for result in seen["toolResults"]}
+    assert results == {call: f"21 °C and sunny in {city}" for call, city in cities.items()}
+
+
+async def test_ag_ui_frames_of_a_react_agent_end_with_the_answer_it_saves(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    seen = check(await published(iq_client, iq_servers.default.url, react_agent().run(user_msg="?"), agui()), tmp_path)
+    assert seen["rejected"] is None and seen["failures"] == []
+    assert seen["text"].endswith('Action Input: {"city": "Paris"}' + REACT_ANSWER)
+
+
+async def test_ag_ui_frames_with_a_split_surrogate_pair_are_accepted_by_the_client(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    handler = weather_agent(answer_tokens=["Sunny \ud83d", "\ude00 in ", "Paris."]).run(user_msg="Weather?")
+    seen = check(await published(iq_client, iq_servers.default.url, handler, agui()), tmp_path)
+    assert seen["rejected"] is None and seen["failures"] == []
+    assert seen["text"] == FIRST_TEXT + "Sunny �� in Paris."

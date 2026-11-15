@@ -22,10 +22,12 @@ from .base import (
     Fits,
     Frame,
     bounded_json,
+    call_key,
     cut,
     dumps,
     event_name,
     fields,
+    scrub,
     shrink_strings,
     split_text,
 )
@@ -62,19 +64,24 @@ class NativeEncoder:
         self._exclude = tuple(exclude)
         self._max_field_bytes = max_field_bytes
         self._expose_errors = expose_errors
-        self._tools: set[str] = set()  # tool ids announced: a human-input wait replays the tool step
+        # Tool calls announced and still without a result: a human-input wait replays the tool step, ToolCall included.
+        self._open: set[tuple[str, str, str]] = set()
 
     def start(self, run_id: str) -> Iterable[Frame]:
+        self._open = set()
         return [("RunStarted", dumps({"run_id": run_id}))]
 
     def encode(self, event: Event) -> Iterable[Frame]:
         if isinstance(event, StopEvent):
             return [(event_name(event), dumps(self._terminal(event)))]
+        agents = agent_events()
+        if agents is not None and isinstance(event, agents.ToolCallResult):
+            # Whether or not results are published: a call with a result is over, and one like it later is new.
+            self._open.discard(call_key(event.tool_id, event.tool_name, tool_kwargs(event)))
         if self._include and not isinstance(event, self._include):
             return []
         if self._exclude and isinstance(event, self._exclude):
             return []
-        agents = agent_events()
         if agents is not None:
             if isinstance(event, (agents.AgentInput, agents.AgentSetup)):
                 return []
@@ -85,10 +92,13 @@ class NativeEncoder:
             if isinstance(event, agents.ToolCallResult):
                 return [("ToolCallResult", dumps(self._result(event)))]
             if isinstance(event, agents.ToolCall):
-                if event.tool_id in self._tools:
+                kwargs = tool_kwargs(event)
+                key = call_key(event.tool_id, event.tool_name, kwargs)
+                if key in self._open:
                     return []
-                self._tools.add(event.tool_id)
-                return [("ToolCall", dumps(self._call(event.tool_id, event.tool_name, tool_kwargs(event))))]
+                frame = ("ToolCall", dumps(self._call(event.tool_id, event.tool_name, kwargs)))
+                self._open.add(key)
+                return [frame]
             if isinstance(event, agents.AgentStreamStructuredOutput):
                 output, truncated = bounded_json(event.output, self._max_field_bytes, _TRUNCATED)
                 return [("AgentStreamStructuredOutput", dumps(_marked({"output": output}, truncated)))]
@@ -148,6 +158,7 @@ class NativeEncoder:
         return pieces
 
     def _text(self, text: str) -> tuple[str, bool]:
+        text = scrub(text)
         short = cut(text, self._max_field_bytes)
         return (short + _TRUNCATED, True) if short != text else (text, False)
 

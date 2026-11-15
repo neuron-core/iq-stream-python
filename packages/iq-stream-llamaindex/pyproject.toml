@@ -88,6 +88,8 @@ filterwarnings = [
     "ignore:The `__fields_set__` attribute is deprecated:DeprecationWarning",
     "ignore:Accessing the 'model_computed_fields' attribute on the instance is deprecated:DeprecationWarning",
     "ignore:Accessing the 'model_fields' attribute on the instance is deprecated:DeprecationWarning",
+    # ReActAgent reads ctx.is_running inside its step, which llama-index-workflows deprecates.
+    "ignore:is_running called from within a step:DeprecationWarning",
 ]
 
 [tool.ruff]

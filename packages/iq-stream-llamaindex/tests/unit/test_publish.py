@@ -4,18 +4,21 @@ the tee, and the errors that belong to the application."""
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
 
 import pytest
 from fakes import (
     ANSWER,
     FIRST_TEXT,
+    REACT_ANSWER,
     broken_weather,
     hitl_agent,
+    react_agent,
     slow_weather,
     weather_agent,
 )
@@ -487,3 +490,120 @@ async def test_two_concurrent_runs_publish_to_their_own_streams_without_mixing()
         assert {event.get("runId") for event in events} - {None} == {run_id}
         text = "".join(event["delta"] for event in events if event["type"] == "TEXT_MESSAGE_CONTENT")
         assert text == FIRST_TEXT + ANSWER and publisher.outcome == "end"
+
+
+async def test_a_handler_whose_stream_another_generator_holds_is_refused_and_never_closed_with_end() -> None:
+    handler = weather_agent().run(user_msg="Weather?")
+    held = handler.stream_events()
+    async for _ in held:
+        break  # break leaves the generator suspended: it keeps the run's stream
+    publisher = AsyncRecordingPublisher()
+    try:
+        with pytest.raises(RuntimeError, match="single consumer"):
+            await asyncio.wait_for(publish(handler, publisher, encoder=AGUIEncoder(thread_id="t")), 10)
+    finally:
+        await held.aclose()
+    assert publisher.outcome == "fail"
+    assert agui_types(publisher) == ["RUN_STARTED", "RUN_ERROR"]
+
+
+async def test_a_run_whose_stream_never_delivers_its_terminal_event_closes_with_fail() -> None:
+    handler = Report(timeout=10).run()
+
+    async def without_terminal() -> AsyncGenerator[Event, None]:
+        yield Progress(step=1)
+        await asyncio.Event().wait()  # the terminal event never comes, though the run ends
+
+    handler.stream_events = without_terminal  # type: ignore[method-assign]
+    publisher = AsyncRecordingPublisher()
+    outcome = await asyncio.wait_for(publish(handler, publisher), 10)
+    assert names(publisher) == ["RunStarted", "Progress", "RunAborted"]
+    assert publisher.outcome == "fail" and outcome.result == {"pages": 3, "title": "Q3"}
+
+
+@pytest.mark.parametrize("delay", [0, 0.05], ids=["reader-first", "reader-late"])
+@pytest.mark.parametrize("protocol", ["native", "agui"])
+async def test_an_agent_output_is_published_as_llama_index_finalizes_it_however_fast_it_is_read(
+    protocol: str, delay: float
+) -> None:
+    publisher = AsyncRecordingPublisher()
+
+    async def on_event(event: Event) -> None:
+        await asyncio.sleep(delay)  # an application that awaits lets llama-index-core finalize the output first
+
+    encoder = AGUIEncoder(thread_id="t") if protocol == "agui" else NativeEncoder()
+    outcome = await publish(react_agent().run(user_msg="Weather?"), publisher, encoder=encoder, on_event=on_event)
+    assert str(outcome.result) == REACT_ANSWER
+    if protocol == "agui":
+        texts = [json.loads(data)["delta"] for data in publisher.data if '"TEXT_MESSAGE_CONTENT"' in data]
+        assert texts[-1] == REACT_ANSWER
+    else:
+        final = json.loads(publisher.data[names(publisher).index("StopEvent") - 1])
+        assert names(publisher)[-2] == "AgentOutput" and final["content"] == REACT_ANSWER
+        assert [call["tool_name"] for call in final["tool_calls"]] == ["get_weather"]  # the run's, as in the result
+
+
+async def test_a_function_agents_last_output_lists_the_runs_tool_calls_however_fast_it_is_read() -> None:
+    for delay in (0, 0.05):
+        publisher = AsyncRecordingPublisher()
+
+        async def on_event(event: Event, delay: float = delay) -> None:
+            await asyncio.sleep(delay)
+
+        outcome = await publish(weather_agent().run(user_msg="Weather?"), publisher, on_event=on_event)
+        final = json.loads(publisher.data[-2])
+        assert final["tool_calls"] == [
+            {"tool_id": "call_1", "tool_name": "get_weather", "tool_kwargs": {"city": "Paris"}}
+        ]
+        assert len(outcome.result.tool_calls) == 1
+
+
+async def test_the_tee_yields_the_terminal_event_before_its_frames_and_the_close() -> None:
+    publisher = AsyncRecordingPublisher()
+    at_terminal: list[tuple[str | None, Outcome | None]] = []
+    async with published(weather_agent().run(user_msg="Weather?"), publisher) as events:
+        async for event in events:
+            if isinstance(event, StopEvent):
+                at_terminal.append((publisher.frames[-1].event, publisher.outcome))
+    assert at_terminal == [("AgentOutput", None)]  # the loop can still save the answer before the browser learns
+    assert names(publisher)[-1] == "StopEvent" and publisher.outcome == "end"
+
+
+async def test_a_second_cancellation_of_the_publishing_task_still_stops_the_run_and_closes_with_fail() -> None:
+    publisher = AsyncRecordingPublisher()
+    handler = weather_agent(tool=slow_weather(5.0)).run(user_msg="Weather?")
+    task = asyncio.create_task(publish(handler, publisher))
+    await wait_for(lambda: "ToolCall" in names(publisher))
+    task.cancel()
+    await asyncio.sleep(0)  # the first cancellation is delivered and the cleanup starts
+    task.cancel()  # a server shutting down cancels again
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await wait_for(lambda: publisher.outcome is not None, 8)
+    assert publisher.outcome == "fail" and names(publisher)[-1] == "RunAborted" and handler.is_done()
+
+
+async def test_a_run_whose_result_does_not_settle_after_its_stream_ended_fails_without_hanging(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(publish_module, "SETTLE", 0.3)
+    handler = Report(timeout=10).run()
+    release = asyncio.Event()
+
+    async def stuck() -> StopEvent:
+        await release.wait()
+        raise RuntimeError("settled late")
+
+    handler.stop_event_result = stuck  # type: ignore[method-assign]
+    publisher = AsyncRecordingPublisher()
+    asyncio.get_running_loop().call_later(3, release.set)  # bounds the test if publish() waits for ever
+    started = time.monotonic()
+    with caplog.at_level(logging.ERROR, logger="asyncio"):
+        outcome = await publish(handler, publisher)
+        assert time.monotonic() - started < 2
+        assert outcome.status == "failed" and "did not end" in str(outcome.error) and publisher.outcome == "fail"
+        release.set()
+        await asyncio.sleep(0.05)
+        del outcome
+        gc.collect()
+    assert "never retrieved" not in caplog.text  # the late exception is marked as seen
