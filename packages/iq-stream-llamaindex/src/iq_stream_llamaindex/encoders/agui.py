@@ -23,12 +23,13 @@ from .base import (
     MASKED_ERROR,
     Fits,
     Frame,
+    ToolCalls,
     bounded_json,
-    call_key,
     cut,
     dumps,
     event_name,
     fields,
+    model_json,
     scrub,
     shrink_strings,
     split_text,
@@ -37,8 +38,6 @@ from .base import (
 if TYPE_CHECKING:
     from ag_ui.core import BaseEvent
     from llama_index.core.agent.workflow.workflow_events import AgentOutput, AgentStream, ToolCallResult
-
-_CallKey = tuple[str, str, str]
 
 _ELLIPSIS = "…"
 TIMED_OUT = "The run timed out."
@@ -62,7 +61,7 @@ def _ag_ui():
     try:
         from ag_ui.core import events
     except ImportError as error:
-        raise ImportError("AGUIEncoder needs ag-ui-protocol: pip install 'iq-stream-llamaindex[agui]'") from error
+        raise ImportError("AGUIEncoder needs ag-ui-protocol: pip install 'iq-stream-llamaindex[ag-ui]'") from error
     return events
 
 
@@ -74,9 +73,10 @@ class AGUIEncoder:
     agent of an ``AgentWorkflow``); events that already are AG-UI events (from ``AGUIChatWorkflow``) pass through
     unchanged; any other event becomes a ``CUSTOM`` event named after its class, unless ``custom_events`` is false.
     The run opens with ``RUN_STARTED`` and ends with ``RUN_FINISHED`` (with the cancelled outcome for a cancelled run)
-    or ``RUN_ERROR``. Tool arguments and results longer than ``max_field_bytes`` are cut, with an ellipsis. An
-    exception's text is masked as ``"An error occurred."`` unless ``expose_errors`` is true. A tool-call id that
-    repeats in a run (providers without ids use the tool's name) gets a suffix, ``#2``, so that each call is its own.
+    or ``RUN_ERROR``. Tool arguments, tool results and answers that were not streamed, longer than ``max_field_bytes``,
+    are cut, with an ellipsis. An exception's text is masked as ``"An error occurred."`` unless ``expose_errors`` is
+    true. A tool-call id that repeats in a run (providers without ids use the tool's name) gets a suffix, ``#2``, so
+    that each call is its own.
     """
 
     def __init__(
@@ -109,10 +109,7 @@ class AGUIEncoder:
         self._streamed = False  # the current model step streamed text
         self._answered = False  # assistant text was published since the last tool result
         self._parent: str | None = None  # the assistant message of the current model step, for its tool calls
-        # Tool calls announced and still without a result, with the id they were published under: a human-input wait
-        # replays the tool step, ToolCall included.
-        self._open: dict[_CallKey, str] = {}
-        self._ids: set[str] = set()  # the tool-call ids published in this run
+        self._calls = ToolCalls()
 
     def start(self, run_id: str) -> Iterable[Frame]:
         self._begin(self._fixed_run_id or run_id)
@@ -121,7 +118,7 @@ class AGUIEncoder:
     def encode(self, event: Event) -> Iterable[Frame]:
         # All or nothing: the frames of an event that fails to encode are skipped, and the state must not say they
         # went out (a message opened, a call announced).
-        saved = {**vars(self), "_open": dict(self._open), "_ids": set(self._ids)}
+        saved = {**vars(self), "_calls": self._calls.copy()}
         try:
             return self._encode(event)
         except BaseException:
@@ -160,7 +157,7 @@ class AGUIEncoder:
         frames = self._close_messages()
         if isinstance(error, asyncio.CancelledError):
             return [*frames, *self._finished(cancelled=True)]
-        message = scrub(str(error)) if self._expose_errors and str(error) else MASKED_ERROR
+        message = str(error) if self._expose_errors and str(error) else MASKED_ERROR
         return [*frames, self._frame(self._ag.RunErrorEvent(message=message, code="aborted"))]
 
     def fit(self, frame: Frame, fits: Fits) -> Iterable[Frame]:
@@ -182,8 +179,8 @@ class AGUIEncoder:
 
     @staticmethod
     def _frame(event: BaseEvent) -> Frame:
-        # The JSON ag_ui's EventEncoder writes after "data: ".
-        return (None, event.model_dump_json(by_alias=True))
+        # The JSON ag_ui's EventEncoder writes after "data: ", with a lone surrogate as U+FFFD instead of an error.
+        return (None, model_json(event))
 
     def _custom(self, name: str, value: Any) -> Frame:
         bounded, _ = bounded_json(value, self._max_field_bytes, _ELLIPSIS)
@@ -207,7 +204,7 @@ class AGUIEncoder:
                 self._reasoning = str(uuid.uuid4())
                 frames.append(self._frame(ag.ReasoningStartEvent(message_id=self._reasoning)))
                 frames.append(self._frame(ag.ReasoningMessageStartEvent(message_id=self._reasoning, role="reasoning")))
-            delta = scrub(event.thinking_delta)
+            delta = event.thinking_delta
             frames.append(self._frame(ag.ReasoningMessageContentEvent(message_id=self._reasoning, delta=delta)))
         if event.delta:
             frames += self._close_reasoning()
@@ -215,7 +212,7 @@ class AGUIEncoder:
                 self._text = self._parent = str(uuid.uuid4())
                 frames.append(self._frame(ag.TextMessageStartEvent(message_id=self._text, role="assistant")))
             self._streamed = self._answered = True
-            frames.append(self._frame(ag.TextMessageContentEvent(message_id=self._text, delta=scrub(event.delta))))
+            frames.append(self._frame(ag.TextMessageContentEvent(message_id=self._text, delta=event.delta)))
         return frames
 
     def _output(self, event: AgentOutput) -> list[Frame]:
@@ -233,20 +230,23 @@ class AGUIEncoder:
         self._answered = True
         return [
             self._frame(ag.TextMessageStartEvent(message_id=message_id, role="assistant")),
-            self._frame(ag.TextMessageContentEvent(message_id=message_id, delta=scrub(content))),
+            self._frame(ag.TextMessageContentEvent(message_id=message_id, delta=self._bounded(content))),
             self._frame(ag.TextMessageEndEvent(message_id=message_id)),
         ]
 
+    def _bounded(self, text: str) -> str:
+        """``text`` cut to ``max_field_bytes``, with an ellipsis when it was cut."""
+        text = scrub(text)  # a lone surrogate has no UTF-8 size
+        short = cut(text, self._max_field_bytes)
+        return short + _ELLIPSIS if short != text else text
+
     def _call(self, tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> list[Frame]:
-        key = call_key(tool_id, tool_name, kwargs)
-        if key in self._open:
+        call_id = self._calls.announce(tool_id, tool_name, kwargs)
+        if call_id is None:
             return []  # the replay of a call that waits for a human
-        call_id, n = tool_id, 1
-        while call_id in self._ids:
-            n += 1
-            call_id = f"{tool_id}#{n}"
-        self._open[key] = call_id
-        self._ids.add(call_id)
+        return self._announced(call_id, tool_name, kwargs)
+
+    def _announced(self, call_id: str, tool_name: str, kwargs: dict[str, Any]) -> list[Frame]:
         ag = self._ag
         arguments, _ = bounded_json(kwargs, self._max_field_bytes, _ELLIPSIS)
         start = ag.ToolCallStartEvent(tool_call_id=call_id, tool_call_name=tool_name, parent_message_id=self._parent)
@@ -260,15 +260,12 @@ class AGUIEncoder:
     def _result(self, event: ToolCallResult) -> list[Frame]:
         output = event.tool_output
         kwargs = tool_kwargs(event)
-        frames = self._call(event.tool_id, event.tool_name, kwargs)  # nothing when announced
-        call_id = self._open.pop(call_key(event.tool_id, event.tool_name, kwargs))
+        call_id, announced = self._calls.result(event.tool_id, event.tool_name, kwargs)
+        # A result whose call was not in the stream is announced first: a client drops a result of an unknown call.
+        frames = [] if announced else self._announced(call_id, event.tool_name, kwargs)
         self._answered = False
-        if output.is_error and not self._expose_errors:
-            content = MASKED_ERROR
-        else:
-            text = scrub(str(output.content))
-            content = cut(text, self._max_field_bytes)
-            content += _ELLIPSIS if content != text else ""
+        masked = output.is_error and not self._expose_errors
+        content = MASKED_ERROR if masked else self._bounded(str(output.content))
         result = self._ag.ToolCallResultEvent(
             message_id=str(uuid.uuid4()), tool_call_id=call_id, content=content, role="tool"
         )
@@ -280,7 +277,7 @@ class AGUIEncoder:
         frames = self._close_messages()
         if isinstance(event, WorkflowFailedEvent):
             _, text = failure(event)
-            message = scrub(text) if self._expose_errors and text else MASKED_ERROR
+            message = text if self._expose_errors and text else MASKED_ERROR
             return [*frames, self._frame(ag.RunErrorEvent(message=message, code="failed"))]
         if isinstance(event, WorkflowTimedOutEvent):
             return [*frames, self._frame(ag.RunErrorEvent(message=TIMED_OUT, code="timeout"))]

@@ -2,32 +2,37 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 
 import pytest
-from ag_ui.core import RunAgentInput, UserMessage
 from checks import agui_events, assert_well_formed, joined, types
 from fakes import (
     ANSWER,
+    BIG_RESULT,
     FIRST_TEXT,
     THINKING,
     TOOL_RESULT,
+    FakeStreamingLLM,
     ScriptedLLM,
+    big_weather,
     broken_weather,
+    chat_run,
     direct_agent,
     get_weather,
     handoff_workflow,
+    needs_ag_ui_workflow,
     parallel_agent,
     repeated_id_agent,
     tool_call,
     weather_agent,
 )
 from iq_stream.testing import AsyncRecordingPublisher
-from llama_index.core.agent.workflow import AgentStream, FunctionAgent, ToolCall
+from llama_index.core.agent.workflow import AgentStream, FunctionAgent, ToolCall, ToolCallResult
 from llama_index.core.agent.workflow.workflow_events import AgentStreamStructuredOutput
 from llama_index.core.base.llms.types import TextBlock
-from llama_index.protocols.ag_ui.agent import AGUIChatWorkflow
+from llama_index.core.tools import FunctionTool, ToolOutput
 from workflows import Context, Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
@@ -45,10 +50,11 @@ async def run(handler: object, **options: object) -> Events:
 
 
 async def test_an_agent_run_is_a_well_formed_ag_ui_run() -> None:
-    events = await run(weather_agent().run(user_msg="Weather in Paris?", run_id="run-0000000000000001"))
+    handler = weather_agent().run(user_msg="Weather in Paris?")
+    events = await run(handler)
     assert_well_formed(events)
-    assert events[0] == {"type": "RUN_STARTED", "threadId": "thread-1", "runId": "run-0000000000000001"}
-    assert events[-1] == {"type": "RUN_FINISHED", "threadId": "thread-1", "runId": "run-0000000000000001"}
+    assert events[0] == {"type": "RUN_STARTED", "threadId": "thread-1", "runId": handler.run_id}
+    assert events[-1] == {"type": "RUN_FINISHED", "threadId": "thread-1", "runId": handler.run_id}
     assert joined(events, "TEXT_MESSAGE_CONTENT") == FIRST_TEXT + ANSWER
     start = next(event for event in events if event["type"] == "TOOL_CALL_START")
     assert start["toolCallName"] == "get_weather" and start["toolCallId"] == "call_1"
@@ -135,18 +141,9 @@ async def test_a_failed_run_exposes_the_models_error_only_when_asked() -> None:
     assert_well_formed(events)
 
 
+@needs_ag_ui_workflow
 async def test_ag_ui_events_of_ag_ui_chat_workflow_pass_through_unchanged() -> None:
-    workflow = AGUIChatWorkflow(llm=weather_agent().llm, backend_tools=[get_weather], timeout=30)
-    run_input = RunAgentInput(
-        thread_id="thread-1",
-        run_id="run-1",
-        state={},
-        messages=[UserMessage(id="user-1", role="user", content="Weather in Paris?")],
-        tools=[],
-        context=[],
-        forwarded_props={},
-    )
-    handler = workflow.run(input_data=run_input)
+    handler = chat_run()
     publisher = AsyncRecordingPublisher()
     seen: list[str] = []
 
@@ -190,7 +187,7 @@ def test_a_structured_output_is_a_custom_event() -> None:
 
 def test_without_ag_ui_protocol_the_encoder_says_which_extra_to_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "ag_ui.core", None)
-    with pytest.raises(ImportError, match=r"iq-stream-llamaindex\[agui\]"):
+    with pytest.raises(ImportError, match=r"iq-stream-llamaindex\[ag-ui\]"):
         AGUIEncoder(thread_id="t")
 
 
@@ -222,14 +219,13 @@ async def test_tool_calls_that_share_an_id_are_each_announced_under_an_id_of_the
 
 async def test_one_encoder_serves_runs_one_after_another() -> None:
     encoder = AGUIEncoder(thread_id="thread-1")
-    for n in (1, 2):
+    for _ in (1, 2):
         publisher = AsyncRecordingPublisher()
-        await publish(
-            weather_agent().run(user_msg="Weather?", run_id=f"run-{n}-000000000000"), publisher, encoder=encoder
-        )
+        handler = weather_agent().run(user_msg="Weather?")
+        await publish(handler, publisher, encoder=encoder)
         events = agui_events(publisher.data)
         assert_well_formed(events)
-        assert events[0]["runId"] == events[-1]["runId"] == f"run-{n}-000000000000"
+        assert events[0]["runId"] == events[-1]["runId"] == handler.run_id
         assert [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"] == ["call_1"]
     fixed = AGUIEncoder(thread_id="thread-1", run_id="chosen")
     for _ in (1, 2):
@@ -299,3 +295,139 @@ def test_non_finite_numbers_are_null_in_custom_events() -> None:
 
 def _refuse(constant: str) -> None:
     raise AssertionError(f"{constant} is not JSON")
+
+
+# ---------------------------------------------------------------------------------------------------- round two
+
+
+def tool_frames(frames: list[tuple[str | None, str]]) -> dict[str, list[str]]:
+    """Each tool-call id's events, in order."""
+    calls: dict[str, list[str]] = {}
+    for _, data in frames:
+        event = json.loads(data)
+        if event["type"].startswith("TOOL_CALL"):
+            calls.setdefault(event["toolCallId"], []).append(event["type"].removeprefix("TOOL_CALL_"))
+    return calls
+
+
+def result_of(call: ToolCall, content: str) -> ToolCallResult:
+    output = ToolOutput(tool_name=call.tool_name, content=content, raw_input={}, raw_output=content)
+    return ToolCallResult(
+        tool_name=call.tool_name,
+        tool_kwargs=call.tool_kwargs,
+        tool_id=call.tool_id,
+        tool_output=output,
+        return_direct=False,
+    )
+
+
+def test_a_result_whose_arguments_the_tool_changed_in_place_belongs_to_its_call() -> None:
+    encoder = AGUIEncoder(thread_id="t")
+    frames = list(encoder.start("r"))
+    numbers = [10, 3, 7]
+    call = ToolCall(tool_name="sort_numbers", tool_kwargs={"numbers": numbers}, tool_id="c1")
+    frames += encoder.encode(call)
+    numbers.sort()  # the tool sorts the list it was given, which the result's arguments are
+    frames += encoder.encode(result_of(call, "sorted"))
+    assert tool_frames(frames) == {"c1": ["START", "ARGS", "END", "RESULT"]}
+    again = encoder.encode(ToolCall(tool_name="sort_numbers", tool_kwargs={"numbers": [10, 3, 7]}, tool_id="c1"))
+    assert tool_frames(list(again)) == {"c1#2": ["START", "ARGS", "END"]}  # a later call, not a replay
+
+
+async def test_a_tool_that_sorts_its_list_argument_in_place_keeps_one_call_with_its_result() -> None:
+    announced = asyncio.Event()
+
+    async def sort_numbers(numbers: list[int]) -> str:
+        """Sort the numbers."""
+        await announced.wait()  # the call is published with the arguments the model gave
+        numbers.sort()
+        return f"sorted: {numbers}"
+
+    llm = ScriptedLLM(script=[[tool_call("sort_numbers", "c1", numbers=[10, 3, 7])], [TextBlock(text="Done.")]])
+    handler = FunctionAgent(name="a", tools=[sort_numbers], llm=llm).run(user_msg="Sort 10 3 7")
+    publisher = AsyncRecordingPublisher()
+
+    def on_event(event: Event) -> None:
+        if isinstance(event, ToolCall):
+            announced.set()
+
+    await publish(handler, publisher, encoder=AGUIEncoder(thread_id="t"), on_event=on_event)
+    events = agui_events(publisher.data)
+    assert_well_formed(events)
+    assert tool_frames([(None, data) for data in publisher.data]) == {"c1": ["START", "ARGS", "END", "RESULT"]}
+    assert json.loads(joined(events, "TOOL_CALL_ARGS")) == {"numbers": [10, 3, 7]}
+    assert next(event for event in events if event["type"] == "TOOL_CALL_RESULT")["content"] == "sorted: [3, 7, 10]"
+
+
+def test_arguments_whose_keys_cannot_be_sorted_still_publish_the_call_and_its_result() -> None:
+    encoder = AGUIEncoder(thread_id="t")
+    call = ToolCall(tool_name="score", tool_kwargs={"table": {1: "one", "two": 2}}, tool_id="c9")
+    frames = [*encoder.encode(call), *encoder.encode(result_of(call, "ok"))]
+    assert tool_frames(frames) == {"c9": ["START", "ARGS", "END", "RESULT"]}
+
+
+def test_an_ag_ui_event_passed_through_with_a_lone_surrogate_is_published_with_a_replacement_character() -> None:
+    from ag_ui.core import TextMessageChunkEvent
+
+    encoder = AGUIEncoder(thread_id="t")
+    event = TextMessageChunkEvent(message_id="m1", delta="Sunny \ud83d")
+    (frame,) = encoder.encode(event)  # type: ignore[arg-type]
+    assert json.loads(frame[1]) == {"type": "TEXT_MESSAGE_CHUNK", "messageId": "m1", "delta": "Sunny \ufffd"}
+
+
+@needs_ag_ui_workflow
+async def test_ag_ui_chat_workflow_events_with_a_split_surrogate_pair_are_all_published() -> None:
+    events = await run(chat_run(answer_tokens=["Sunny \ud83d", "\ude00 in ", "Paris."]), run_id="run-1")
+    assert joined(events, "TEXT_MESSAGE_CHUNK").endswith("Sunny \ufffd\ufffd in Paris.")
+    snapshots = [event for event in events if event["type"] == "MESSAGES_SNAPSHOT"]
+    assert "Sunny \ufffd\ufffd in Paris." in json.dumps(snapshots[-1], ensure_ascii=False)  # the final history
+
+
+async def test_an_answer_that_was_not_streamed_is_cut_to_max_field_bytes() -> None:
+    direct = FunctionTool.from_defaults(async_fn=big_weather, return_direct=True)
+    agent = FunctionAgent(name="direct", tools=[direct], llm=FakeStreamingLLM(tool_name="big_weather"))
+    events = await run(agent.run(user_msg="Weather?"), max_field_bytes=64)
+    answer = joined(events, "TEXT_MESSAGE_CONTENT").removeprefix(FIRST_TEXT)
+    assert answer == BIG_RESULT[:64] + "…"
+    llm = ScriptedLLM(script=[[TextBlock(text="é" * 100)]])
+    plain = FunctionAgent(name="plain", tools=[], llm=llm, streaming=False)
+    events = await run(plain.run(user_msg="Hi"), max_field_bytes=64)
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == "é" * 32 + "…"
+
+
+def test_a_thinking_delta_with_a_lone_surrogate_keeps_its_reasoning_frames() -> None:
+    encoder = AGUIEncoder(thread_id="t")
+    stream = AgentStream(delta="", response="", current_agent_name="a", thinking_delta="Hmm \ud83d")
+    frames = [json.loads(data) for _, data in encoder.encode(stream)]
+    kinds = [frame["type"] for frame in frames]
+    assert kinds == ["REASONING_START", "REASONING_MESSAGE_START", "REASONING_MESSAGE_CONTENT"]
+    assert frames[-1]["delta"] == "Hmm \ufffd"
+
+
+async def test_answers_that_were_not_streamed_keep_a_lone_surrogate_as_a_replacement_character() -> None:
+    llm = ScriptedLLM(script=[[TextBlock(text="Sunny \ud83d.")]])
+    events = await run(FunctionAgent(name="plain", tools=[], llm=llm, streaming=False).run(user_msg="Hi"))
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == "Sunny \ufffd."
+
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        return "21 \udcc3C in Paris"  # decoded with surrogateescape
+
+    direct = FunctionTool.from_defaults(async_fn=get_weather, return_direct=True)
+    agent = FunctionAgent(name="direct", tools=[direct], llm=FakeStreamingLLM(tool_name="get_weather"))
+    events = await run(agent.run(user_msg="Weather?"))
+    assert joined(events, "TEXT_MESSAGE_CONTENT") == FIRST_TEXT + "21 \ufffdC in Paris"
+
+
+async def test_exposed_error_texts_keep_a_lone_surrogate_as_a_replacement_character() -> None:
+    agent = weather_agent(fail_on_second_call=True, failure="the model \udcc3 failed")
+    events = await run(agent.run(user_msg="Weather?"), expose_errors=True)
+    assert events[-1] == {"type": "RUN_ERROR", "message": "the model \ufffd failed", "code": "failed"}
+    (frame,) = AGUIEncoder(thread_id="t", expose_errors=True).abort(OSError("disk \udcc3 full"))
+    assert json.loads(frame[1]) == {"type": "RUN_ERROR", "message": "disk \ufffd full", "code": "aborted"}
+
+
+def test_the_ag_ui_extra_is_named_as_in_the_other_adapters() -> None:
+    from importlib.metadata import metadata
+
+    assert "ag-ui" in (metadata("iq-stream-llamaindex").get_all("Provides-Extra") or [])

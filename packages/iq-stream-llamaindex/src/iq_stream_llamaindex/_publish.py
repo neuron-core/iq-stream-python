@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import inspect
 import logging
@@ -30,6 +31,9 @@ logger = logging.getLogger("iq_stream_llamaindex")
 GRACE = 1.0
 #: Seconds given to a run to settle after its terminal event, or after ``cancel_run()``.
 SETTLE = 10.0
+#: Seconds an agent's last ``AgentOutput`` is held for llama-index-core to finalize it, at most: the event after it
+#: usually ends the wait at once, but a structured-output call can stand between them.
+HOLD = 0.25
 
 CONSUMED = (
     "The handler's events were read elsewhere: handler.stream_events() has a single consumer, and a generator of it "
@@ -52,8 +56,9 @@ class PublishedStream:
     block is left, after ``before_close``, so that nothing tells the browser the run ended before the application has
     saved its answer, in ``before_close`` or in the loop. Leaving the block normally reads and publishes the rest of
     the run, waits for its result, calls ``before_close``, sends the terminal frames and closes the stream. Leaving it
-    with an exception, a cancellation included, stops the run (``cancel_run()``), sends the encoder's abort frames and
-    closes the stream with ``fail``. ``outcome`` is set once the block has exited.
+    with an exception stops the run (``cancel_run()``), sends the encoder's abort frames and closes the stream with
+    ``fail``; a cancellation does the same and closes with ``close_on_cancel``. ``outcome`` is set once the block has
+    exited.
     """
 
     def __init__(
@@ -63,20 +68,21 @@ class PublishedStream:
         *,
         encoder: Encoder | None = None,
         before_close: CloseHook | None = None,
-        cancelled_close: Outcome = "fail",
+        close_on_cancel: Outcome = "fail",
     ) -> None:
-        if cancelled_close not in ("end", "fail"):
-            raise ValueError('cancelled_close is "end" or "fail"')
+        if close_on_cancel not in ("end", "fail"):
+            raise ValueError('close_on_cancel is "end" or "fail"')
         self._handler = handler
         self._publisher = publisher
-        self._encoder: Encoder = encoder if encoder is not None else NativeEncoder()
+        # A copy, so that one encoder configured once serves concurrent runs: its run state is the copy's.
+        self._encoder: Encoder = copy.copy(encoder) if encoder is not None else NativeEncoder()
         self._before_close = before_close
-        self._cancelled_close: Outcome = cancelled_close
+        self._close_on_cancel: Outcome = close_on_cancel
         self._entered = False
         self._events: AsyncGenerator[Event, None] | None = None
         self._result: asyncio.Task[StopEvent] | None = None
-        self._reading: asyncio.Task[Event | None] | None = None
-        self._ahead: tuple[Event | None] | None = None  # the event read after an AgentOutput, not yet handled
+        self._reading: asyncio.Task[Event | None] | None = None  # the read of the next event, until it is taken
+        self._held: Event | None = None  # an AgentOutput read and not yet published, while it is finalized
         self._read_any = False
         self._ended = False
         self._terminal: StopEvent | None = None
@@ -135,10 +141,7 @@ class PublishedStream:
 
     async def _next(self) -> Event | None:
         """Reads one event and publishes it; the terminal event is held back until the answer is saved."""
-        if self._ahead is not None:
-            (event,), self._ahead = self._ahead, None
-        else:
-            event = await self._read()
+        event = await self._read()
         if event is None:
             self._ended = True
             return None
@@ -147,20 +150,34 @@ class PublishedStream:
             self._terminal = event
             self._ended = True
             return event
-        agents = agent_events()
-        if agents is not None and isinstance(event, agents.AgentOutput):
-            # llama-index-core changes an AgentOutput after writing it to the stream: ReActAgent strips its "Answer:"
-            # scaffolding, the last one gains the run's tool calls. The next event comes once that step is over.
-            self._ahead = (await self._read(),)
+        if _last_output(event):
+            # llama-index-core finalizes an agent's last AgentOutput after writing it to the stream, in the step that
+            # follows: ReActAgent strips its "Answer:" scaffolding, the output gains the run's tool calls. Until it is
+            # published it is kept here, where a cancellation still finds it.
+            self._held = event
+            await self._wait_for_next(HOLD)
+            self._held = None
         what = type(event).__name__
         self._send(self._encoded(lambda: self._encoder.encode(event), what), what)
         return event
 
+    def _reader(self) -> asyncio.Task[Event | None]:
+        """The read of the next event: the one under way, or a new one."""
+        assert self._events is not None
+        if self._reading is None:
+            self._reading = asyncio.ensure_future(_next_event(self._events))
+        return self._reading
+
+    async def _wait_for_next(self, timeout: float) -> None:
+        """Until the next event is read (and left for ``_read()``), the run is done, or ``timeout`` passed."""
+        assert self._result is not None
+        await asyncio.wait((self._reader(), self._result), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+
     async def _read(self) -> Event | None:
         """The next event, or ``None`` when the stream ended, or when the run is done and the stream stays silent
         past the grace period."""
-        assert self._events is not None and self._result is not None
-        reading = self._reading = asyncio.ensure_future(_next_event(self._events))
+        assert self._result is not None
+        reading = self._reader()
         try:
             done, _ = await asyncio.wait((reading, self._result), return_when=asyncio.FIRST_COMPLETED)
             if reading not in done:
@@ -178,6 +195,9 @@ class PublishedStream:
             if self._read_any:
                 raise
             raise RuntimeError(CONSUMED) from error
+        finally:
+            if reading.done():
+                self._reading = None
 
     async def _finish(self) -> None:
         """The run's stream has ended: settle the result, persist, send the terminal frames, close."""
@@ -220,7 +240,7 @@ class PublishedStream:
             frames = self._encoded(lambda: self._encoder.abort(reason), "the abort")
         self._send(frames, "the end")
         # Abort frames never go with end: a run that ended without its terminal event in the stream did not end there.
-        line = close_line(status, self._cancelled_close) if terminal is not None or status == "cancelled" else "fail"
+        line = close_line(status, self._close_on_cancel) if terminal is not None or status == "cancelled" else "fail"
         answer = await self._close(line)
         published = self._live and (answer is None or answer.error is None)
         self._outcome = replace(outcome, frames=self._frames, published=published, publish_result=answer)
@@ -240,8 +260,8 @@ class PublishedStream:
         return (None, error) if error is not None else (task.result(), None)
 
     async def _abandon(self, error: BaseException) -> None:
-        """The block raised, or the task was cancelled: stop the run and close with ``fail``. The cleanup is shielded,
-        so that a second cancellation does not leave the stream open."""
+        """The block raised, or the task was cancelled: stop the run and close with ``fail``, or ``close_on_cancel``
+        for a cancellation. The cleanup is shielded, so that a second cancellation does not leave the stream open."""
         if self._outcome is not None:
             return
         cleanup = asyncio.ensure_future(self._cleanup(error))
@@ -254,6 +274,9 @@ class PublishedStream:
         if reading is not None and not reading.done():
             reading.cancel()
             await asyncio.wait((reading,))
+        held, self._held = self._held, None
+        if held is not None:  # an answer the model gave goes out before the abort frames
+            self._send(self._encoded(lambda: self._encoder.encode(held), type(held).__name__), "the output", quiet=True)
         if self._events is not None:
             with contextlib.suppress(Exception):
                 await self._events.aclose()
@@ -264,9 +287,10 @@ class PublishedStream:
         stop_event, run_error = (None, None) if self._result is None else await self._settle()
         self._send(self._encoded(lambda: self._encoder.abort(error), "the abort"), "the abort", quiet=True)
         published = self._live
-        answer = await self._close("fail", quiet=True)
+        cancelled = isinstance(error, asyncio.CancelledError)
+        answer = await self._close(self._close_on_cancel if cancelled else "fail", quiet=True)
         self._outcome = RunOutcome(
-            status="cancelled" if isinstance(error, asyncio.CancelledError) else classify(self._terminal, run_error),
+            status="cancelled" if cancelled else classify(self._terminal, run_error),
             run_id=handler.run_id,
             result=None,
             stop_event=self._terminal or stop_event,
@@ -367,7 +391,7 @@ def published(
     *,
     encoder: Encoder | None = None,
     before_close: CloseHook | None = None,
-    cancelled_close: Outcome = "fail",
+    close_on_cancel: Outcome = "fail",
 ) -> PublishedStream:
     """Publishes a run and hands each event on to the application, for code that still reads the events (to answer a
     human-input request, to log):
@@ -380,10 +404,11 @@ def published(
         outcome = events.outcome
 
     Breaking out of the loop early does not cut the browser's stream short: leaving the block reads and publishes
-    the rest of the run. Leaving it with an exception stops the run and closes the stream with ``fail``.
+    the rest of the run. Leaving it with an exception stops the run and closes the stream with ``fail``, or with
+    ``close_on_cancel`` for a cancellation.
     """
     return PublishedStream(
-        handler, publisher, encoder=encoder, before_close=before_close, cancelled_close=cancelled_close
+        handler, publisher, encoder=encoder, before_close=before_close, close_on_cancel=close_on_cancel
     )
 
 
@@ -394,7 +419,7 @@ async def publish(
     encoder: Encoder | None = None,
     on_event: EventHook | None = None,
     before_close: CloseHook | None = None,
-    cancelled_close: Outcome = "fail",
+    close_on_cancel: Outcome = "fail",
     raise_run_errors: bool = False,
 ) -> RunOutcome:
     """Publishes a run to the browser and returns how it ended.
@@ -403,14 +428,15 @@ async def publish(
     sent, then given to ``on_event``; the terminal event is given to ``on_event`` before its frames, which go out after
     ``before_close``. When the stream ends it awaits the run's result, calls ``before_close`` with the outcome (where
     the application saves the answer), sends the terminal frames and closes the stream: ``end`` for a completed run,
-    ``fail`` for a failed or timed-out one, ``cancelled_close`` for a cancelled one.
+    ``fail`` for a failed or timed-out one, ``close_on_cancel`` for a cancelled one.
 
     A failed run is returned, not raised, unless ``raise_run_errors`` is true: ``publish()`` usually runs in a task
     of its own. Exceptions from ``on_event`` and ``before_close`` propagate, the stream then closed with ``fail``. A
-    cancellation of the task stops the run, closes the stream with ``fail`` and propagates. Publishing fails open: a
-    publisher that gives up stops the encoding, and the run is still read to its end and ``before_close`` called.
+    cancellation of the task stops the run, closes the stream with ``close_on_cancel`` and propagates. Publishing fails
+    open: a publisher that gives up stops the encoding, and the run is still read to its end and ``before_close``
+    called. The encoder is copied for the run, so one instance may serve concurrent runs.
     """
-    stream = published(handler, publisher, encoder=encoder, before_close=before_close, cancelled_close=cancelled_close)
+    stream = published(handler, publisher, encoder=encoder, before_close=before_close, close_on_cancel=close_on_cancel)
     async with stream:
         async for event in stream:
             if on_event is not None:
@@ -419,6 +445,13 @@ async def publish(
     if raise_run_errors and outcome.error is not None and outcome.status != "completed":
         raise outcome.error
     return outcome
+
+
+def _last_output(event: Event) -> bool:
+    """An ``AgentOutput`` without tool calls: the agent's answer, which llama-index-core finalizes once written. An
+    output with tool calls is not changed after it, and its calls follow at once."""
+    agents = agent_events()
+    return agents is not None and isinstance(event, agents.AgentOutput) and not event.tool_calls
 
 
 def _retrieve(task: asyncio.Task[StopEvent]) -> None:

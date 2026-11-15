@@ -8,10 +8,9 @@ import logging
 
 import pytest
 from checks import agui_events, assert_well_formed, joined
-from fakes import BIG_RESULT, big_weather, get_weather, weather_agent
+from fakes import BIG_RESULT, big_weather, chat_run, needs_ag_ui_workflow, weather_agent
 from iq_stream.testing import AsyncRecordingPublisher
 from llama_index.core.agent.workflow import ToolCallResult
-from llama_index.protocols.ag_ui.agent import AGUIChatWorkflow
 from workflows import Context, Workflow, step
 from workflows.events import Event, StartEvent, StopEvent
 
@@ -54,21 +53,14 @@ async def test_ag_ui_frames_split_long_deltas_and_arguments_and_cut_long_results
     assert str(result["content"]).endswith("…") and result["toolCallId"] == "call_1"
 
 
+@needs_ag_ui_workflow
 async def test_a_snapshot_over_the_limit_is_dropped_with_a_warning_and_the_run_goes_on(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from ag_ui.core import RunAgentInput, UserMessage
-
-    history = [UserMessage(id=f"u{i}", role="user", content="An earlier question. " * 10) for i in range(10)]
-    workflow = AGUIChatWorkflow(llm=weather_agent().llm, backend_tools=[get_weather], timeout=30)
-    run_input = RunAgentInput(
-        thread_id="t", run_id="r", state={}, messages=history, tools=[], context=[], forwarded_props={}
-    )
+    handler = chat_run(history=["An earlier question. " * 10] * 10)
     publisher = AsyncRecordingPublisher(max_frame_bytes=LIMIT)
     with caplog.at_level(logging.WARNING, logger="iq_stream_llamaindex"):
-        outcome = await publish(
-            workflow.run(input_data=run_input), publisher, encoder=AGUIEncoder(thread_id="t", run_id="r")
-        )
+        outcome = await publish(handler, publisher, encoder=AGUIEncoder(thread_id="thread-1", run_id="run-1"))
     assert outcome.status == "completed" and fits_limit(publisher)
     kinds = [event["type"] for event in agui_events(publisher.data)]
     assert "MESSAGES_SNAPSHOT" not in kinds and "TEXT_MESSAGE_CHUNK" in kinds and kinds[-1] == "RUN_FINISHED"
@@ -139,7 +131,9 @@ def test_bounded_json_cuts_strings_and_gives_up_on_what_strings_cannot_shrink() 
     assert bounded_json(list(range(100)), 40, "…") == ({}, True)
 
 
-LONG_ID = "call_" + "7" * 840  # it leaves the other strings of a 1,024-byte frame less room than a uuid takes
+# Ids that leave the other strings of a 1,024-byte frame less room than a uuid takes: AG-UI carries the id once, native
+# frames twice (tool_id and call_id).
+LONG_IDS = {"agui": "call_" + "7" * 840, "native": "call_" + "7" * 400}
 
 
 class OneBigResult(Workflow):
@@ -148,7 +142,7 @@ class OneBigResult(Workflow):
         from llama_index.core.tools import ToolOutput
 
         output = ToolOutput(tool_name="get_weather", content=BIG_RESULT, raw_input={}, raw_output=BIG_RESULT)
-        kwargs = {"tool_name": "get_weather", "tool_kwargs": {}, "tool_id": LONG_ID}
+        kwargs = {"tool_name": "get_weather", "tool_kwargs": {}, "tool_id": ev.tool_id}
         ctx.write_event_to_stream(ToolCallResult(**kwargs, tool_output=output, return_direct=False))
         return StopEvent(result="done")
 
@@ -157,8 +151,10 @@ class OneBigResult(Workflow):
 async def test_a_cut_never_touches_the_ids_a_page_keys_on(protocol: str) -> None:
     publisher = AsyncRecordingPublisher(max_frame_bytes=LIMIT)
     encoder = NativeEncoder() if protocol == "native" else AGUIEncoder(thread_id="t")
-    await publish(OneBigResult(timeout=10).run(), publisher, encoder=encoder)
+    long_id = LONG_IDS[protocol]
+    await publish(OneBigResult(timeout=10).run(tool_id=long_id), publisher, encoder=encoder)
     (result,) = [json.loads(data) for data in publisher.data if '"content"' in data]
-    assert result.get("tool_id", result.get("toolCallId")) == LONG_ID and str(result["content"]).endswith("…")
+    assert result.get("tool_id", result.get("toolCallId")) == long_id and str(result["content"]).endswith("…")
+    assert result.get("call_id", long_id) == long_id
     assert result.get("tool_name", "get_weather") == "get_weather" and len(result.get("messageId", "-" * 36)) == 36
     assert fits_limit(publisher) and publisher.outcome == "end"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 from ag_ui.core import TextMessageContentEvent
@@ -12,7 +13,9 @@ from fakes import (
     SYSTEM_PROMPT,
     ScriptedLLM,
     big_weather,
+    chat_run,
     get_weather,
+    needs_ag_ui_workflow,
     opaque_weather,
     repeated_id_agent,
     tool_call,
@@ -144,6 +147,7 @@ def test_a_structured_output_is_published_as_json() -> None:
     assert frame == ("AgentStreamStructuredOutput", '{"output":{"city":"Paris"}}')
 
 
+@needs_ag_ui_workflow
 def test_an_ag_ui_event_keeps_its_wire_json_under_its_class_name() -> None:
     from llama_index.protocols.ag_ui.events import TextMessageContentWorkflowEvent
 
@@ -195,6 +199,7 @@ def test_a_tool_result_carries_its_flags() -> None:
     )
     assert json.loads(frame[1]) == {
         "tool_id": "1",
+        "call_id": "1",
         "tool_name": "t",
         "content": "ok",
         "is_error": False,
@@ -234,9 +239,10 @@ def test_a_call_like_an_earlier_one_that_has_its_result_is_a_new_call() -> None:
 
 async def test_one_encoder_serves_runs_one_after_another() -> None:
     encoder = NativeEncoder()
-    for n in (1, 2):
-        frames = await frames_of(weather_agent().run(user_msg="Weather?", run_id=f"run-{n}-000000000000"), encoder)
-        assert json.loads(frames[0][1]) == {"run_id": f"run-{n}-000000000000"}
+    for _ in (1, 2):
+        handler = weather_agent().run(user_msg="Weather?")
+        frames = await frames_of(handler, encoder)
+        assert json.loads(frames[0][1]) == {"run_id": handler.run_id}
         assert [event for event, _ in frames].count("ToolCall") == 1
     call = ToolCall(tool_name="get_weather", tool_kwargs={"city": "Paris"}, tool_id="call_1")
     assert len(list(encoder.encode(call))) == 1  # a run stopped before this call had its result
@@ -269,7 +275,90 @@ def test_non_finite_numbers_are_null_so_that_every_frame_is_json() -> None:
     (structured,) = encoder.encode(AgentStreamStructuredOutput(output={"confidence": float("nan")}))
     assert strict(structured[1]) == {"output": {"confidence": None}}
     (call,) = encoder.encode(ToolCall(tool_name="t", tool_kwargs={"x": float("-inf")}, tool_id="c"))
-    assert strict(call[1]) == {"tool_id": "c", "tool_name": "t", "tool_kwargs": {"x": None}}
+    assert strict(call[1]) == {"tool_id": "c", "call_id": "c", "tool_name": "t", "tool_kwargs": {"x": None}}
     (custom,) = encoder.encode(type("Stats", (Event,), {})(mean=float("nan")))
     assert strict(custom[1]) == {"mean": None}
     assert encoder.encode(StopEvent(result={"label": "NaN"})) == [("StopEvent", '{"result":{"label":"NaN"}}')]
+
+
+# ---------------------------------------------------------------------------------------------------- round two
+
+
+def result_of(call: ToolCall, content: str) -> ToolCallResult:
+    from llama_index.core.tools import ToolOutput
+
+    output = ToolOutput(tool_name=call.tool_name, content=content, raw_input={}, raw_output=content)
+    return ToolCallResult(
+        tool_name=call.tool_name,
+        tool_kwargs=call.tool_kwargs,
+        tool_id=call.tool_id,
+        tool_output=output,
+        return_direct=False,
+    )
+
+
+def test_a_result_whose_arguments_the_tool_changed_in_place_closes_its_call() -> None:
+    encoder = NativeEncoder()
+    numbers = [10, 3, 7]
+    call = ToolCall(tool_name="sort_numbers", tool_kwargs={"numbers": numbers}, tool_id="get_weather")
+    (announced,) = encoder.encode(call)
+    numbers.sort()  # the tool sorts the list it was given, which the result's arguments are
+    (result,) = encoder.encode(result_of(call, "sorted"))
+    assert json.loads(announced[1])["call_id"] == json.loads(result[1])["call_id"] == "get_weather"
+    # the call is closed: one with the same id and the model's arguments later (Ollama's ids repeat) is a new call
+    again = ToolCall(tool_name="sort_numbers", tool_kwargs={"numbers": [10, 3, 7]}, tool_id="get_weather")
+    assert [json.loads(data)["call_id"] for _, data in encoder.encode(again)] == ["get_weather#2"]
+
+
+def test_arguments_whose_keys_cannot_be_sorted_still_publish_the_call_and_its_result() -> None:
+    encoder = NativeEncoder()
+    call = ToolCall(tool_name="score", tool_kwargs={"table": {1: "one", "two": 2}}, tool_id="c9")
+    frames = [*encoder.encode(call), *encoder.encode(result_of(call, "ok"))]
+    assert [name for name, _ in frames] == ["ToolCall", "ToolCallResult"]
+    assert json.loads(frames[0][1])["tool_kwargs"] == {"table": {"1": "one", "two": 2}}
+
+
+async def test_parallel_calls_that_share_an_id_pair_with_their_results_by_call_id() -> None:
+    frames = await frames_of(repeated_id_agent(parallel=True).run(user_msg="Paris and Rome?"))
+    calls = {str(call["call_id"]): call["tool_kwargs"]["city"] for call in payloads(frames, "ToolCall")}  # type: ignore[index]
+    assert sorted(calls) == ["get_weather", "get_weather#2"]
+    results = {str(result["call_id"]): result["content"] for result in payloads(frames, "ToolCallResult")}
+    assert results == {call_id: f"21 °C and sunny in {city}" for call_id, city in calls.items()}
+
+
+def test_an_ag_ui_event_passed_through_with_a_lone_surrogate_is_published_with_a_replacement_character() -> None:
+    from ag_ui.core import TextMessageChunkEvent
+
+    event = TextMessageChunkEvent(message_id="m1", delta="Sunny \ud83d")
+    (frame,) = NativeEncoder().encode(event)  # type: ignore[arg-type]
+    assert frame == ("TextMessageChunkEvent", '{"type":"TEXT_MESSAGE_CHUNK","messageId":"m1","delta":"Sunny \ufffd"}')
+
+
+@needs_ag_ui_workflow
+async def test_ag_ui_chat_workflow_events_with_a_split_surrogate_pair_are_all_published() -> None:
+    frames = await frames_of(chat_run(answer_tokens=["Sunny \ud83d", "\ude00 in ", "Paris."]))
+    chunks = [json.loads(data).get("delta") or "" for name, data in frames if name == "TextMessageChunkWorkflowEvent"]
+    assert "".join(chunks).endswith("Sunny \ufffd\ufffd in Paris.")
+    snapshots = [data for name, data in frames if name == "MessagesSnapshotWorkflowEvent"]
+    assert "Sunny \ufffd\ufffd in Paris." in snapshots[-1]  # the final history
+
+
+class FailsOnce(NativeEncoder):
+    """Fails on its first tool call, after it has counted it, as an encoder may on a value it cannot handle."""
+
+    failed = False
+
+    def _call(self, tool_id: str, call_id: str, tool_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if not self.failed:
+            self.failed = True
+            raise TypeError("cannot encode this")
+        return super()._call(tool_id, call_id, tool_name, kwargs)
+
+
+def test_a_call_whose_frame_failed_to_encode_is_announced_when_it_comes_again() -> None:
+    encoder = FailsOnce()
+    call = ToolCall(tool_name="ask", tool_kwargs={"q": 1}, tool_id="q1")
+    with pytest.raises(TypeError):
+        encoder.encode(call)
+    # its replay (a human-input wait) is the first frame of the call a page sees, under the call's own id
+    assert [json.loads(data)["call_id"] for _, data in encoder.encode(call)] == ["q1"]

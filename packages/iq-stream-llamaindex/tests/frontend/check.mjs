@@ -56,7 +56,8 @@ async function native() {
   }
   // What a page derives from the native events: the answer, the reasoning, the tool calls, how the run ended.
   const of = (name) => events.filter((event) => event.name === name);
-  const results = new Map(of('ToolCallResult').map((event) => [event.tool_id, event]));
+  // call_id pairs a result with its call: tool_id repeats when a provider has no ids (Ollama, Gemini).
+  const results = new Map(of('ToolCallResult').map((event) => [event.call_id, event]));
   const last = events.at(-1) ?? null;
   return {
     events: events.length,
@@ -66,7 +67,7 @@ async function native() {
     tools: of('ToolCall').map((event) => ({
       name: event.tool_name,
       args: event.tool_kwargs,
-      result: results.get(event.tool_id)?.content ?? null,
+      result: results.get(event.call_id)?.content ?? null,
     })),
     last: last?.name ?? null,
     lastData: last,

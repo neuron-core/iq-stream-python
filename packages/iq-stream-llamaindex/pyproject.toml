@@ -33,7 +33,7 @@ dependencies = ["iq-stream>=0.1.0,<0.2", "llama-index-workflows>=2.14,<3"]
 # The agent events (FunctionAgent, ReActAgent, AgentWorkflow) are defined in llama-index-core.
 agents = ["llama-index-core>=0.14,<0.15"]
 # AGUIEncoder builds its events with the ag_ui.core models.
-agui = ["ag-ui-protocol>=1.0,<2"]
+ag-ui = ["ag-ui-protocol>=1.0,<2"]
 
 [project.urls]
 Repository = "https://github.com/neuron-core/iq-stream-python"
@@ -42,7 +42,7 @@ Issues = "https://github.com/neuron-core/iq-stream-python/issues"
 
 [dependency-groups]
 dev = [
-    "iq-stream-llamaindex[agents,agui]",
+    "iq-stream-llamaindex[agents,ag-ui]",
     "pytest>=8",
     "pytest-asyncio>=1.0",
     "ruff",
@@ -54,20 +54,16 @@ dev = [
     "uvicorn",
 ]
 
-[tool.uv]
-# The versions the plan (SDKs/llamaindex.md) was researched and prototyped against; the ranges above stay wide.
-constraint-dependencies = [
-    "llama-index-workflows==2.26.1",
-    "llama-index-core==0.14.25",
-    "llama-index-instrumentation==0.6.0",
-    "llama-index-protocols-ag-ui==0.6.0",
-    "ag-ui-protocol==1.0.0",
-    "pydantic==2.14.3",
-    "httpx==0.28.1",
-]
+# uv.lock holds the versions the plan (SDKs/llamaindex.md) was researched and prototyped against: llama-index-workflows
+# 2.26.1, llama-index-core 0.14.25, llama-index-protocols-ag-ui 0.6.0, ag-ui-protocol 1.0.0, pydantic 2.14.3. They are
+# not constraints in [tool.uv], which `uv pip install` would apply to the floor run too.
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
+
+# The lowest versions of the ranges above, which CI runs the unit tests against on the lowest Python.
+[tool.iq-stream]
+floor = ["llama-index-workflows==2.14.0", "llama-index-core==0.14.0", "ag-ui-protocol==1.0.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iq_stream_llamaindex"]
@@ -90,6 +86,8 @@ filterwarnings = [
     "ignore:Accessing the 'model_fields' attribute on the instance is deprecated:DeprecationWarning",
     # ReActAgent reads ctx.is_running inside its step, which llama-index-workflows deprecates.
     "ignore:is_running called from within a step:DeprecationWarning",
+    # llama-index-core 0.14.0 (the floor) declares fields that pydantic 2.12 and later warn about on import.
+    "ignore:The 'validate_default' attribute with value True was provided to the `Field\\(\\)` function",
 ]
 
 [tool.ruff]

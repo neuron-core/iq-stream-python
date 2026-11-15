@@ -9,22 +9,29 @@ import json
 import logging
 import time
 import warnings
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from typing import Any
 
 import pytest
 from fakes import (
     ANSWER,
     FIRST_TEXT,
     REACT_ANSWER,
+    ScriptedLLM,
     broken_weather,
+    get_weather,
     hitl_agent,
+    needs_agent_run_id,
+    needs_agent_waits,
     react_agent,
     slow_weather,
+    tool_call,
     weather_agent,
 )
 from iq_stream import IQError, Outcome, PublishResult
 from iq_stream.testing import AsyncRecordingPublisher
-from llama_index.core.agent.workflow import ToolCall
+from llama_index.core.agent.workflow import FunctionAgent, ToolCall
+from llama_index.core.base.llms.types import TextBlock
 from workflows import Context, Workflow, step
 from workflows.errors import WorkflowCancelledByUser, WorkflowTimeoutError
 from workflows.events import (
@@ -82,6 +89,7 @@ async def test_a_completed_run_publishes_every_frame_in_order_then_closes_with_e
     assert json.loads(publisher.data[0]) == {"run_id": outcome.run_id}
 
 
+@needs_agent_run_id
 async def test_the_run_id_is_the_stream_id_when_the_application_passes_it() -> None:
     publisher = AsyncRecordingPublisher()
     handler = weather_agent().run(user_msg="Weather?", run_id=publisher.stream_id)
@@ -190,9 +198,9 @@ async def test_a_timed_out_run_closes_with_fail() -> None:
 # ---------------------------------------------------------------------------------------------------- cancellation
 
 
-@pytest.mark.parametrize("cancelled_close", ["fail", "end"])
+@pytest.mark.parametrize("close_on_cancel", ["fail", "end"])
 async def test_cancel_run_during_a_tool_closes_with_the_chosen_line_after_the_cancelled_outcome(
-    cancelled_close: Outcome,
+    close_on_cancel: Outcome,
 ) -> None:
     publisher = AsyncRecordingPublisher()
     handler = weather_agent(tool=slow_weather(5.0)).run(user_msg="Weather?")
@@ -202,13 +210,13 @@ async def test_cancel_run_during_a_tool_closes_with_the_chosen_line_after_the_ca
             asyncio.get_running_loop().create_task(handler.cancel_run())
 
     outcome = await publish(
-        handler, publisher, encoder=AGUIEncoder(thread_id="t"), on_event=on_event, cancelled_close=cancelled_close
+        handler, publisher, encoder=AGUIEncoder(thread_id="t"), on_event=on_event, close_on_cancel=close_on_cancel
     )
     assert outcome.status == "cancelled" and isinstance(outcome.error, WorkflowCancelledByUser)
     assert isinstance(outcome.stop_event, WorkflowCancelledEvent)
     assert agui_types(publisher)[-2:] == ["STEP_FINISHED", "RUN_FINISHED"]
     assert json.loads(publisher.data[-1])["outcome"] == {"type": "cancelled"}
-    assert publisher.outcome == cancelled_close
+    assert publisher.outcome == close_on_cancel
 
 
 async def test_cancelling_the_publishing_task_stops_the_run_aborts_and_closes_with_fail() -> None:
@@ -261,6 +269,31 @@ async def test_a_hard_cancelled_run_ends_within_the_grace_period_instead_of_hang
 # ---------------------------------------------------------------------------------------------------- human in the loop
 
 
+class Approval(Workflow):
+    @step
+    async def ask(self, ctx: Context, ev: StartEvent) -> StopEvent:
+        waiter = InputRequiredEvent(prefix="Proceed?")
+        answer = await ctx.wait_for_event(HumanResponseEvent, waiter_id="ok", waiter_event=waiter, timeout=10)
+        return StopEvent(result=answer.response)
+
+
+async def test_a_workflow_waiting_for_a_human_keeps_the_stream_open_until_the_answer() -> None:
+    publisher = AsyncRecordingPublisher()
+    handler = Approval(timeout=10).run()
+    paused: list[tuple[bool, Outcome | None]] = []
+
+    async def on_event(event: Event) -> None:
+        if isinstance(event, InputRequiredEvent):
+            await asyncio.sleep(0.2)
+            paused.append((handler.is_done(), publisher.outcome))
+            handler.ctx.send_event(HumanResponseEvent(response="yes"))
+
+    outcome = await publish(handler, publisher, on_event=on_event)
+    assert paused == [(False, None)] and outcome.result == "yes" and publisher.outcome == "end"
+    assert names(publisher) == ["RunStarted", "InputRequiredEvent", "StopEvent"]
+
+
+@needs_agent_waits
 @pytest.mark.parametrize("encoder", [NativeEncoder(), AGUIEncoder(thread_id="t")], ids=["native", "agui"])
 async def test_a_human_input_pause_keeps_the_stream_open_until_the_answer_and_the_run_ends(
     encoder: NativeEncoder,
@@ -398,7 +431,8 @@ async def test_an_exception_in_the_tee_cancels_the_run_closes_with_fail_and_prop
     publisher = AsyncRecordingPublisher()
     handler = weather_agent(tool=slow_weather(5.0)).run(user_msg="Weather?")
     with pytest.raises(LookupError):
-        async with published(handler, publisher, encoder=AGUIEncoder(thread_id="t")) as events:
+        # close_on_cancel is for a stop: an application that failed closes with fail whatever it says
+        async with published(handler, publisher, encoder=AGUIEncoder(thread_id="t"), close_on_cancel="end") as events:
             async for event in events:
                 if isinstance(event, ToolCall):
                     raise LookupError("the application gave up")
@@ -433,10 +467,10 @@ async def test_the_tee_is_used_inside_its_block_and_its_outcome_after_it() -> No
             pass
 
 
-async def test_cancelled_close_is_end_or_fail() -> None:
+async def test_close_on_cancel_is_end_or_fail() -> None:
     handler = weather_agent().run(user_msg="Weather?")
-    with pytest.raises(ValueError, match="cancelled_close"):
-        published(handler, AsyncRecordingPublisher(), cancelled_close="maybe")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="close_on_cancel"):
+        published(handler, AsyncRecordingPublisher(), close_on_cancel="maybe")  # type: ignore[arg-type]
     await publish(handler, AsyncRecordingPublisher())
 
 
@@ -479,13 +513,14 @@ async def test_a_plain_workflow_publishes_its_own_events_and_its_result() -> Non
 async def test_two_concurrent_runs_publish_to_their_own_streams_without_mixing() -> None:
     first, second = AsyncRecordingPublisher(), AsyncRecordingPublisher()
     agent = weather_agent()
-    one = agent.run(user_msg="Weather?", run_id="run-one-0000000")
-    two = agent.run(user_msg="Weather?", run_id="run-two-0000000")
+    one = agent.run(user_msg="Weather?")
+    two = agent.run(user_msg="Weather?")
     await asyncio.gather(
         publish(one, first, encoder=AGUIEncoder(thread_id="one")),
         publish(two, second, encoder=AGUIEncoder(thread_id="two")),
     )
-    for publisher, run_id in ((first, "run-one-0000000"), (second, "run-two-0000000")):
+    assert one.run_id != two.run_id
+    for publisher, run_id in ((first, one.run_id), (second, two.run_id)):
         events = [json.loads(data) for data in publisher.data]
         assert {event.get("runId") for event in events} - {None} == {run_id}
         text = "".join(event["delta"] for event in events if event["type"] == "TEXT_MESSAGE_CONTENT")
@@ -607,3 +642,117 @@ async def test_a_run_whose_result_does_not_settle_after_its_stream_ended_fails_w
         del outcome
         gc.collect()
     assert "never retrieved" not in caplog.text  # the late exception is marked as seen
+
+
+# ---------------------------------------------------------------------------------------------------- round two
+
+
+async def test_cancelling_the_publishing_task_closes_with_close_on_cancel() -> None:
+    publisher = AsyncRecordingPublisher()
+    handler = weather_agent(tool=slow_weather(5.0)).run(user_msg="Weather?")
+    task = asyncio.create_task(publish(handler, publisher, encoder=AGUIEncoder(thread_id="t"), close_on_cancel="end"))
+    await wait_for(lambda: "TOOL_CALL_END" in agui_types(publisher))
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert handler.is_done() and json.loads(publisher.data[-1])["outcome"] == {"type": "cancelled"}
+    assert publisher.outcome == "end"
+
+
+def answering_agent(structured: Callable[[Any], Awaitable[dict[str, Any]]]) -> FunctionAgent:
+    """An agent built with streaming=False, whose answer is in its last AgentOutput, with a structured output that
+    llama-index-core computes after it has written that output to the stream."""
+    llm = ScriptedLLM(script=[[tool_call("get_weather", "c1", city="Paris")], [TextBlock(text=ANSWER)]])
+    return FunctionAgent(name="a", tools=[get_weather], llm=llm, streaming=False, structured_output_fn=structured)
+
+
+@pytest.mark.parametrize("protocol", ["native", "agui"])
+async def test_the_last_output_waits_a_bounded_time_for_its_finalization_not_for_a_structured_output_call(
+    protocol: str,
+) -> None:
+    marks: dict[str, float] = {}
+
+    async def structured(messages: Any) -> dict[str, Any]:
+        marks["written"] = time.monotonic()  # the answer is in the stream already
+        await asyncio.sleep(1.5)  # a second model call
+        return {"city": "Paris"}
+
+    class Timed(AsyncRecordingPublisher):
+        def send(self, data: str, event: str | None = None) -> bool:
+            if ANSWER in data:
+                marks.setdefault("sent", time.monotonic())
+            return super().send(data, event)
+
+    publisher = Timed()
+    encoder = AGUIEncoder(thread_id="t") if protocol == "agui" else NativeEncoder()
+    outcome = await publish(answering_agent(structured).run(user_msg="Weather?"), publisher, encoder=encoder)
+    assert outcome.status == "completed" and publisher.outcome == "end"
+    assert marks["sent"] - marks["written"] < publish_module.HOLD + 0.5
+
+
+@pytest.mark.parametrize("protocol", ["native", "agui"])
+async def test_an_answer_held_for_its_finalization_is_published_when_the_task_is_cancelled(
+    protocol: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(publish_module, "HOLD", 30.0)
+    computing = asyncio.Event()
+
+    async def structured(messages: Any) -> dict[str, Any]:
+        computing.set()
+        await asyncio.sleep(30)
+        return {}
+
+    publisher = AsyncRecordingPublisher()
+    encoder = AGUIEncoder(thread_id="t") if protocol == "agui" else NativeEncoder()
+    task = asyncio.create_task(publish(answering_agent(structured).run(user_msg="?"), publisher, encoder=encoder))
+    await asyncio.wait_for(computing.wait(), 5)
+    await asyncio.sleep(0.2)  # the output is read and held
+    task.cancel()  # the user pressed stop
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert publisher.outcome == "fail"
+    if protocol == "native":
+        assert names(publisher)[-2:] == ["AgentOutput", "RunAborted"]
+        assert json.loads(publisher.data[-2])["content"] == ANSWER
+    else:
+        kinds = agui_types(publisher)
+        assert json.loads(publisher.data[kinds.index("TEXT_MESSAGE_CONTENT")])["delta"] == ANSWER
+        assert kinds[-1] == "RUN_FINISHED" and json.loads(publisher.data[-1])["outcome"] == {"type": "cancelled"}
+
+
+async def test_one_encoder_shared_by_concurrent_runs_keeps_each_runs_frames_its_own() -> None:
+    for encoder in (NativeEncoder(), AGUIEncoder(thread_id="t")):  # configured once, as in a route module
+        publishers = [AsyncRecordingPublisher(), AsyncRecordingPublisher()]
+        handlers = [weather_agent(tool=slow_weather(0.3)).run(user_msg="Weather?") for _ in publishers]
+        await asyncio.gather(*(publish(h, p, encoder=encoder) for h, p in zip(handlers, publishers, strict=True)))
+        for handler, publisher in zip(handlers, publishers, strict=True):
+            assert publisher.outcome == "end"
+            if isinstance(encoder, NativeEncoder):
+                (call,) = [json.loads(frame.data) for frame in publisher.frames if frame.event == "ToolCall"]
+                assert call["call_id"] == "call_1" and json.loads(publisher.data[0])["run_id"] == handler.run_id
+            else:
+                events = [json.loads(data) for data in publisher.data]
+                assert {event["runId"] for event in events if "runId" in event} == {handler.run_id}
+                assert [event["toolCallId"] for event in events if event["type"] == "TOOL_CALL_START"] == ["call_1"]
+
+
+class Slow(Workflow):
+    @step
+    async def wait(self, ctx: Context, ev: StartEvent) -> StopEvent:
+        await asyncio.sleep(5)
+        return StopEvent(result="late")
+
+
+async def test_a_hard_cancel_before_any_event_is_reported_as_cancelled_not_as_a_consumed_stream() -> None:
+    publisher = AsyncRecordingPublisher()
+    handler = Slow(timeout=10).run()
+
+    def hard_cancel() -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            handler.cancel()
+
+    asyncio.get_running_loop().call_later(0.1, hard_cancel)
+    outcome = await asyncio.wait_for(publish(handler, publisher), 10)
+    assert outcome.status == "cancelled" and isinstance(outcome.error, WorkflowCancelledByUser)
+    assert names(publisher) == ["RunStarted", "RunAborted"] and publisher.outcome == "fail"

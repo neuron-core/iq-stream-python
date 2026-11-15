@@ -18,20 +18,22 @@ from fakes import (
     REACT_ANSWER,
     THINKING,
     TOOL_RESULT,
+    ScriptedLLM,
+    chat_run,
     direct_agent,
-    get_weather,
     handoff_workflow,
     hitl_agent,
     react_agent,
     repeated_id_agent,
     slow_weather,
+    tool_call,
     weather_agent,
 )
 from iq_stream import IQClient
 from iq_stream.testing import TestServers, subscribe_in_background
 from live import recording
-from llama_index.core.agent.workflow import ToolCall
-from llama_index.protocols.ag_ui.agent import AGUIChatWorkflow
+from llama_index.core.agent.workflow import FunctionAgent, ToolCall
+from llama_index.core.base.llms.types import TextBlock
 from workflows.events import Event, HumanResponseEvent, InputRequiredEvent
 from workflows.handler import WorkflowHandler
 
@@ -167,24 +169,47 @@ async def test_ag_ui_frames_of_a_human_input_run_carry_the_question_and_the_rest
 async def test_ag_ui_chat_workflow_events_passed_through_rebuild_the_answer(
     iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
 ) -> None:
-    from ag_ui.core import RunAgentInput, UserMessage
-
-    workflow = AGUIChatWorkflow(llm=weather_agent().llm, backend_tools=[get_weather], timeout=30)
-    run_input = RunAgentInput(
-        thread_id="thread-1",
-        run_id="run-1",
-        state={},
-        messages=[UserMessage(id="user-1", role="user", content="Weather in Paris?")],
-        tools=[],
-        context=[],
-        forwarded_props={},
-    )
-    handler = workflow.run(input_data=run_input)
     encoder = AGUIEncoder(thread_id="thread-1", run_id="run-1")
-    seen = check(await published(iq_client, iq_servers.default.url, handler, encoder), tmp_path)
+    seen = check(await published(iq_client, iq_servers.default.url, chat_run(), encoder), tmp_path)
     assert seen["rejected"] is None and seen["failures"] == []
     assert ANSWER in seen["text"]
     assert any(call["name"] == "get_weather" and call["args"] == {"city": "Paris"} for call in seen["toolCalls"])
+
+
+async def test_ag_ui_chat_workflow_events_with_a_split_surrogate_pair_rebuild_the_whole_answer(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    handler = chat_run(answer_tokens=["Sunny \ud83d", "\ude00 in ", "Paris."])
+    encoder = AGUIEncoder(thread_id="thread-1", run_id="run-1")
+    seen = check(await published(iq_client, iq_servers.default.url, handler, encoder), tmp_path)
+    assert seen["rejected"] is None and seen["failures"] == []
+    assert seen["text"].endswith("Sunny \ufffd\ufffd in Paris.")
+
+
+async def test_ag_ui_frames_of_a_tool_that_changes_its_arguments_in_place_rebuild_one_call_with_its_result(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    announced = asyncio.Event()
+
+    async def sort_numbers(numbers: list[int]) -> str:
+        """Sort the numbers."""
+        await announced.wait()
+        numbers.sort()
+        return f"sorted: {numbers}"
+
+    llm = ScriptedLLM(script=[[tool_call("sort_numbers", "c1", numbers=[10, 3, 7])], [TextBlock(text="Done.")]])
+    handler = FunctionAgent(name="a", tools=[sort_numbers], llm=llm).run(user_msg="Sort 10 3 7")
+    ticket = iq_client.ticket()
+    subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
+
+    def on_event(event: Event) -> None:
+        if isinstance(event, ToolCall):
+            announced.set()
+
+    await publish(handler, iq_client.apublisher(ticket.stream_id), encoder=agui(), on_event=on_event)
+    seen = check(recording(await subscription, "agui"), tmp_path)
+    assert seen["toolCalls"] == [{"id": "c1", "name": "sort_numbers", "args": {"numbers": [10, 3, 7]}}]
+    assert seen["toolResults"] == [{"toolCallId": "c1", "content": "sorted: [3, 7, 10]"}]
 
 
 async def test_split_frames_rebuild_the_whole_answer_and_arguments_in_stream_agent(
@@ -228,6 +253,15 @@ async def test_ag_ui_frames_of_calls_that_share_an_id_rebuild_each_call_with_its
     assert sorted(cities.values()) == ["Paris", "Rome"] and len(cities) == 2
     results = {result["toolCallId"]: result["content"] for result in seen["toolResults"]}
     assert results == {call: f"21 °C and sunny in {city}" for call, city in cities.items()}
+
+
+async def test_native_frames_of_parallel_calls_that_share_an_id_pair_each_result_with_its_call(
+    iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
+) -> None:
+    handler = repeated_id_agent(parallel=True).run(user_msg="Paris and Rome?")
+    seen = check(await published(iq_client, iq_servers.default.url, handler), tmp_path)
+    assert sorted(tool["args"]["city"] for tool in seen["tools"]) == ["Paris", "Rome"]
+    assert all(tool["result"] == f"21 °C and sunny in {tool['args']['city']}" for tool in seen["tools"])
 
 
 async def test_ag_ui_frames_of_a_react_agent_end_with_the_answer_it_saves(
