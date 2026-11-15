@@ -45,7 +45,7 @@ class StreamOptions(TypedDict, total=False):
     expose_errors: bool
     close_on_cancel: Outcome
     close_timeout: float
-    on_error: Callable[[IQError], object] | None
+    on_dropped: Callable[[IQError], object] | None
 
 
 # The event loop keeps only weak references to tasks: these keep the runs alive until they end.

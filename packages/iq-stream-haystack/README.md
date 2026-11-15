@@ -224,7 +224,7 @@ with IQStream(iq) as stream:
     careful_agent.run(load_messages("chat-1"), streaming_callback=stream.callback, hook_context={"stream": stream})
 ```
 
-The run goes on in the same stream once the strategy returns, and closes with `end` when it completes. The request is an AG-UI `CUSTOM` event, an AI SDK `data-tool_confirmation` part, or `{"type": "custom"}` in Haystack's format; in each, a value JSON cannot hold is written as its `str()`, and a NaN or an infinity as `null`, as `JSON.stringify` writes them. `emit(payload, event=None)` publishes a frame exactly as given instead: an `ag_ui.core` event, a mapping as JSON, or a string. A frame of either kind that cannot be encoded (a mapping with keys that are not strings, a reference cycle) or is too large is dropped and reported to `on_error`, and the stream goes on.
+The run goes on in the same stream once the strategy returns, and closes with `end` when it completes. The request is an AG-UI `CUSTOM` event, an AI SDK `data-tool_confirmation` part, or `{"type": "custom"}` in Haystack's format; in each, a value JSON cannot hold is written as its `str()`, and a NaN or an infinity as `null`, as `JSON.stringify` writes them. `emit(payload, event=None)` publishes a frame exactly as given instead: an `ag_ui.core` event, a mapping as JSON, or a string. A frame of either kind that cannot be encoded (a mapping with keys that are not strings, a reference cycle) or is too large is dropped and reported to `on_dropped`, and the stream goes on.
 
 ## What the browser needs
 
@@ -272,9 +272,9 @@ A cancelled run closes with `fail` by default because its answer is incomplete, 
 
 ## Errors and sizes
 
-Publishing never breaks the run. An exception in Haystack's callback would abort the run, so `callback`, `custom()` and `emit()` catch everything. A chunk that cannot be converted, or a frame of your own that cannot be encoded or is too large, is skipped: `on_error` gets an `IQError` for it (code `encode_failed`, with the cause as `__cause__`, or a `FrameTooLarge`), and the stream goes on, closing with `end` when the run completes. By default each kind is logged once per stream as a warning on the `haystack_integrations.iq_stream` logger, with the cause's type and never its text or frame data.
+Publishing never breaks the run. An exception in Haystack's callback would abort the run, so `callback`, `custom()` and `emit()` catch everything. A chunk that cannot be converted, or a frame of your own that cannot be encoded or is too large, is skipped: `on_dropped` gets an `IQError` for it (code `encode_failed`, with the cause as `__cause__`, or a `FrameTooLarge`), and the stream goes on, closing with `end` when the run completes. By default each kind is logged once per stream as a warning on the `haystack_integrations.iq_stream` logger, with the cause's type and never its text or frame data.
 
-Publishing stops when the core's publisher gives up, as when the server cannot be reached or the stream outgrew its limit, or when the publisher fails in another way (code `publish_failed`). `on_error` gets that `IQError` once, as soon as the adapter sees it, later chunks are dropped without work, the run is read to its end, and the stream closes with `fail`. The core logs its own give-up; the run, its result and your save are unaffected, and `stream.failed` and `stream.error` say what happened.
+Publishing stops when the core's publisher gives up, as when the server cannot be reached or the stream outgrew its limit, or when the publisher fails in another way (code `publish_failed`). `on_dropped` gets that `IQError` once, as soon as the adapter sees it, later chunks are dropped without work, the run is read to its end, and the stream closes with `fail`. The core logs its own give-up; the run, its result and your save are unaffected, and `stream.failed` and `stream.error` say what happened.
 
 An application that would rather fail when the publisher gives up opens its client with `IQClient(on_error="raise")`. Nothing raises into the run even then, so that it reads to its end and your save in the block happens; leaving the block raises the publisher's `IQError` instead. When the block raised an exception of its own, that one goes on, and the adapter logs the publisher's error, which the core does not log in this mode. Skipped frames and a `publish_failed` stop never raise.
 
@@ -286,7 +286,7 @@ A frame must fit the publisher's `max_frame_bytes` (64 KiB by default, or the ap
 
 ```text
 IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=None, include_tool_results=True,
-         max_tool_result_bytes=32_768, expose_errors=False, close_on_cancel="fail", close_timeout=10.0, on_error=None)
+         max_tool_result_bytes=32_768, expose_errors=False, close_on_cancel="fail", close_timeout=10.0, on_dropped=None)
 ```
 
 | Option | | |
@@ -300,7 +300,7 @@ IQStream(client, stream_id=None, *, protocol="ag-ui", thread_id=None, run_id=Non
 | `expose_errors` | `False` | Publish error text instead of "An error occurred.". |
 | `close_on_cancel` | `"fail"` | The close line of a cancelled run, an `iq_stream.Outcome`. |
 | `close_timeout` | `10.0` | Seconds the close waits for the server's answer, after the core's `min_open`; finite and above 0. A close that is not answered in time ends the stream failed, with `close_timeout`. |
-| `on_error` | log | Called with an `IQError` for each chunk or frame of your own that was skipped (`encode_failed`, or a `FrameTooLarge`), and once with the error that stopped publishing (the core publisher's, or `publish_failed`). |
+| `on_dropped` | log | Called with an `IQError` for each chunk or frame of your own that was skipped (`encode_failed`, or a `FrameTooLarge`), and once with the error that stopped publishing (the core publisher's, or `publish_failed`). |
 
 | Member | |
 | --- | --- |

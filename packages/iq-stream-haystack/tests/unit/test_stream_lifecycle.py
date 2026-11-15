@@ -242,20 +242,20 @@ def test_a_publisher_that_gave_up_never_breaks_the_run_which_is_read_to_its_end(
     reported: list[Exception] = []
     generator = ScriptedChatGenerator(weather_script())
     agent = Agent(chat_generator=generator, tools=[get_weather])
-    with caplog.at_level(logging.WARNING), IQStream(publisher, on_error=reported.append) as stream:
+    with caplog.at_level(logging.WARNING), IQStream(publisher, on_dropped=reported.append) as stream:
         result = agent.run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
     assert generator.calls == 2
     assert publisher.data == [] and stream.failed
     assert isinstance(stream.error, IQError)
-    assert reported == [publisher.error]  # on_error hears of the core's error, once
+    assert reported == [publisher.error]  # on_dropped hears of the core's error, once
     assert not [r for r in caplog.records if r.name == "haystack_integrations.iq_stream"]  # the core logged it
 
 
 def test_a_publisher_that_gives_up_mid_run_stops_publishing_and_the_run_goes_on() -> None:
     publisher = GivesUp()
     reported: list[Exception] = []
-    with IQStream(publisher, on_error=reported.append) as stream:
+    with IQStream(publisher, on_dropped=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
         assert reported == [publisher.error]  # as soon as the adapter saw it, before the block was left
     same_run(result)
@@ -272,7 +272,7 @@ def test_a_publisher_that_raises_is_reported_once_and_the_stream_closes_with_fai
 
     publisher = Raises()
     reported: list[IQError] = []
-    with IQStream(publisher, on_error=reported.append) as stream:
+    with IQStream(publisher, on_dropped=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
     assert [(error.code, str(error.__cause__)) for error in reported] == [("publish_failed", "socket exploded")]
@@ -320,7 +320,7 @@ def test_a_chunk_that_cannot_be_converted_is_skipped_and_the_rest_of_the_run_is_
     publisher = RecordingPublisher()
     reported: list[IQError] = []
     converter = BreaksOnce(thread_id="thread-1", run_id="run-1")
-    with IQStream(publisher, protocol=converter, on_error=reported.append) as stream:
+    with IQStream(publisher, protocol=converter, on_dropped=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
     assert [error.code for error in reported] == ["encode_failed"]
@@ -336,7 +336,7 @@ def test_with_on_error_raise_the_run_is_read_to_its_end_and_leaving_the_block_ra
     publisher = GivesUp(on_error="raise")
     reported: list[Exception] = []
     results: list[dict[str, Any]] = []
-    with pytest.raises(IQError) as raised, IQStream(publisher, on_error=reported.append) as stream:
+    with pytest.raises(IQError) as raised, IQStream(publisher, on_dropped=reported.append) as stream:
         results.append(weather_agent().run(QUESTION, streaming_callback=stream.callback))
         assert stream.custom("progress", 1) is False  # nothing raises into the run
     same_run(results[0])
@@ -401,14 +401,14 @@ def test_a_publisher_that_cannot_open_is_reported_and_the_run_goes_on(monkeypatc
     monkeypatch.setattr(IQClient, "publisher", refuse)
     client = IQClient("http://127.0.0.1:9", "demo-app", "test-app-secret-0123456789abcdef0123")
     reported: list[IQError] = []
-    with IQStream(client, on_error=reported.append) as stream:
+    with IQStream(client, on_dropped=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
     assert stream.failed and stream.result is None
     assert [(e.code, str(e.__cause__)) for e in reported] == [("publish_failed", "can't start new thread")]
 
 
-def test_an_on_error_that_raises_is_logged_and_contained(caplog: pytest.LogCaptureFixture) -> None:
+def test_an_on_dropped_that_raises_is_logged_and_contained(caplog: pytest.LogCaptureFixture) -> None:
     class Raises(RecordingPublisher):
         def send(self, data: str, event: str | None = None) -> bool:
             raise RuntimeError("nope")
@@ -416,9 +416,9 @@ def test_an_on_error_that_raises_is_logged_and_contained(caplog: pytest.LogCaptu
     def handler(error: Exception) -> None:
         raise KeyError("handler bug")
 
-    with caplog.at_level(logging.ERROR), IQStream(Raises(), on_error=handler) as stream:
+    with caplog.at_level(logging.ERROR), IQStream(Raises(), on_dropped=handler) as stream:
         same_run(weather_agent().run(QUESTION, streaming_callback=stream.callback))
-    assert any("on_error raised" in record.getMessage() for record in caplog.records)
+    assert any("on_dropped raised" in record.getMessage() for record in caplog.records)
 
 
 # -- sizes ---------------------------------------------------------------------------------------------------------
@@ -492,7 +492,7 @@ def test_emit_publishes_events_mappings_and_strings_in_order() -> None:
 def test_custom_and_emit_never_raise_into_the_run_and_drop_only_a_frame_too_large(protocol: str) -> None:
     publisher = RecordingPublisher(max_frame_bytes=1024)
     reported: list[Exception] = []
-    with IQStream(publisher, protocol=protocol, on_error=reported.append) as stream:  # pyright: ignore[reportArgumentType]
+    with IQStream(publisher, protocol=protocol, on_dropped=reported.append) as stream:  # pyright: ignore[reportArgumentType]
         assert stream.custom("note", {"text": "x" * 2_000}) is False
         assert stream.emit({"text": "x" * 2_000}) is False
         assert stream.custom("note", {"text": "small"})
@@ -511,7 +511,7 @@ def test_custom_through_a_publisher_that_raises_stops_publishing_and_the_run_goe
             return super().send(data, event)
 
     reported: list[IQError] = []
-    with IQStream(Raises(), on_error=reported.append) as stream:
+    with IQStream(Raises(), on_dropped=reported.append) as stream:
         assert stream.custom("tool_confirmation", {"tool": "get_weather"}) is False
         same_run(weather_agent().run(QUESTION, streaming_callback=stream.callback))
     assert [str(error.__cause__) for error in reported] == ["socket exploded"]
@@ -540,7 +540,7 @@ def test_emit_never_raises_into_the_run_whatever_its_payload_holds() -> None:
 
     publisher = RecordingPublisher()
     reported: list[IQError] = []
-    with IQStream(publisher, on_error=reported.append) as stream:
+    with IQStream(publisher, on_dropped=reported.append) as stream:
         assert stream.emit(CustomEvent(name="confirm", value={"ticket": Ticket()}))  # written as its str()
         assert stream.emit({("a", 1): "a key JSON cannot hold"}) is False  # dropped and reported
         assert stream.emit("bad name", event="not a name!") is False
@@ -584,7 +584,7 @@ def test_custom_sends_nothing_unless_every_frame_of_it_fits() -> None:
     publisher = RecordingPublisher(max_frame_bytes=1024)
     reported: list[IQError] = []
     converter = TwoFrames(thread_id="thread-1", run_id="run-1", max_frame_bytes=1024)
-    with IQStream(publisher, protocol=converter, on_error=reported.append) as stream:
+    with IQStream(publisher, protocol=converter, on_dropped=reported.append) as stream:
         assert stream.custom("note", None) is False
     assert not any("part" in data for data in publisher.data)
     assert [type(error).__name__ for error in reported] == ["FrameTooLarge"]
@@ -613,7 +613,7 @@ def test_a_publisher_dead_on_entry_is_reported_before_the_block_runs_even_with_n
     publisher = RecordingPublisher()
     publisher.fail()
     reported: list[IQError] = []
-    with IQStream(publisher, protocol=Silent(), on_error=reported.append):
+    with IQStream(publisher, protocol=Silent(), on_dropped=reported.append):
         assert reported == [publisher.error]
     assert reported == [publisher.error]
 
@@ -636,7 +636,7 @@ def test_the_readme_s_confirmation_strategy_survives_arguments_too_large_for_a_f
     hook = ConfirmationHook(confirmation_strategies={"save_note": namespace["AskTheBrowser"]()})
     agent = Agent(chat_generator=ScriptedChatGenerator(script), tools=[save_note], hooks={"before_tool": [hook]})
     publisher = RecordingPublisher(max_frame_bytes=1024)
-    with IQStream(publisher, on_error=lambda error: None) as stream:
+    with IQStream(publisher, on_dropped=lambda error: None) as stream:
         result = agent.run(QUESTION, streaming_callback=stream.callback, hook_context={"stream": stream})
     assert result["last_message"].text == "Done."
     conversation = verify_agui(publisher.data)
@@ -714,7 +714,7 @@ def test_a_close_that_raises_is_retried_with_fail_so_the_stream_is_never_left_op
 
     publisher = CloseBreaksOnce()
     reported: list[IQError] = []
-    with IQStream(publisher, on_error=reported.append) as stream:
+    with IQStream(publisher, on_dropped=reported.append) as stream:
         weather_agent().run(QUESTION, streaming_callback=stream.callback)
     assert publisher.outcome == "fail" and not publisher.alive
     assert [str(error.__cause__) for error in reported] == ["close broke"]

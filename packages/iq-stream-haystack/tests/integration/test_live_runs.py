@@ -184,9 +184,9 @@ def unreachable_client(**options: Any) -> IQClient:
                     retry_budget=0.5, min_open=0, **options)  # fmt: skip
 
 
-def test_an_unreachable_server_never_breaks_the_run_and_on_error_hears_of_it() -> None:
+def test_an_unreachable_server_never_breaks_the_run_and_on_dropped_hears_of_it() -> None:
     reported: list[Exception] = []
-    with IQStream(unreachable_client(), on_error=reported.append) as stream:
+    with IQStream(unreachable_client(), on_dropped=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     assert result["last_message"].text == "It is sunny in Paris."
     assert stream.failed and stream.error is not None and stream.error.code == "unreachable"  # pyright: ignore[reportAttributeAccessIssue]
@@ -208,7 +208,7 @@ def test_a_confirmation_request_too_large_for_the_short_server_is_dropped_and_th
     ticket = client.ticket()
     subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
     reported: list[Exception] = []
-    with IQStream(client, ticket.stream_id, on_error=reported.append) as stream:
+    with IQStream(client, ticket.stream_id, on_dropped=reported.append) as stream:
         assert stream.custom("tool_confirmation", {"arguments": "x" * 2_000}) is False
         assert stream.custom("tool_confirmation", {"arguments": None})
         weather_agent().run(QUESTION, streaming_callback=stream.callback)
@@ -272,7 +272,7 @@ def test_a_run_past_the_stream_s_byte_limit_goes_on_unpublished(iq_servers: Test
     ticket = client.ticket()
     subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
     reported: list[Exception] = []
-    with IQStream(client, ticket.stream_id, on_error=reported.append) as stream:
+    with IQStream(client, ticket.stream_id, on_dropped=reported.append) as stream:
         result = agent.run(QUESTION, streaming_callback=stream.callback)
     received = subscription.result(30)
     assert result["last_message"].text == "".join(words)

@@ -54,8 +54,8 @@ class IQStream:
     ``close_on_cancel``. The run's exception goes on unchanged.
 
     Publishing never breaks the run. A chunk that cannot be converted, or a frame of the application's own that
-    cannot be encoded or is too large, is skipped and reported to ``on_error`` (else logged once per kind), and the
-    stream goes on. When the publisher gives up (the core's ``IQError``) or fails, publishing stops, ``on_error``
+    cannot be encoded or is too large, is skipped and reported to ``on_dropped`` (else logged once per kind), and the
+    stream goes on. When the publisher gives up (the core's ``IQError``) or fails, publishing stops, ``on_dropped``
     hears of it once, the stream closes with ``fail``, and the run is read to its end. With a client opened with
     ``on_error="raise"``, leaving the block then raises the publisher's ``IQError``, unless the block raised already.
 
@@ -78,7 +78,7 @@ class IQStream:
         expose_errors: bool = False,
         close_on_cancel: Outcome = "fail",
         close_timeout: float = 10.0,
-        on_error: Callable[[IQError], object] | None = None,
+        on_dropped: Callable[[IQError], object] | None = None,
     ) -> None:
         if isinstance(client, IQClient):
             self._client: IQClient | None = client
@@ -120,7 +120,7 @@ class IQStream:
         self._expose_errors = expose_errors
         self._close_on_cancel: Outcome = close_on_cancel
         self._close_timeout = close_timeout
-        self._on_error = on_error
+        self._on_dropped = on_dropped
 
         # Haystack calls back from tool threads and from asyncio.to_thread workers: one lock orders every frame.
         self._lock = threading.Lock()
@@ -128,7 +128,7 @@ class IQStream:
         self._publisher: PublisherLike | None = None
         self._converter: ChunkConverter | None = None
         self._stopped: IQError | None = None  # why publishing stopped on this side
-        self._heard = False  # on_error was told that the publisher gave up
+        self._heard = False  # on_dropped was told that the publisher gave up
         self._logged: set[str] = set()
         self._token: contextvars.Token[IQStream | None] | None = None
         self._result: PublishResult | None = None
@@ -214,7 +214,7 @@ class IQStream:
     def emit(self, payload: BaseEvent | Mapping[str, object] | str, event: str | None = None) -> bool:
         """Publishes one frame as given, in order with the run's: an AG-UI event, a mapping (as JSON) or a string.
         Returns whether it was queued. It never raises: a frame that cannot be encoded or is over the limit is dropped
-        and reported to ``on_error`` (else logged), and the stream goes on."""
+        and reported to ``on_dropped`` (else logged), and the stream goes on."""
 
         def frames(converter: ChunkConverter) -> list[Frame]:
             if isinstance(payload, BaseEvent):
@@ -394,7 +394,7 @@ class IQStream:
         self._report(error)
 
     def _note_gave_up(self) -> None:
-        """Tells ``on_error``, once, that the core's publisher gave up (unreachable, stream too large, ...). The core
+        """Tells ``on_dropped``, once, that the core's publisher gave up (unreachable, stream too large, ...). The core
         logged it already, unless its client raises it: then leaving the block raises it, or logs it (``_finish``)."""
         publisher = self._publisher
         if publisher is None or publisher.alive or publisher.error is None:
@@ -403,13 +403,13 @@ class IQStream:
             if self._heard:
                 return
             self._heard = True
-        if self._on_error is not None:
-            self._call_on_error(publisher.error)
+        if self._on_dropped is not None:
+            self._call_on_dropped(publisher.error)
 
     def _report(self, error: IQError) -> None:
-        """Hands ``error`` to ``on_error``, else logs it once per kind, without frame data."""
-        if self._on_error is not None:
-            self._call_on_error(error)
+        """Hands ``error`` to ``on_dropped``, else logs it once per kind, without frame data."""
+        if self._on_dropped is not None:
+            self._call_on_dropped(error)
             return
         kind = error.code or type(error).__name__
         with self._lock:
@@ -426,12 +426,12 @@ class IQStream:
         else:
             logger.warning("%s", error)
 
-    def _call_on_error(self, error: IQError) -> None:
-        assert self._on_error is not None
+    def _call_on_dropped(self, error: IQError) -> None:
+        assert self._on_dropped is not None
         try:
-            self._on_error(error)
+            self._on_dropped(error)
         except Exception:
-            logger.exception("IQ stream %s: on_error raised.", self._stream_id)
+            logger.exception("IQ stream %s: on_dropped raised.", self._stream_id)
 
     def _leave(self) -> None:
         if self._token is None:
@@ -477,7 +477,7 @@ class IQStream:
         if gave_up is not None and publisher.on_error == "raise":
             if exc is None:
                 raise gave_up
-            if self._on_error is None:  # the core logs only in report mode, and the block's exception goes on
+            if self._on_dropped is None:  # the core logs only in report mode, and the block's exception goes on
                 logger.warning("%s; the block's own exception goes on.", gave_up)
 
 
