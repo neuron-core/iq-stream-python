@@ -21,12 +21,13 @@ from .base import (
     MASKED_ERROR,
     Fits,
     Frame,
+    ToolCalls,
     bounded_json,
-    call_key,
     cut,
     dumps,
     event_name,
     fields,
+    model_json,
     scrub,
     shrink_strings,
     split_text,
@@ -37,7 +38,9 @@ if TYPE_CHECKING:
 
 _TRUNCATED = "…"
 # Never cut: what a page keys on.
-_KEEP = frozenset({"tool_id", "tool_name", "agent", "run_id", "step_name", "type", "is_error", "return_direct"})
+_KEEP = frozenset(
+    {"tool_id", "call_id", "tool_name", "agent", "run_id", "step_name", "type", "is_error", "return_direct"}
+)
 
 
 class NativeEncoder:
@@ -46,8 +49,10 @@ class NativeEncoder:
     Prompts and chat history never leave the server: ``AgentInput`` and ``AgentSetup`` are not published, and
     ``AgentStream`` carries its delta, not the cumulative ``response`` nor the provider's ``raw`` chunk. Tool arguments,
     tool results and final answers longer than ``max_field_bytes`` are cut, with ``"truncated": true`` in the frame.
-    ``include`` and ``exclude`` choose events by class (``isinstance``); the terminal event is always published. An
-    exception's text is masked as ``"An error occurred."`` unless ``expose_errors`` is true.
+    ``ToolCall`` and ``ToolCallResult`` carry ``call_id``, which pairs a result with its call: LlamaIndex's
+    ``tool_id``, or ``<tool_id>#2``, ``#3`` for a later call of the run that reuses it (providers without ids use the
+    tool's name). ``include`` and ``exclude`` choose events by class (``isinstance``); the terminal event is always
+    published. An exception's text is masked as ``"An error occurred."`` unless ``expose_errors`` is true.
     """
 
     def __init__(
@@ -64,20 +69,33 @@ class NativeEncoder:
         self._exclude = tuple(exclude)
         self._max_field_bytes = max_field_bytes
         self._expose_errors = expose_errors
-        # Tool calls announced and still without a result: a human-input wait replays the tool step, ToolCall included.
-        self._open: set[tuple[str, str, str]] = set()
+        self._calls = ToolCalls()
 
     def start(self, run_id: str) -> Iterable[Frame]:
-        self._open = set()
+        self._calls = ToolCalls()
         return [("RunStarted", dumps({"run_id": run_id}))]
 
     def encode(self, event: Event) -> Iterable[Frame]:
+        # All or nothing: a call whose frame failed to encode is not counted as published.
+        saved = self._calls.copy()
+        try:
+            return self._encode(event)
+        except BaseException:
+            self._calls = saved
+            raise
+
+    def _encode(self, event: Event) -> list[Frame]:
         if isinstance(event, StopEvent):
             return [(event_name(event), dumps(self._terminal(event)))]
         agents = agent_events()
+        call_id: str | None = None
+        # Calls are counted whether or not they are published, so that a call_id names the same call either way.
         if agents is not None and isinstance(event, agents.ToolCallResult):
-            # Whether or not results are published: a call with a result is over, and one like it later is new.
-            self._open.discard(call_key(event.tool_id, event.tool_name, tool_kwargs(event)))
+            call_id, _ = self._calls.result(event.tool_id, event.tool_name, tool_kwargs(event))
+        elif agents is not None and isinstance(event, agents.ToolCall):
+            call_id = self._calls.announce(event.tool_id, event.tool_name, tool_kwargs(event))
+            if call_id is None:
+                return []  # the replay of a call that waits for a human
         if self._include and not isinstance(event, self._include):
             return []
         if self._exclude and isinstance(event, self._exclude):
@@ -89,22 +107,16 @@ class NativeEncoder:
                 return self._stream(event.delta, event.thinking_delta, event.current_agent_name)
             if isinstance(event, agents.AgentOutput):
                 return [("AgentOutput", dumps(self._output(event)))]
-            if isinstance(event, agents.ToolCallResult):
-                return [("ToolCallResult", dumps(self._result(event)))]
-            if isinstance(event, agents.ToolCall):
-                kwargs = tool_kwargs(event)
-                key = call_key(event.tool_id, event.tool_name, kwargs)
-                if key in self._open:
-                    return []
-                frame = ("ToolCall", dumps(self._call(event.tool_id, event.tool_name, kwargs)))
-                self._open.add(key)
-                return [frame]
+            if isinstance(event, agents.ToolCallResult) and call_id is not None:
+                return [("ToolCallResult", dumps(self._result(event, call_id)))]
+            if isinstance(event, agents.ToolCall) and call_id is not None:
+                return [("ToolCall", dumps(self._call(event.tool_id, call_id, event.tool_name, tool_kwargs(event))))]
             if isinstance(event, agents.AgentStreamStructuredOutput):
                 output, truncated = bounded_json(event.output, self._max_field_bytes, _TRUNCATED)
                 return [("AgentStreamStructuredOutput", dumps(_marked({"output": output}, truncated)))]
         ag = agui_events()
         if ag is not None and isinstance(event, ag.BaseEvent):
-            return [(event_name(event), event.model_dump_json(by_alias=True))]
+            return [(event_name(event), model_json(event))]
         return [(event_name(event), dumps(fields(event)))]
 
     def abort(self, error: BaseException) -> Iterable[Frame]:
@@ -162,9 +174,10 @@ class NativeEncoder:
         short = cut(text, self._max_field_bytes)
         return (short + _TRUNCATED, True) if short != text else (text, False)
 
-    def _call(self, tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _call(self, tool_id: str, call_id: str, tool_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         bounded, truncated = bounded_json(kwargs, self._max_field_bytes, _TRUNCATED)
-        return _marked({"tool_id": tool_id, "tool_name": tool_name, "tool_kwargs": bounded}, truncated)
+        payload = {"tool_id": tool_id, "call_id": call_id, "tool_name": tool_name, "tool_kwargs": bounded}
+        return _marked(payload, truncated)
 
     def _output(self, event: AgentOutput) -> dict[str, Any]:
         content, truncated = self._text(event.response.content or "")
@@ -176,7 +189,7 @@ class NativeEncoder:
         payload = {"agent": event.current_agent_name, "content": content, "tool_calls": bounded}
         return _marked(payload, truncated or calls_truncated)
 
-    def _result(self, event: ToolCallResult) -> dict[str, Any]:
+    def _result(self, event: ToolCallResult, call_id: str) -> dict[str, Any]:
         output = event.tool_output
         is_error = bool(output.is_error)
         if is_error and not self._expose_errors:
@@ -185,6 +198,7 @@ class NativeEncoder:
             content, truncated = self._text(str(output.content))
         payload = {
             "tool_id": event.tool_id,
+            "call_id": call_id,
             "tool_name": event.tool_name,
             "content": content,
             "is_error": is_error,

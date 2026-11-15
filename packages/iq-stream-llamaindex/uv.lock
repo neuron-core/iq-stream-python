@@ -7,17 +7,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[manifest]
-constraints = [
-    { name = "ag-ui-protocol", specifier = "==1.0.0" },
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "llama-index-core", specifier = "==0.14.25" },
-    { name = "llama-index-instrumentation", specifier = "==0.6.0" },
-    { name = "llama-index-protocols-ag-ui", specifier = "==0.6.0" },
-    { name = "llama-index-workflows", specifier = "==2.26.1" },
-    { name = "pydantic", specifier = "==2.14.3" },
-]
-
 [[package]]
 name = "ag-ui-protocol"
 version = "1.0.0"
@@ -1038,18 +1027,18 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+ag-ui = [
+    { name = "ag-ui-protocol" },
+]
 agents = [
     { name = "llama-index-core" },
-]
-agui = [
-    { name = "ag-ui-protocol" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "fastapi", version = "0.162.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "fastapi", version = "0.163.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "iq-stream-llamaindex", extra = ["agents", "agui"] },
+    { name = "iq-stream-llamaindex", extra = ["ag-ui", "agents"] },
     { name = "llama-index-protocols-ag-ui", marker = "python_full_version < '3.14'" },
     { name = "pyright" },
     { name = "pytest" },
@@ -1060,17 +1049,17 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ag-ui-protocol", marker = "extra == 'agui'", specifier = ">=1.0,<2" },
+    { name = "ag-ui-protocol", marker = "extra == 'ag-ui'", specifier = ">=1.0,<2" },
     { name = "iq-stream", editable = "../iq-stream" },
     { name = "llama-index-core", marker = "extra == 'agents'", specifier = ">=0.14,<0.15" },
     { name = "llama-index-workflows", specifier = ">=2.14,<3" },
 ]
-provides-extras = ["agents", "agui"]
+provides-extras = ["agents", "ag-ui"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "fastapi" },
-    { name = "iq-stream-llamaindex", extras = ["agents", "agui"] },
+    { name = "iq-stream-llamaindex", extras = ["agents", "ag-ui"] },
     { name = "llama-index-protocols-ag-ui", marker = "python_full_version < '3.14'", specifier = ">=0.6,<0.7" },
     { name = "pyright" },
     { name = "pytest", specifier = ">=8" },

@@ -49,10 +49,10 @@ def classify(terminal: StopEvent | None, error: BaseException | None) -> RunStat
     return "completed"
 
 
-def close_line(status: RunStatus, cancelled_close: Outcome) -> Outcome:
-    """``end`` for a completed run, ``fail`` for a failed or timed-out one, ``cancelled_close`` for a cancelled one."""
+def close_line(status: RunStatus, close_on_cancel: Outcome) -> Outcome:
+    """``end`` for a completed run, ``fail`` for a failed or timed-out one, ``close_on_cancel`` for a cancelled one."""
     if status == "completed":
         return "end"
     if status == "cancelled":
-        return cancelled_close
+        return close_on_cancel
     return "fail"

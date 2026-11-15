@@ -6,9 +6,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from workflows.events import Event
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 #: One frame: the SSE event name (``None`` for an unnamed frame) and the data string.
 Frame = tuple["str | None", str]
@@ -27,9 +30,10 @@ _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class Encoder(Protocol):
-    """Turns a run's events into frames. ``publish()`` calls it from one task, in the order of the stream. An encoder
-    serves one run at a time: ``start()`` begins a run, so one instance may serve runs one after another, not two at
-    once."""
+    """Turns a run's events into frames. ``publish()`` calls it from one task, in the order of the stream, on a
+    shallow copy (``copy.copy``) of the encoder it was given, so that one encoder configured once serves concurrent
+    runs: ``start()`` begins a run, and gives the state it keeps about a run fresh objects, which the original never
+    shares."""
 
     def start(self, run_id: str) -> Iterable[Frame]:
         """The frames that open the stream, before the first event. It begins a new run: the state an encoder keeps
@@ -71,10 +75,67 @@ def scrub(text: str) -> str:
     return _SURROGATE.sub("�", text)
 
 
-def call_key(tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> tuple[str, str, str]:
+def model_json(model: BaseModel) -> str:
+    """A model's JSON by its aliases, as its own serializer writes it; through ``dumps`` when that serializer refuses
+    the model (a lone surrogate in a string), so that the event is published, with U+FFFD, rather than lost."""
+    try:
+        return model.model_dump_json(by_alias=True)
+    except ValueError:  # PydanticSerializationError
+        return dumps(model.model_dump(mode="json", by_alias=True, fallback=str))
+
+
+_CallKey = tuple[str, str, str]
+
+
+def call_key(tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> _CallKey:
     """What tells a tool call apart from another with the same id: some providers have no ids and use the tool's name
     (Ollama, sometimes Gemini), so a model that calls one tool twice gives two calls with one id."""
-    return tool_id, tool_name, json.dumps(kwargs, sort_keys=True, default=str)
+    try:
+        arguments = json.dumps(kwargs, sort_keys=True, default=str)
+    except (TypeError, ValueError):  # keys that cannot be sorted or written (1 and "a" together), a cycle
+        arguments = repr(kwargs)
+    return tool_id, tool_name, arguments
+
+
+class ToolCalls:
+    """A run's tool calls, each under an id of its own in the run: LlamaIndex's ``tool_id``, or ``<tool_id>#2``,
+    ``#3`` for a later call that reuses it. A call stays open until its result."""
+
+    def __init__(self) -> None:
+        self._open: dict[_CallKey, str] = {}  # in the order announced
+        self._ids: set[str] = set()
+
+    def copy(self) -> ToolCalls:
+        calls = ToolCalls()
+        calls._open, calls._ids = dict(self._open), set(self._ids)
+        return calls
+
+    def announce(self, tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> str | None:
+        """The id a new call is published under, or ``None`` for the replay of an open call (the same id, tool and
+        arguments), which a human-input wait causes: it runs the tool step again, ``ToolCall`` included."""
+        key = call_key(tool_id, tool_name, kwargs)
+        if key in self._open:
+            return None
+        call_id = self._open[key] = self._new_id(tool_id)
+        return call_id
+
+    def result(self, tool_id: str, tool_name: str, kwargs: dict[str, Any]) -> tuple[str, bool]:
+        """The id of the call a result belongs to, which closes, and whether that call was announced. It is the open
+        call with the same id, tool and arguments, else the oldest open one with the same id and tool: the tool may
+        have changed its arguments in place (``numbers.sort()``), and they are the objects the result carries."""
+        key = call_key(tool_id, tool_name, kwargs)
+        match = key if key in self._open else next((other for other in self._open if other[:2] == key[:2]), None)
+        if match is not None:
+            return self._open.pop(match), True
+        return self._new_id(tool_id), False
+
+    def _new_id(self, tool_id: str) -> str:
+        call_id, n = tool_id, 1
+        while call_id in self._ids:
+            n += 1
+            call_id = f"{tool_id}#{n}"
+        self._ids.add(call_id)
+        return call_id
 
 
 def event_name(event: object) -> str:
