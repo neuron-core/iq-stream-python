@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-dependencies = ["iq-stream>=0.1.0,<0.2", "langgraph>=1.1"]
+dependencies = ["iq-stream>=0.1.0,<0.2", "langgraph>=1.1,<2"]
 
 [project.optional-dependencies]
 # ag_ui_langgraph imports FastAPI in its __init__, so the extra brings it.

@@ -441,7 +441,7 @@ with iq.publisher(ticket.stream_id) as publisher:
 
 ## Requirements
 
-- Python 3.10 to 3.13, `iq-stream` 0.1, `langgraph` 1.1 or later (the `tools` parts and drain requests need 1.2, the experimental module 1.2). For the `ag-ui` extra, `ag-ui-langgraph` 0.0.47 or later with FastAPI.
+- Python 3.10 to 3.13, `iq-stream` 0.1, `langgraph` 1.1 or a later 1.x (the `tools` parts and drain requests need 1.2, the experimental module 1.2). For the `ag-ui` extra, `ag-ui-langgraph` 0.0.47 or later with FastAPI.
 - Tested with `langgraph` 1.2.21, `langgraph-prebuilt` 1.1.1, `langchain` 1.5.0, `langchain-core` 1.8.0 and `ag-ui-langgraph` 0.0.47 (on Python 3.10: `langchain` 1.4.10 and `langchain-core` 1.7.7, the last releases that support it), and at the floor, on Python 3.10, with `langgraph` 1.1.0, `langgraph-prebuilt` 1.0.8 (the only release of the range `langgraph` 1.1.0 asks for that imports with it), `langchain` 1.2.11 (the first that takes `langgraph` 1.1) and `ag-ui-langgraph` 0.0.47.
 - An IQ-Stream server 1.x.
 

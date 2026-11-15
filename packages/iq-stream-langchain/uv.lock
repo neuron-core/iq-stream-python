@@ -534,7 +534,7 @@ dev = [
 requires-dist = [
     { name = "ag-ui-langgraph", extras = ["fastapi"], marker = "extra == 'ag-ui'", specifier = ">=0.0.47" },
     { name = "iq-stream", editable = "../iq-stream" },
-    { name = "langgraph", specifier = ">=1.1" },
+    { name = "langgraph", specifier = ">=1.1,<2" },
 ]
 provides-extras = ["ag-ui"]
 
