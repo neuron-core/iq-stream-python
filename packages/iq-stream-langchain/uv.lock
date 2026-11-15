@@ -7,15 +7,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[manifest]
-constraints = [
-    { name = "ag-ui-langgraph", specifier = "==0.0.47" },
-    { name = "langchain", marker = "python_full_version >= '3.11'", specifier = "==1.5.0" },
-    { name = "langchain-core", marker = "python_full_version >= '3.11'", specifier = "==1.8.0" },
-    { name = "langgraph", specifier = "==1.2.21" },
-    { name = "langgraph-prebuilt", specifier = "==1.1.1" },
-]
-
 [[package]]
 name = "ag-ui-a2ui-toolkit"
 version = "0.0.6"
@@ -550,7 +541,7 @@ provides-extras = ["ag-ui"]
 [package.metadata.requires-dev]
 dev = [
     { name = "ag-ui-langgraph", extras = ["fastapi"], specifier = ">=0.0.47" },
-    { name = "langchain", specifier = ">=1.2" },
+    { name = "langchain", specifier = ">=1.2.11" },
     { name = "pyright" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1.0" },

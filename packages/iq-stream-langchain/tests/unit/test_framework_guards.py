@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from fakes import USER, weather_agent
+import pytest
+from fakes import LANGGRAPH_1_2, NEEDS_1_2, USER, weather_agent
 from langchain_core.callbacks import BaseCallbackHandler
 
 
@@ -28,6 +29,7 @@ def test_a_plain_callback_handler_on_invoke_gets_no_tokens() -> None:
     assert streamed.tokens > 0
 
 
+@pytest.mark.skipif(not LANGGRAPH_1_2, reason=NEEDS_1_2)
 def test_the_tools_mode_yields_tool_events() -> None:
     parts = list(weather_agent().stream(USER, stream_mode=["tools"], subgraphs=True, version="v2"))  # type: ignore[list-item]
     assert [part["data"]["event"] for part in parts] == ["tool-started", "tool-finished"]  # type: ignore[index]

@@ -8,11 +8,11 @@ from collections import Counter
 from typing import Any
 
 import pytest
-from fakes import FINAL, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
+from fakes import FINAL, LANGGRAPH_1_2, NEEDS_1_2, USER, FakeToolCallingModel, failing_agent, tool_call, weather_agent
 from iq_stream.testing import RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
@@ -20,9 +20,13 @@ from typing_extensions import TypedDict
 from iq_stream_langchain import MASKED_MESSAGE, Oversize
 from iq_stream_langchain.experimental import iq_transformer
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:The v3 streaming protocol on Pregel is experimental:langchain_core._api.beta_decorator.LangChainBetaWarning"
-)
+pytestmark = [
+    pytest.mark.skipif(not LANGGRAPH_1_2, reason=NEEDS_1_2),
+    pytest.mark.filterwarnings(
+        "ignore:The v3 streaming protocol on Pregel is experimental"
+        ":langchain_core._api.beta_decorator.LangChainBetaWarning"
+    ),
+]
 
 
 def kinds(publisher: RecordingPublisher) -> Counter[tuple[str, Any]]:
@@ -153,3 +157,41 @@ def test_an_on_oversize_hook_that_raises_never_breaks_the_run() -> None:
         final = weather_agent().stream_events(USER, version="v3", transformers=[transformer]).output
     assert final["messages"][-1].text == FINAL
     assert publisher.outcome == "end"
+
+
+def test_an_exposed_error_too_large_for_a_frame_is_sent_masked() -> None:
+    def node(state: State) -> dict[str, Any]:
+        raise RuntimeError("the provider refused the request: " + "x" * 2000)
+
+    graph = StateGraph(State)
+    graph.add_node("node", node)
+    graph.add_edge(START, "node")
+    graph.add_edge("node", END)
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with pytest.raises(RuntimeError), publisher:
+        transformer = iq_transformer(publisher, methods=["custom"], expose_errors=True)
+        assert graph.compile().stream_events({"value": None}, version="v3", transformers=[transformer]).output
+    assert [json.loads(data) for data in publisher.data] == [
+        {"type": "error", "ns": [], "data": {"error": "RuntimeError", "message": MASKED_MESSAGE}}
+    ]
+    assert publisher.outcome == "fail"
+
+
+def test_a_failed_tool_result_is_masked() -> None:
+    @tool
+    def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        raise ToolException("the API key sk-123 was refused")
+
+    get_weather.handle_tool_error = True
+    model = FakeToolCallingModel(
+        messages=iter([AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")]), "Sorry."])  # type: ignore[list-item]
+    )
+    publisher = RecordingPublisher()
+    with publisher:
+        run = create_agent(model, [get_weather]).stream_events(
+            USER, version="v3", transformers=[iq_transformer(publisher, methods=["updates", "tools"])]
+        )
+        assert run.output["messages"][-2].content == "the API key sk-123 was refused"
+    assert publisher.data and not any("sk-123" in data for data in publisher.data)
+    assert any(MASKED_MESSAGE in data for data in publisher.data)

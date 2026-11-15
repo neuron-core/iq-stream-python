@@ -14,7 +14,7 @@ from ._encode import (
     encode_part,
     error_part,
 )
-from ._relay import CancelledOutcome, apublish_run, arelay, publish_run, relay
+from ._relay import apublish_run, arelay, publish_run, relay
 from ._reports import Oversize
 
 __all__ = [
@@ -22,7 +22,6 @@ __all__ = [
     "DEFAULT_STREAM_MODE",
     "MASKED_MESSAGE",
     "SLIM_METADATA",
-    "CancelledOutcome",
     "Metadata",
     "Oversize",
     "apublish_run",

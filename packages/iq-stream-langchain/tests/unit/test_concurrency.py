@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from fakes import (
     ASYNC_TOKENS,
+    LANGGRAPH_1_2,
     USER,
     FakeToolCallingModel,
     get_weather,
@@ -98,7 +99,8 @@ def test_parallel_tool_calls_in_a_sync_run() -> None:
     publisher = RecordingPublisher()
     with publisher:
         list(relay(publisher, parallel_agent(), USER))
-    assert_each_call_ordered(tool_events(publisher))
+    if LANGGRAPH_1_2:  # the tools stream mode
+        assert_each_call_ordered(tool_events(publisher))
     parts = [json.loads(data) for data in publisher.data]
     results = [
         part["data"][0]["content"] for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool"
@@ -110,7 +112,13 @@ async def test_parallel_tool_calls_in_an_async_run() -> None:
     publisher = AsyncRecordingPublisher()
     async with publisher:
         await apublish_run(publisher, parallel_agent(), USER)
-    assert_each_call_ordered(tool_events(publisher))
+    if LANGGRAPH_1_2:
+        assert_each_call_ordered(tool_events(publisher))
+    parts = [json.loads(data) for data in publisher.data]
+    results = [
+        part["data"][0]["content"] for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool"
+    ]
+    assert sorted(results) == ["sunny, 21C in Rome", "sunny, 21C in Turin"]
 
 
 async def test_two_runs_at_once_keep_their_own_frames() -> None:

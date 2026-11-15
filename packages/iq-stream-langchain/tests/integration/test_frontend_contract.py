@@ -17,6 +17,8 @@ from typing import Any
 
 import pytest
 from fakes import (
+    ASYNC_INTERRUPTS,
+    DRAFT,
     FINAL,
     FIRST,
     TOOL_RESULT,
@@ -24,6 +26,7 @@ from fakes import (
     FakeToolCallingModel,
     booking_agent,
     failing_agent,
+    hitl_agent,
     research_supervisor,
     tool_call,
     weather_agent,
@@ -87,8 +90,10 @@ def rebuild(node_dir: Path, check: str, received: dict[str, Any], *arguments: st
     return json.loads(process.stdout.strip().splitlines()[-1])
 
 
-def published(client: IQClient, servers: TestServers, agent: Any, config: Any = None) -> dict[str, Any]:
-    ticket, subscription = watch(client, servers.default.url)
+def published(
+    client: IQClient, servers: TestServers, agent: Any, config: Any = None, *, short: bool = False
+) -> dict[str, Any]:
+    ticket, subscription = watch(client, servers.short.url if short else servers.default.url)
     try:
         with client.publisher(ticket.stream_id) as publisher:
             publish_run(publisher, agent, USER, config)
@@ -274,3 +279,66 @@ async def test_stream_agent_accepts_a_run_cancelled_inside_a_sub_agent(
     result = rebuild(node_dir, "agui", recording(received))
     assert result["outcome"] == {"type": "cancelled"}
     assert result["failures"] == [], "the client's checks accepted the events that closed the sub-agent"
+
+
+@pytest.mark.parametrize("server", ["default", "short"])
+def test_use_chat_asks_the_human_for_a_paused_run(
+    server: str, node_dir: Path, iq_client: IQClient, iq_short_client: IQClient, iq_servers: TestServers
+) -> None:
+    """HumanInTheLoopMiddleware's pause, within the frame limit and over the short server's 1 KiB one."""
+    short = server == "short"
+    client = iq_short_client if short else iq_client
+    config = {"configurable": {"thread_id": f"hitl-{server}"}}
+    result = rebuild(node_dir, "usechat", published(client, iq_servers, hitl_agent(), config, short=short))
+    assert result["status"] == "ready" and result["error"] is None
+    assert "tool-approval-request" in result["chunks"]
+    asking = [part for part in result["parts"] if part["state"] == "approval-requested"]
+    assert [part["toolName"] for part in asking] == ["send_email"]
+    assert asking[0]["input"]["to"] == "team@example.com"
+    body = asking[0]["input"]["body"]
+    assert body == DRAFT if not short else body.startswith("Dear team") and body.endswith("…[truncated]")
+
+
+def test_the_readme_chat_transport_resumes_after_a_reload_and_stops_with_the_token(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    result = rebuild(node_dir, "chattransport", published(iq_client, iq_servers, weather_agent()), str(README))
+    assert result["asked"] == [
+        {"url": "/chat/thread-1/stream", "method": "GET", "body": None},
+        {"url": "/chat/s-1/stop", "method": "POST", "body": {"token": "tok-1"}},
+        {"url": "/chat/thread-1/stream", "method": "GET", "body": None},
+    ]
+    assert result["nothing"] is None, "204: no run in flight"
+    assert result["status"] == "ready" and result["texts"] == [FIRST, FINAL]
+
+
+async def test_stream_agent_reports_a_save_that_failed(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    """StreamAgent takes RUN_FINISHED as the end and ignores the iq:fail after it: the relay holds it for the save."""
+
+    class SaveFailed(Exception):
+        pass
+
+    def save(finished: Any) -> None:
+        raise SaveFailed("the database is down")
+
+    graph = weather_agent(checkpointer=InMemorySaver())
+    received = await publish_agui(iq_client, iq_servers.default.url, graph, before_close=save, raises=SaveFailed)
+    result = rebuild(node_dir, "agui", recording(received))
+    assert result["runError"] == MASKED_MESSAGE and "RUN_FINISHED" not in result["events"]
+    assert result["failures"] == [], "one error, the RUN_ERROR"
+
+
+@pytest.mark.skipif(not ASYNC_INTERRUPTS, reason="LangChain's async interrupt() needs Python 3.11")
+async def test_stream_agent_hears_an_interrupt_over_the_frame_limit(
+    node_dir: Path, iq_short_client: IQClient, iq_servers: TestServers
+) -> None:
+    received = await publish_agui(iq_short_client, iq_servers.short.url, hitl_agent(), emit_interrupt_outcome=True)
+    assert received.terminal is not None and received.terminal.event == "iq:end"
+    result = rebuild(node_dir, "agui", recording(received))
+    assert result["failures"] == [] and result["runError"] is None
+    assert result["outcome"]["type"] == "interrupt"
+    [interrupt] = result["outcome"]["interrupts"]
+    assert interrupt["id"] and interrupt["metadata"]["langgraph"]["raw"]["action_requests"][0]["name"] == "send_email"
+    assert "CUSTOM" in result["events"], "the on_interrupt event too"

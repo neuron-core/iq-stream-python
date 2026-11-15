@@ -15,6 +15,7 @@ import sys
 import time
 from collections.abc import AsyncIterator, Iterator, Sequence
 from functools import reduce
+from importlib.metadata import version
 from typing import Annotated, Any
 
 from langchain.agents import create_agent
@@ -33,6 +34,15 @@ from typing_extensions import TypedDict
 #: in async code only from Python 3.11, whose asyncio.create_task takes a context. On 3.10 an async run streams whole
 #: messages, not tokens.
 ASYNC_TOKENS = sys.version_info >= (3, 11)
+
+#: langgraph 1.2 added the `tools` stream mode, drain requests, Interrupt.response_schema and
+#: stream_events(version="v3"). The unit tests run on the declared floor (1.1) too, where those are absent.
+LANGGRAPH_1_2 = tuple(int(number) for number in version("langgraph").split(".")[:2]) >= (1, 2)
+NEEDS_1_2 = "needs langgraph 1.2 (the tools stream mode, drain requests, stream_events v3)"
+#: The same limit for interrupt(): LangChain's HumanInTheLoopMiddleware fails an async run on Python 3.10 with
+#: "Called get_config outside of a runnable context", with or without the adapter.
+ASYNC_INTERRUPTS = ASYNC_TOKENS
+NEEDS_3_11 = "LangChain's async interrupt() needs Python 3.11 (asyncio.create_task with a context)"
 
 USER = {"messages": [{"role": "user", "content": "weather in Turin?"}]}
 FIRST = "Let me check the weather."
@@ -206,6 +216,56 @@ def research_supervisor() -> Any:
         )
     )
     return create_agent(model, [research], checkpointer=InMemorySaver(), name="supervisor")
+
+
+@tool
+def send_email(to: str, body: str) -> str:
+    """Send an email; a human approves it first."""
+    return f"sent to {to}"
+
+
+#: A draft long enough that HumanInTheLoopMiddleware's interrupt (which repeats the arguments in its description)
+#: does not fit the short server's 1 KiB frame, while each half of the streamed arguments does.
+DRAFT = "Dear team, " + "the quarterly figures are attached. " * 12
+
+
+def hitl_agent(body: str = DRAFT) -> Any:
+    """A `create_agent` agent whose `send_email` call waits for a human's decision (HumanInTheLoopMiddleware)."""
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    model = FakeToolCallingModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="", tool_calls=[tool_call("send_email", {"to": "team@example.com", "body": body}, "c1")]
+                ),  # type: ignore[list-item]
+                "Sent.",
+            ]
+        )
+    )
+    middleware = HumanInTheLoopMiddleware(interrupt_on={"send_email": True})
+    return create_agent(model, [send_email], middleware=[middleware], checkpointer=InMemorySaver())
+
+
+def stubborn_agent(cleanup: float, entered: asyncio.Event) -> Any:
+    """A tool that finishes its work before it lets a cancel through (a transaction it must not leave half done).
+    ``entered`` is set once the tool runs."""
+
+    @tool
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.shield(asyncio.sleep(cleanup))
+            raise
+        return "sunny"
+
+    model = FakeToolCallingModel(
+        messages=iter([AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")]), "Sunny."])  # type: ignore[list-item]
+    )
+    return create_agent(model, [get_weather], checkpointer=InMemorySaver())
 
 
 def failing_agent(**options: Any) -> Any:

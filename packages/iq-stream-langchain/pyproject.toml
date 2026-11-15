@@ -44,21 +44,14 @@ dev = [
     "pytest-asyncio>=1.0",
     "ruff",
     "pyright",
-    "langchain>=1.2",
+    "langchain>=1.2.11",
     "ag-ui-langgraph[fastapi]>=0.0.47",
     "uvicorn>=0.30",
 ]
 
-[tool.uv]
-# The versions the plan was researched against. langchain 1.5 and langchain-core 1.8 need Python 3.11, so on 3.10
-# the lockfile holds the newest releases that support it (langchain 1.4, langchain-core 1.7).
-constraint-dependencies = [
-    "langgraph==1.2.21",
-    "langgraph-prebuilt==1.1.1",
-    "langchain==1.5.0 ; python_version >= '3.11'",
-    "langchain-core==1.8.0 ; python_version >= '3.11'",
-    "ag-ui-langgraph==0.0.47",
-]
+[tool.iq-stream]
+# The lowest versions of the ranges above, which CI installs over the lockfile for the unit tests on Python 3.10.
+floor = ["langgraph==1.1.0", "langgraph-prebuilt==1.0.8", "langchain==1.2.11", "ag-ui-langgraph==0.0.47"]
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }

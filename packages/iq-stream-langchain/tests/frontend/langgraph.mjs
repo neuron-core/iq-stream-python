@@ -30,6 +30,11 @@ export function uiMessageChunks(url, options = {}) {
           throw new Error(part.data.message);
         }
         yield part.ns.length ? [part.ns, part.type, part.data] : [part.type, part.data];
+        // @ai-sdk/langchain, too, reads a human-in-the-loop interrupt from `values` only.
+        if (part.type === 'updates' && part.data?.__interrupt__) {
+          const values = { __interrupt__: part.data.__interrupt__ };
+          yield part.ns.length ? [part.ns, 'values', values] : ['values', values];
+        }
       }
     } catch (error) {
       if (error?.name === 'IQStreamError') lost = error;

@@ -6,21 +6,33 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from typing import Any
 
 import pytest
-from fakes import USER, FakeToolCallingModel, booking_agent, failing_agent, tool_call, weather_agent
+from fakes import (
+    LANGGRAPH_1_2,
+    NEEDS_1_2,
+    USER,
+    FakeToolCallingModel,
+    booking_agent,
+    failing_agent,
+    stubborn_agent,
+    tool_call,
+    weather_agent,
+)
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.errors import GraphDrained
-from langgraph.runtime import RunControl
+from langgraph.config import get_stream_writer
 from langgraph.types import Command
 
-from iq_stream_langchain import CANCELLED_PART, MASKED_MESSAGE, arelay, publish_run, relay
+from iq_stream_langchain import CANCELLED_PART, MASKED_MESSAGE, apublish_run, arelay, publish_run, relay
+
+CANCELLING = sys.version_info >= (3, 11)
 
 
 def last(publisher: RecordingPublisher | AsyncRecordingPublisher) -> dict[str, Any]:
@@ -88,7 +100,7 @@ async def test_a_cancelled_task_publishes_the_cancel_and_closes_fail() -> None:
 
 async def test_a_cancelled_task_closes_end_when_asked() -> None:
     publisher = AsyncRecordingPublisher()
-    await run_and_cancel(publisher, cancelled="end")
+    await run_and_cancel(publisher, close_on_cancel="end")
     assert publisher.data[-1] == CANCELLED_PART
     assert publisher.outcome == "end"
 
@@ -98,8 +110,6 @@ async def test_a_cancelled_apublish_run_closes_fail() -> None:
 
     async def run() -> None:
         async with publisher:
-            from iq_stream_langchain import apublish_run
-
             await apublish_run(publisher, weather_agent(token_delay=0.05), USER)
 
     task = asyncio.create_task(run())
@@ -123,7 +133,7 @@ def test_a_sync_loop_left_early_is_a_cancelled_run() -> None:
 
     publisher = RecordingPublisher()
     with publisher:
-        for index, _ in enumerate(relay(publisher, weather_agent(), USER, cancelled="end")):
+        for index, _ in enumerate(relay(publisher, weather_agent(), USER, close_on_cancel="end")):
             if index == 2:
                 break
     assert publisher.data[-1] == CANCELLED_PART
@@ -157,7 +167,11 @@ async def test_an_async_loop_left_early_without_aclosing_closes_end() -> None:
     assert publisher.outcome == "end"
 
 
+@pytest.mark.skipif(not LANGGRAPH_1_2, reason=NEEDS_1_2)
 def test_a_drain_request_is_a_cancelled_run() -> None:
+    from langgraph.errors import GraphDrained  # type: ignore[attr-defined, unused-ignore]
+    from langgraph.runtime import RunControl  # type: ignore[attr-defined, unused-ignore]
+
     control = RunControl()
 
     @tool
@@ -190,14 +204,15 @@ def test_a_run_that_waits_for_a_human_closes_end_and_resumes_on_a_new_stream() -
     assert parts[-1]["type"] == "updates"
     assert parts[-1]["data"]["__interrupt__"][0]["value"] == {"question": "book Turin?"}
     assert parts[-1]["data"]["__interrupt__"][0]["id"]
-    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started"]
+    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started"] * LANGGRAPH_1_2
     assert paused.outcome == "end"
 
     resumed = RecordingPublisher()
     with resumed:
         final = publish_run(resumed, agent, Command(resume="yes"), config)
     parts = [json.loads(data) for data in resumed.data]
-    assert [part["data"]["event"] for part in parts if part["type"] == "tools"] == ["tool-started", "tool-finished"]
+    tools = [part["data"]["event"] for part in parts if part["type"] == "tools"]
+    assert tools == ["tool-started", "tool-finished"] * LANGGRAPH_1_2
     assert final["messages"][-2].content == "booked Turin: yes"
     assert resumed.outcome == "end"
 
@@ -225,7 +240,7 @@ def test_an_exception_of_the_callers_loop_never_closes_end(cancelled: Any) -> No
     """A generator cannot tell it from a break, so the page reads the Cancelled part; the close line stays fail."""
     publisher = RecordingPublisher()
     with pytest.raises(SaveFailed), publisher:
-        for part in relay(publisher, weather_agent(), USER, cancelled=cancelled):
+        for part in relay(publisher, weather_agent(), USER, close_on_cancel=cancelled):
             if part["type"] == "updates":
                 raise SaveFailed("the database is down")
     assert publisher.data[-1] == CANCELLED_PART
@@ -238,7 +253,7 @@ async def test_an_exception_of_the_callers_async_loop_never_closes_end(cancelled
     with pytest.raises(SaveFailed):
         async with (
             publisher,
-            contextlib.aclosing(arelay(publisher, weather_agent(), USER, cancelled=cancelled)) as parts,
+            contextlib.aclosing(arelay(publisher, weather_agent(), USER, close_on_cancel=cancelled)) as parts,
         ):
             async for part in parts:
                 if part["type"] == "updates":
@@ -264,6 +279,7 @@ def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
     @tool
     def get_weather(city: str) -> str:
         """Get the weather for a city."""
+        get_stream_writer()({"looking up": city})
         time.sleep(1.5)
         return "sunny"
 
@@ -276,7 +292,7 @@ def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
     left = 0.0
     with publisher:
         for part in relay(publisher, create_agent(model, [get_weather]), USER):
-            if part["type"] == "tools":
+            if part["type"] == "custom":  # the tool runs
                 left = time.monotonic()
                 break
         assert publisher.outcome == "fail", "closed before the block's own close"
@@ -284,3 +300,94 @@ def test_a_sync_loop_left_during_a_slow_tool_is_cancelled_at_once() -> None:
     assert publisher.cancelled_at is not None
     assert publisher.cancelled_at - left < 0.5
     assert stopped - left > 1.0, "the graph was stopped after its node ended"
+
+
+@pytest.mark.skipif(not CANCELLING, reason="Python 3.10 has no Task.cancelling(): a cancel in the loop body is a break")
+async def test_a_cancel_that_lands_in_the_loop_body_closes_with_close_on_cancel() -> None:
+    """A stop route that cancels a task whose loop awaits something of its own (a websocket send, a save per part)."""
+    publisher = AsyncRecordingPublisher()
+    streaming = asyncio.Event()
+
+    async def run() -> None:
+        relayed = arelay(publisher, weather_agent(token_delay=0.02), USER, close_on_cancel="end")
+        async with publisher, contextlib.aclosing(relayed):
+            async for part in relayed:
+                if part["type"] == "messages":
+                    streaming.set()
+                await asyncio.sleep(0.05)
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(streaming.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert publisher.data[-1] == CANCELLED_PART
+    assert publisher.outcome == "end"
+
+
+class AsyncTimedPublisher(AsyncRecordingPublisher):
+    """Notes when the Cancelled part went out and when the stream was first closed."""
+
+    cancelled_at: float | None = None
+    closed_at: float | None = None
+
+    def send(self, data: str, event: str | None = None) -> bool:
+        if data == CANCELLED_PART:
+            self.cancelled_at = time.monotonic()
+        return super().send(data, event)
+
+    async def close(self, outcome: Any = "end", timeout: float = 10.0) -> Any:
+        if self.closed_at is None:
+            self.closed_at = time.monotonic()
+        return await super().close(outcome, timeout)
+
+
+@pytest.mark.parametrize("stop", ["break", "cancel"])
+async def test_an_async_cancel_is_published_before_the_graph_has_stopped(stop: str) -> None:
+    """A tool that finishes its work before it lets a cancel through holds LangGraph up, whether the loop was left or
+    the task cancelled while LangGraph waited for the tool; the page hears at once, and the close line is fail."""
+    publisher = AsyncTimedPublisher()
+    entered = asyncio.Event()
+
+    async def run() -> None:
+        relayed = arelay(publisher, stubborn_agent(1.0, entered), USER, {"configurable": {"thread_id": "slow"}})
+        async with publisher, contextlib.aclosing(relayed):
+            async for part in relayed:
+                if stop == "break" and part["type"] == "updates" and "model" in part["data"]:
+                    await entered.wait()  # the relay reads on meanwhile, and LangGraph runs the tool
+                    break
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(entered.wait(), 5)
+    await asyncio.sleep(0.1)
+    stopped = time.monotonic()
+    if stop == "cancel":
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert publisher.cancelled_at is not None and publisher.cancelled_at - stopped < 0.5
+    assert publisher.closed_at is not None and publisher.closed_at - stopped < 0.5
+    assert time.monotonic() - stopped > 0.8, "the graph stopped once the tool was done"
+    assert publisher.data.count(CANCELLED_PART) == 1
+    assert publisher.outcome == "fail"
+
+
+async def test_with_close_on_cancel_end_the_close_line_waits_for_the_graph() -> None:
+    """end says the answer is complete as it stands: only once the graph has stopped and saved it."""
+    publisher = AsyncTimedPublisher()
+    entered = asyncio.Event()
+
+    async def run() -> None:
+        async with publisher:
+            config: Any = {"configurable": {"thread_id": "slow"}}
+            await apublish_run(publisher, stubborn_agent(1.0, entered), USER, config, close_on_cancel="end")
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(entered.wait(), 5)
+    stopped = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert publisher.cancelled_at is not None and publisher.cancelled_at - stopped < 0.5
+    assert publisher.closed_at is not None and publisher.closed_at - stopped > 0.8
+    assert publisher.outcome == "end"
