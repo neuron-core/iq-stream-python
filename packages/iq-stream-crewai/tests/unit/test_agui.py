@@ -14,6 +14,7 @@ from crew_fakes import ANSWER, TERM, FakeReActLLM, FakeStreamingLLM, LookupTool,
 from crewai import Agent, Crew, Task
 from crewai.events import crewai_event_bus
 from crewai.events.base_events import BaseEvent
+from crewai.events.types.flow_events import FlowFinishedEvent
 from crewai.flow.flow import Flow, listen, start
 from iq_stream.testing import RecordingPublisher
 
@@ -79,7 +80,7 @@ def test_a_failing_model_ends_with_run_error_masked_and_fail() -> None:
     with pytest.raises(RuntimeError, match="fake provider outage") as raised, publish(publisher) as run:
         make_crew(fail_on_call=2).kickoff()
     events = checked(publisher.data)
-    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "RuntimeError"}
+    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "error"}
     assert "sk-secret" not in "".join(publisher.data)
     assert publisher.outcome == "fail"
     assert type(raised.value) is RuntimeError
@@ -91,7 +92,11 @@ def test_expose_errors_publishes_the_message() -> None:
     with pytest.raises(RuntimeError), publish(publisher, expose_errors=True):
         make_crew(fail_on_call=1).kickoff()
     events = checked(publisher.data)
-    assert events[-1] == {"type": "RUN_ERROR", "message": "fake provider outage at sk-secret", "code": "RuntimeError"}
+    assert events[-1] == {
+        "type": "RUN_ERROR",
+        "message": "RuntimeError: fake provider outage at sk-secret",
+        "code": "error",
+    }
 
 
 def test_a_tool_that_raises_becomes_an_error_result_and_the_run_goes_on() -> None:
@@ -206,7 +211,7 @@ def test_a_second_open_step_of_the_same_name_gets_a_suffix() -> None:
     assert names == ["flow:outer", "task:Answer question same", "task:Answer question same#2"]
 
 
-def test_a_flow_paused_for_human_feedback_is_a_custom_event_and_ends() -> None:
+def _paused_review(message: str = "Approve the draft?") -> Flow[Any]:
     from crewai.flow.async_feedback import HumanFeedbackPending, PendingFeedbackContext
     from crewai.flow.human_feedback import human_feedback
 
@@ -217,17 +222,20 @@ def test_a_flow_paused_for_human_feedback_is_a_custom_event_and_ends() -> None:
     class Review(Flow):  # type: ignore[type-arg]
         @start()
         @human_feedback(
-            message="Approve the draft?",
-            emit=["approved", "rejected"],
-            llm=FakeStreamingLLM(answer="approved"),
-            provider=Provider(),
+            message=message, emit=["approved", "rejected"], llm=FakeStreamingLLM(answer="approved"), provider=Provider()
         )
         def draft(self) -> str:
             return "a draft"
 
+    return Review()
+
+
+def test_a_flow_paused_for_human_feedback_ends_the_run_interrupted() -> None:
+    from crewai.flow.async_feedback import HumanFeedbackPending
+
     publisher = RecordingPublisher()
     with publish(publisher) as run:
-        outcome = Review().kickoff()
+        outcome = _paused_review().kickoff()
         saved = outcome  # the application persists the pending request before the close line
     assert isinstance(saved, HumanFeedbackPending)
     events = checked(publisher.data)
@@ -237,9 +245,36 @@ def test_a_flow_paused_for_human_feedback_is_a_custom_event_and_ends() -> None:
     assert paused["value"]["emit"] == ["approved", "rejected"]
     assert paused["value"]["method_name"] == "draft"
     assert paused["value"]["flow_id"] == saved.context.flow_id
-    assert events[-1]["type"] == "RUN_FINISHED"
+    # AG-UI's interrupt outcome: a generic client shows the pause; resuming is a new run.
+    interrupt = {"id": saved.context.flow_id, "reason": "human_feedback", "message": "Approve the draft?"}
+    assert events[-1] == {
+        "type": "RUN_FINISHED",
+        "threadId": run.thread_id,
+        "runId": run.run_id,
+        "outcome": {"type": "interrupt", "interrupts": [interrupt]},
+    }
     assert publisher.outcome == "end"
     assert run.errors == []
+
+
+def test_an_interrupt_whose_message_does_not_fit_still_finishes_the_run() -> None:
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with publish(publisher) as run:
+        _paused_review("Approve? " * 300).kickoff()
+    events = checked(publisher.data)
+    assert events[-1]["outcome"]["type"] == "interrupt"
+    assert "message" not in events[-1]["outcome"]["interrupts"][0]
+    assert run.errors == []
+
+
+def test_a_flow_that_finishes_after_its_pause_is_not_interrupted() -> None:
+    publisher = RecordingPublisher()
+    with publish(publisher) as run:
+        review = _paused_review()
+        review.kickoff()
+        # What the flow emits when the application resumes it, in the same block, and it finishes.
+        crewai_event_bus.emit(review, FlowFinishedEvent(flow_name=type(review).__name__, state={}))
+    assert checked(publisher.data)[-1] == {"type": "RUN_FINISHED", "threadId": run.thread_id, "runId": run.run_id}
 
 
 def test_a_feedback_request_is_a_custom_event() -> None:

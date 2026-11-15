@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from crew_fakes import ANSWER, TERM, FakeMemoryLLM, LookupTool, embed, make_crew
+from crew_fakes import ANSWER, TERM, FakeMemoryLLM, FakeStreamingLLM, LookupTool, embed, make_crew
 from crewai.memory.unified_memory import Memory
 from iq_stream import IQClient
 from iq_stream.testing import Subscription, TestServers, subscribe_in_background
@@ -107,7 +107,7 @@ def test_ag_ui_a_failing_run(iq_client: IQClient, iq_servers: TestServers, tmp_p
     # RUN_ERROR, then iq:fail with reason publisher: the run ends once, on the first.
     assert result["error"] is None
     assert result["outcome"] == "error"
-    assert result["runError"] == {"message": "An error occurred.", "code": "RuntimeError"}
+    assert result["runError"] == {"message": "An error occurred.", "code": "error"}
     assert result["messages"][-1]["content"] == "Let me "
 
 
@@ -139,6 +139,36 @@ async def test_ag_ui_a_cancelled_run(iq_client: IQClient, iq_servers: TestServer
     assert result["error"] is None and result["outcome"] == "cancelled"
     [call] = result["messages"]
     assert call["toolCalls"][0]["name"] == "lookup"
+
+
+def test_ag_ui_a_flow_paused_for_human_feedback(iq_client: IQClient, iq_servers: TestServers, tmp_path: Path) -> None:
+    from crewai.flow.async_feedback import HumanFeedbackPending, PendingFeedbackContext
+    from crewai.flow.flow import Flow, start
+    from crewai.flow.human_feedback import human_feedback
+
+    class Provider:
+        def request_feedback(self, context: PendingFeedbackContext, flow: object) -> str:
+            raise HumanFeedbackPending(context=context)
+
+    class Review(Flow):  # type: ignore[type-arg]
+        @start()
+        @human_feedback(
+            message="Approve the draft?", emit=["approved", "rejected"], llm=FakeStreamingLLM(), provider=Provider()
+        )
+        def draft(self) -> str:
+            return "a draft"
+
+    ticket = iq_client.ticket()
+    subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
+    with publish(iq_client, ticket.stream_id):
+        pending = Review().kickoff()
+    assert isinstance(pending, HumanFeedbackPending)
+    result = replay("ag-ui", subscription.result(30), tmp_path)
+    assert result["error"] is None and result["outcome"] == "interrupt"
+    assert result["interrupts"] == [
+        {"id": pending.context.flow_id, "reason": "human_feedback", "message": "Approve the draft?"}
+    ]
+    assert "CUSTOM" in result["types"] and result["types"][-1] == "RUN_FINISHED"
 
 
 def test_crewai_native_frames(iq_client: IQClient, iq_servers: TestServers, tmp_path: Path) -> None:

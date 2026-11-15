@@ -64,6 +64,11 @@ class _Call:
     tools: dict[int, _ToolCall] = field(default_factory=lambda: {})
 
 
+def _error_text(error: BaseException) -> str:
+    text = str(error)
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
 def _label(text: str) -> str:
     return text if len(text) <= _LABEL else text[: _LABEL - 1] + "…"
 
@@ -111,6 +116,8 @@ class AgUiEncoder:
         self._ids: set[str] = set()
         self._steps: dict[tuple[str, ...], list[str]] = {}
         self._open_steps: dict[str, None] = {}  # names in the order they were opened
+        # The flows paused for human feedback, by id, unless they finish afterwards: the run ends interrupted.
+        self._paused: dict[str, ag.Interrupt] = {}
         self._handlers: dict[str, Callable[[Snapshot], list[Frame]]] = {
             "llm_call_started": self._call_started,
             "llm_stream_chunk": self._chunk,
@@ -127,7 +134,9 @@ class AgUiEncoder:
             "method_execution_finished": self._step_ended,
             "method_execution_failed": self._step_ended,
             "human_feedback_requested": self._custom,
-            "flow_paused": self._custom,
+            "flow_paused": self._flow_paused,
+            "flow_finished": self._flow_ended,
+            "flow_failed": self._flow_ended,
         }
 
     # -- the Encoder protocol -------------------------------------------------------------------------------------
@@ -156,16 +165,34 @@ class AgUiEncoder:
             out += self._out(ag.StepFinishedEvent(step_name=name))
         self._steps.clear()
         self._open_steps.clear()
-        if error is None:
+        if error is None and self._paused:
+            out += self._interrupted(list(self._paused.values()))
+        elif error is None:
             out += self._out(ag.RunFinishedEvent(thread_id=self._thread_id, run_id=self._run_id))
         elif isinstance(error, CANCELLATIONS):
             # A stop is not a failure of the run: AG-UI has an outcome for it.
             cancelled = ag.RunFinishedCancelledOutcome()
             out += self._out(ag.RunFinishedEvent(thread_id=self._thread_id, run_id=self._run_id, outcome=cancelled))
         else:
-            message = (str(error) if self._expose_errors else "") or MASKED
-            out += self._out(ag.RunErrorEvent(message=message, code=type(error).__name__), cut=("message",))
+            # A fixed code, as across the family: the exception's class names the backend's providers, so it goes
+            # into the message, and only with expose_errors.
+            message = _error_text(error) if self._expose_errors else MASKED
+            out += self._out(ag.RunErrorEvent(message=message, code="error"), cut=("message",))
         return out
+
+    def _interrupted(self, interrupts: list[ag.Interrupt]) -> list[Frame]:
+        """``RUN_FINISHED`` with AG-UI's interrupt outcome: the run waits for an answer, and resuming is a new run.
+        Without the messages when they would not fit, so that the run is never left unfinished."""
+        event = ag.RunFinishedEvent(
+            thread_id=self._thread_id,
+            run_id=self._run_id,
+            outcome=ag.RunFinishedInterruptOutcome(interrupts=interrupts),
+        )
+        payload = event.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if not self._fit.fits(dumps(payload)):
+            for interrupt in payload["outcome"]["interrupts"]:
+                interrupt.pop("message", None)
+        return self._fit.whole(payload)
 
     # -- frames -----------------------------------------------------------------------------------------------------
 
@@ -365,6 +392,20 @@ class AgUiEncoder:
         name = names.pop()
         del self._open_steps[name]
         return self._out(ag.StepFinishedEvent(step_name=name))
+
+    def _flow_paused(self, snapshot: Snapshot) -> list[Frame]:
+        fields = snapshot.fields
+        flow_id = fields.get("flow_id")
+        if flow_id is not None:
+            # The flow's id is what resumes it (Flow.from_pending).
+            message = fields.get("message")
+            interrupt = ag.Interrupt(id=str(flow_id), reason="human_feedback", message=message)
+            self._paused[str(flow_id)] = interrupt
+        return self._custom(snapshot)
+
+    def _flow_ended(self, snapshot: Snapshot) -> list[Frame]:
+        self._paused.pop(str(snapshot.fields.get("flow_id", "")), None)  # resumed, in the block
+        return []
 
     def _custom(self, snapshot: Snapshot) -> list[Frame]:
         event = ag.CustomEvent(name=f"crewai.{snapshot.type}", value=snapshot.fields)

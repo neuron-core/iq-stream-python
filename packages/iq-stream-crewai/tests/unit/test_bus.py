@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import contextvars
+import itertools
 import json
 import threading
 import time
 from collections.abc import Iterator
+from datetime import datetime, timedelta, tzinfo
 
 import pytest
 from agui_checks import checked, conversation, types
 from crew_fakes import ANSWER, TERM, LookupTool, make_crew
-from crewai.events import crewai_event_bus
+from crewai.events import base_events, crewai_event_bus
 from crewai.events.base_events import BaseEvent
 from crewai.events.types.llm_events import LLMStreamChunkEvent
 from iq_stream import Outcome, PublishResult
@@ -79,7 +81,7 @@ def test_a_failing_model() -> None:
     with pytest.raises(RuntimeError), publish(publisher, transport="bus"):
         make_crew(fail_on_call=2).kickoff()
     events = checked(publisher.data)
-    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "RuntimeError"}
+    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "error"}
     assert publisher.outcome == "fail"
 
 
@@ -138,6 +140,50 @@ def test_several_kickoffs_in_one_block_keep_their_order() -> None:
         ("STEP_STARTED", "task:Answer question two"),
         ("STEP_FINISHED", "task:Answer question two"),
     ]
+
+
+class _CoarseClock(datetime):
+    """datetime.now() ticking every 15.6 ms, as on Windows before Python 3.13."""
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> datetime:  # type: ignore[override]
+        now = datetime.now(tz)
+        return now.replace(microsecond=now.microsecond // 15_625 * 15_625)
+
+
+def test_kickoffs_keep_their_order_on_a_coarse_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The last events of one kickoff and the first of the next are made in the same tick of the clock.
+    monkeypatch.setattr(base_events, "datetime", _CoarseClock)
+    for _ in range(3):
+        publisher = RecordingPublisher()
+        with publish(publisher, protocol="crewai", transport="bus"):
+            make_crew(name="one", terms=[]).kickoff()
+            make_crew(name="two", terms=[]).kickoff()
+        crews = [
+            (frame.event, json.loads(frame.data)["crew_name"])
+            for frame in publisher.frames
+            if frame.event and frame.event.startswith("crew_kickoff")
+        ]
+        names = ["crew-one", "crew-two"]
+        assert crews == [(f"crew_kickoff_{state}", name) for name in names for state in ("started", "completed")]
+
+
+def test_a_clock_that_steps_back_does_not_reorder_a_kickoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An NTP step, a resumed VM: the clock goes back a second in the middle of the answer.
+    made = itertools.count()
+
+    class Stepping(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:  # type: ignore[override]
+            now = datetime.now(tz)
+            return now - timedelta(seconds=1) if next(made) >= 20 else now
+
+    monkeypatch.setattr(base_events, "datetime", Stepping)
+    words = " ".join(f"w{number:02d}" for number in range(40))
+    publisher = RecordingPublisher()
+    with publish(publisher, transport="bus"):
+        make_crew(answer=words, terms=[], delay=0.002).kickoff()
+    assert conversation(checked(publisher.data)).text == words
 
 
 def test_a_thread_that_outlives_the_block_is_not_even_copied_while_the_close_line_is_on_its_way() -> None:

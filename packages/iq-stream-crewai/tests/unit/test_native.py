@@ -82,15 +82,23 @@ def test_errors_are_masked_unless_exposed() -> None:
         assert publisher.outcome == "fail"
 
 
-def test_long_text_values_are_cut_to_max_text_chars() -> None:
+def test_long_text_values_are_cut_to_max_field_bytes() -> None:
     publisher = RecordingPublisher()
-    with publish(publisher, protocol="crewai", max_text_chars=10):
+    with publish(publisher, protocol="crewai", max_field_bytes=10):
         make_crew(tool=LookupTool(result="r" * 50)).kickoff()
     [finished] = [json.loads(frame.data) for frame in publisher.frames if frame.event == "tool_usage_finished"]
-    assert finished["output"] == "r" * 10 + "… [40 characters truncated]"
+    assert finished["output"] == "r" * 10 + "… [40 bytes truncated]"
     # The answer streamed in chunks is not cut.
     chunks = [json.loads(frame.data)["chunk"] for frame in publisher.frames if frame.event == "llm_stream_chunk"]
     assert "".join(chunks).endswith(ANSWER)
+
+
+def test_max_field_bytes_counts_bytes_of_utf_8_and_never_cuts_a_character_in_two() -> None:
+    publisher = RecordingPublisher()
+    with publish(publisher, protocol="crewai", max_field_bytes=7):
+        make_crew(tool=LookupTool(result="é" * 10 + "😀")).kickoff()  # 2 bytes each, then 4
+    [finished] = [json.loads(frame.data) for frame in publisher.frames if frame.event == "tool_usage_finished"]
+    assert finished["output"] == "ééé… [18 bytes truncated]"
 
 
 def test_long_names_are_cut_to_fit_the_frame() -> None:
@@ -106,8 +114,8 @@ def test_long_names_are_cut_to_fit_the_frame() -> None:
     assert [name for name, _ in seen].count("agent_execution_started") == 1
     roles = [data["agent_role"] for _, data in seen if "agent_role" in data]
     assert len(roles) == 5  # agent started and completed, two model calls, the tool
-    assert all(role.startswith("RRR") and role.endswith("characters truncated]") for role in roles)
-    assert seen[0][1]["crew_name"].endswith("characters truncated]")
+    assert all(role.startswith("RRR") and role.endswith("bytes truncated]") for role in roles)
+    assert seen[0][1]["crew_name"].endswith("bytes truncated]")
     assert run.errors == []
 
 

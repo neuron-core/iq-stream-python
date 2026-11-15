@@ -212,6 +212,48 @@ class FakeMemoryLLM(BaseLLM):
         return self.call(messages, **kwargs)
 
 
+class PromptLLM(BaseLLM):
+    """Answers by its prompt: the first entry of ``answers`` whose phrase the messages contain, else ``answer``. Streams
+    word by word, without function calling, naming the agent CrewAI names."""
+
+    answer: str = ANSWER
+    answers: dict[str, str] = Field(default_factory=lambda: {})
+    calls: int = 0
+
+    def __init__(self, **data: Any) -> None:
+        data.setdefault("model", "fake-prompt")
+        data.setdefault("stream", True)
+        super().__init__(**data)
+
+    def supports_function_calling(self) -> bool:
+        return False
+
+    def call(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+    ) -> Any:
+        self.calls += 1
+        prompt = json.dumps(messages)
+        text = next((answer for phrase, answer in self.answers.items() if phrase in prompt), self.answer)
+        where = {"from_task": from_task, "from_agent": from_agent}
+        with llm_call_context():
+            self._emit_call_started_event(messages=messages, tools=tools, **where)
+            words = text.split(" ")
+            for i, word in enumerate(words):
+                self._emit_stream_chunk_event(chunk=word + (" " if i < len(words) - 1 else ""), **where)
+            self._emit_call_completed_event(response=text, call_type=LLMCallType.LLM_CALL, messages=messages, **where)
+        return text
+
+    async def acall(self, messages: Any, **kwargs: Any) -> Any:
+        return self.call(messages, **kwargs)
+
+
 def embed(texts: list[str]) -> list[list[float]]:
     """An embedder for ``Memory``, without a model."""
     return [[float(len(text) % 7), 1.0, 0.5, 0.25] for text in texts]
