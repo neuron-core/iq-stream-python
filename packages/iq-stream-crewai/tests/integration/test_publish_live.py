@@ -41,7 +41,7 @@ def test_a_run_with_a_tool_call_arrives_in_order_once_and_ends(iq_client: IQClie
     assert list(talk.tool_results.values()) == [f"value:{TERM}"]
     assert run.result is not None and run.result.outcome == "end"
     assert run.result.last_event_id == run.frames_sent == len(received.frames)
-    assert run.publisher is not None and run.publisher.requests == 1  # type: ignore[attr-defined]
+    assert run.publisher is not None and run.publisher.requests == 1
     assert run.errors == []
 
 
@@ -67,7 +67,7 @@ def test_a_failing_run_ends_with_run_error_then_iq_fail(iq_client: IQClient, iq_
     assert received.terminal is not None and received.terminal.event == "iq:fail"
     assert received.terminal.data["reason"] == "publisher"
     events = checked(received.data)
-    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "RuntimeError"}
+    assert events[-1] == {"type": "RUN_ERROR", "message": "An error occurred.", "code": "error"}
     assert_delivered_once_in_order(received, run.frames_sent)
     assert run.result is not None and run.result.outcome == "fail"
 
@@ -83,7 +83,7 @@ def test_a_silent_tool_longer_than_the_read_timeout_stays_on_one_request(iq_serv
     assert_delivered_once_in_order(received, run.frames_sent)
     gap = received.frames[types(checked(received.data)).index("TOOL_CALL_RESULT")].at
     assert gap - received.frames[0].at > 2.5  # the tool's silence really was on the wire
-    assert run.publisher is not None and run.publisher.requests == 1  # type: ignore[attr-defined]
+    assert run.publisher is not None and run.publisher.requests == 1
 
 
 def test_without_keepalives_the_core_resumes_after_the_408(iq_servers: TestServers) -> None:
@@ -96,11 +96,11 @@ def test_without_keepalives_the_core_resumes_after_the_408(iq_servers: TestServe
     assert received.terminal is not None and received.terminal.event == "iq:end"
     assert_delivered_once_in_order(received, run.frames_sent)
     assert conversation(checked(received.data)).text == ANSWER
-    assert run.publisher is not None and run.publisher.requests >= 2  # type: ignore[attr-defined]
+    assert run.publisher is not None and run.publisher.requests >= 2
 
 
-@pytest.mark.parametrize("on_cancel", ["fail", "end"])
-async def test_a_cancelled_run(on_cancel: Outcome, iq_client: IQClient, iq_servers: TestServers) -> None:
+@pytest.mark.parametrize("close_on_cancel", ["fail", "end"])
+async def test_a_cancelled_run(close_on_cancel: Outcome, iq_client: IQClient, iq_servers: TestServers) -> None:
     ticket = iq_client.ticket()
     subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
     gate = threading.Event()
@@ -113,7 +113,7 @@ async def test_a_cancelled_run(on_cancel: Outcome, iq_client: IQClient, iq_serve
             return super()._run(term)
 
     async def run() -> None:
-        async with publish(iq_client, ticket.stream_id, on_cancel=on_cancel):
+        async with publish(iq_client, ticket.stream_id, close_on_cancel=close_on_cancel):
             await make_crew(tool=Signalling(gate=gate, seconds=10.0)).akickoff()
 
     task = asyncio.create_task(run())
@@ -126,7 +126,7 @@ async def test_a_cancelled_run(on_cancel: Outcome, iq_client: IQClient, iq_serve
     events = checked(received.data)
     assert events[-1]["outcome"] == {"type": "cancelled"}
     assert received.terminal is not None
-    if on_cancel == "fail":
+    if close_on_cancel == "fail":
         assert received.terminal.event == "iq:fail" and received.terminal.data["reason"] == "publisher"
     else:
         assert received.terminal.event == "iq:end"
@@ -142,7 +142,7 @@ def test_a_frame_over_the_short_server_s_limit_is_cut(iq_servers: TestServers) -
     assert received.terminal is not None and received.terminal.event == "iq:end"
     assert_delivered_once_in_order(received, run.frames_sent)
     [result] = conversation(checked(received.data)).tool_results.values()
-    assert result.startswith("rrr") and result.endswith("characters truncated]")
+    assert result.startswith("rrr") and result.endswith("bytes truncated]")
     assert run.errors == []
 
 

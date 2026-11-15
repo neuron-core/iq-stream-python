@@ -9,11 +9,7 @@ resolution-markers = [
 ]
 
 [manifest]
-constraints = [
-    { name = "ag-ui-protocol", specifier = "==1.0.0" },
-    { name = "crewai", specifier = "==1.15.41" },
-    { name = "onnxruntime", marker = "python_full_version < '3.11'", specifier = "<1.24" },
-]
+constraints = [{ name = "onnxruntime", marker = "python_full_version < '3.11'", specifier = "<1.24" }]
 
 [[package]]
 name = "ag-ui-protocol"

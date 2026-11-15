@@ -52,17 +52,20 @@ dev = [
     "uvicorn>=0.30",
 ]
 
+# uv.lock holds the versions the plan was researched against (crewai 1.15.41, ag-ui-protocol 1.0.0), locked with
+# `uv lock --upgrade-package`: a constraint here would also bind `uv pip install`, which the floor run needs.
 [tool.uv]
 constraint-dependencies = [
-    # The versions the plan was researched against; the ranges above stay wide.
-    "crewai==1.15.41",
-    "ag-ui-protocol==1.0.0",
     # chromadb's, through CrewAI: 1.24 declares Python 3.10 but publishes no wheel for it.
     "onnxruntime<1.24 ; python_full_version < '3.11'",
 ]
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
+
+# The lowest versions of the ranges above, which CI installs over the lockfile to run the unit tests on Python 3.10.
+[tool.iq-stream]
+floor = ["crewai==1.15.2", "ag-ui-protocol==1.0.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iq_stream_crewai"]
@@ -88,6 +91,8 @@ filterwarnings = [
     # when one is collected.
     "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
     "ignore:Exception ignored in. <sqlite3.Connection object:pytest.PytestUnraisableExceptionWarning",
+    # The opentelemetry-api CrewAI 1.15.2 pins, on Python 3.10, reading entry points the way 3.10 deprecates.
+    "ignore:SelectableGroups dict interface is deprecated:DeprecationWarning:opentelemetry",
 ]
 
 [tool.ruff]

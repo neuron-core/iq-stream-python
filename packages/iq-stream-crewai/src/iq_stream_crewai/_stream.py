@@ -32,7 +32,7 @@ class CrewAIStream:
     """Everything CrewAI emits inside the block goes to one IQ stream. Made by ``publish()``.
 
     The block closes the stream with ``end`` when it exits normally and with ``fail`` when it exits with an
-    exception, which then goes on; a cancellation closes it with ``on_cancel``. The publisher is created, and its
+    exception, which then goes on; a cancellation closes it with ``close_on_cancel``. The publisher is created, and its
     request opened, when the block is entered.
     """
 
@@ -46,9 +46,9 @@ class CrewAIStream:
         run_id: str | None = None,
         include: Collection[str] | None = None,
         exclude: Collection[str] = (),
-        max_text_chars: int | None = 16_000,
+        max_field_bytes: int | None = 16_384,
         expose_errors: bool = False,
-        on_cancel: Outcome = "fail",
+        close_on_cancel: Outcome = "fail",
         transport: Literal["auto", "sink", "bus"] = "auto",
     ) -> None:
         if isinstance(target, IQClient):
@@ -71,20 +71,20 @@ class CrewAIStream:
                 raise ValueError("protocol is 'ag-ui', 'crewai' or an Encoder.")
         elif not all(callable(getattr(protocol, method, None)) for method in methods):
             raise ValueError("protocol is 'ag-ui', 'crewai' or an Encoder.")
-        if on_cancel not in ("end", "fail"):
-            raise ValueError("on_cancel is 'end' or 'fail'.")
+        if close_on_cancel not in ("end", "fail"):
+            raise ValueError("close_on_cancel is 'end' or 'fail'.")
         if transport not in ("auto", "sink", "bus"):
             raise ValueError("transport is 'auto', 'sink' or 'bus'.")
-        if max_text_chars is not None and (isinstance(max_text_chars, bool) or max_text_chars < 0):  # pyright: ignore[reportUnnecessaryIsInstance]
-            raise ValueError("max_text_chars is a non-negative number of characters, or None.")
+        if max_field_bytes is not None and (isinstance(max_field_bytes, bool) or max_field_bytes < 1):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise ValueError("max_field_bytes is a positive number of bytes, or None.")
         self._stream_id = resolved
         self._protocol = protocol
         self._thread_id = thread_id or resolved
         self._run_id = run_id or uuid.uuid4().hex
         self._types = resolve_types(include, exclude)
-        self._max_text_chars = max_text_chars
+        self._max_field_bytes = max_field_bytes
         self._expose_errors = expose_errors
-        self._on_cancel: Outcome = on_cancel
+        self._close_on_cancel: Outcome = close_on_cancel
         self._transport_kind = choose(transport)
 
         self._lock = threading.Lock()
@@ -196,7 +196,7 @@ class CrewAIStream:
     def _make_encoder(self, publisher: PublisherLike) -> Encoder[Any]:
         if not isinstance(self._protocol, str):
             return self._protocol
-        snapshotter = Snapshotter(self._types, self._max_text_chars, self._expose_errors)
+        snapshotter = Snapshotter(self._types, self._max_field_bytes, self._expose_errors)
         fitter = Fitter(publisher.max_frame_bytes, publisher.frame_size, self._fail)
         if self._protocol == "crewai":
             return NativeEncoder(snapshotter, fitter)
@@ -241,7 +241,7 @@ class CrewAIStream:
                     self._emit(self._encoder.finish(error))
                 except Exception as failure:
                     self._fail(failure)
-        if error is None or (isinstance(error, CANCELLATIONS) and self._on_cancel == "end"):
+        if error is None or (isinstance(error, CANCELLATIONS) and self._close_on_cancel == "end"):
             return "end"
         return "fail"
 
@@ -329,9 +329,9 @@ def publish(
     run_id: str | None = None,
     include: Collection[str] | None = None,
     exclude: Collection[str] = (),
-    max_text_chars: int | None = 16_000,
+    max_field_bytes: int | None = 16_384,
     expose_errors: bool = False,
-    on_cancel: Outcome = "fail",
+    close_on_cancel: Outcome = "fail",
     transport: Literal["auto", "sink", "bus"] = "auto",
 ) -> CrewAIStream:
     """Publishes everything CrewAI emits inside a ``with`` (or ``async with``) block to one IQ stream.
@@ -343,10 +343,10 @@ def publish(
       type), or an ``Encoder``.
     - ``thread_id``, ``run_id``: AG-UI's ids of the run; by default the stream id and a new uuid.
     - ``include``, ``exclude``: the CrewAI event types the encoder sees (``EVENT_TYPES`` by default).
-    - ``max_text_chars``: tool results, task outputs and other text values are cut to this many characters, with a
-      marker; ``None`` cuts nothing. Frames are also cut, or split, to fit the publisher's ``max_frame_bytes``.
+    - ``max_field_bytes``: tool results, task outputs and other text values are cut to this many bytes of UTF-8, with
+      a marker; ``None`` cuts nothing. Frames are also cut, or split, to fit the publisher's ``max_frame_bytes``.
     - ``expose_errors``: publish error messages as they are; by default every one is "An error occurred.".
-    - ``on_cancel``: the close line after a cancellation (``CancelledError``, ``KeyboardInterrupt``).
+    - ``close_on_cancel``: the close line after a cancellation (``CancelledError``, ``KeyboardInterrupt``).
     - ``transport``: ``"sink"`` (a scoped stream sink, CrewAI 1.15.2 and later), ``"bus"`` (handlers on the global
       event bus: degraded, for CrewAI without stream sinks), or ``"auto"``.
     """
@@ -358,8 +358,8 @@ def publish(
         run_id=run_id,
         include=include,
         exclude=exclude,
-        max_text_chars=max_text_chars,
+        max_field_bytes=max_field_bytes,
         expose_errors=expose_errors,
-        on_cancel=on_cancel,
+        close_on_cancel=close_on_cancel,
         transport=transport,
     )

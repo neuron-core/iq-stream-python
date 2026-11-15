@@ -29,14 +29,25 @@ def dumps(value: object) -> str:
 
 
 def marker(dropped: int) -> str:
-    return f"… [{dropped} characters truncated]"
+    """What replaces the end of a value that was cut: how many bytes of UTF-8 were dropped."""
+    return f"… [{dropped} bytes truncated]"
 
 
-def cut_text(text: str, max_chars: int | None) -> str:
-    """``text`` cut to ``max_chars`` characters plus a marker that says how many were dropped."""
-    if max_chars is None or len(text) <= max_chars:
+def utf8_size(text: str) -> int:
+    # surrogatepass: a lone surrogate, which JSON text can carry, counts for the three bytes it is written with.
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def cut_text(text: str, max_bytes: int | None) -> str:
+    """``text`` cut to ``max_bytes`` bytes of UTF-8, at a character's boundary, plus a marker that says how many bytes
+    were dropped."""
+    if max_bytes is None or 4 * len(text) <= max_bytes:
         return text
-    return text[:max_chars] + marker(len(text) - max_chars)
+    data = text.encode("utf-8", "surrogatepass")
+    if len(data) <= max_bytes:
+        return text
+    kept = data[:max_bytes].decode("utf-8", "ignore")  # without a character cut in two
+    return kept + marker(len(data) - utf8_size(kept))
 
 
 def _cost(char: str) -> int:
@@ -138,10 +149,11 @@ class Fitter:
         texts = {key: target[key] if isinstance(target[key], str) else dumps(target[key]) for key in present}
         for key in sorted(present, key=lambda name: len(texts[name]), reverse=True):
             text = texts[key]
-            target[key] = marker(len(text))  # the longest the marker can be
+            size = utf8_size(text)
+            target[key] = marker(size)  # the longest the marker can be
             budget = self.limit - self._frame_size(dumps(shrunk), event)
             end = _prefix(text, 0, budget) if budget > 0 else 0
-            target[key] = text[:end] + marker(len(text) - end)
+            target[key] = text[:end] + marker(size - utf8_size(text[:end]))
             data = dumps(shrunk)
             if self.fits(data, event):
                 return [(event, data)]

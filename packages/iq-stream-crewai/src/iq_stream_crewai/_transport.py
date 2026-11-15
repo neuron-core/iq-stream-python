@@ -128,35 +128,59 @@ def _register() -> None:
         _registered = True
 
 
-def _order(event: BaseEvent) -> tuple[float, int]:
-    """Where an event goes among the others. ``emission_sequence`` restarts at every top-level kickoff, so it orders
-    only the events of one kickoff; the time the event was made, in the emitting thread, orders the kickoffs."""
-    stamp: object = getattr(event, "timestamp", None)
-    made = stamp.timestamp() if isinstance(stamp, datetime) else time.time()
-    return made, event.emission_sequence or 0
+def _counter_variable() -> contextvars.ContextVar[object] | None:
+    """CrewAI's emission counter: a new one at every top-level kickoff, shared by the threads and tasks of that
+    kickoff, the iterator ``emission_sequence`` comes from."""
+    from crewai.events import base_events
+
+    variable: object = getattr(base_events, "_emission_counter", None)
+    return variable if isinstance(variable, contextvars.ContextVar) else None  # pyright: ignore[reportUnknownVariableType]
 
 
 class BusTransport:
     """Handlers on the global event bus. They run in the bus's thread pool, after any other listener of the same
     event and out of emission order, so a writer thread holds each event for ``window`` seconds and releases what it
-    holds in the order the events were made; on exit the bus is flushed first. Degraded: it adds latency, depends on
-    a timing margin, and ``flush()`` waits for every listener in the process."""
+    holds in the order the events were emitted; on exit the bus is flushed first. Degraded: it adds latency, depends
+    on a timing margin, and ``flush()`` waits for every listener in the process."""
 
     blocking = True
 
     def __init__(self, snapshot: Snapshot, deliver: Deliver, window: float = 0.05, flush_timeout: float = 30.0) -> None:
-        self._snapshot = snapshot
-        self._deliver = deliver
+        self._snapshot: Snapshot | None = snapshot
         self._window = window
         self._flush_timeout = flush_timeout
         self._queue: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._token: contextvars.Token[BusTransport | None] | None = None
-        self._writer = threading.Thread(target=self._write, name="iq-stream-crewai bus", daemon=True)
+        self._writer = threading.Thread(target=self._write, args=(deliver,), name="iq-stream-crewai bus", daemon=True)
+        self._counter = _counter_variable()
+        # The kickoffs seen, by their emission counter: when the first of their events was made, and in which order
+        # they were seen.
+        self._kickoffs: dict[object, tuple[float, int]] = {}
+        self._kickoffs_lock = threading.Lock()
 
     def take(self, source: object, event: BaseEvent) -> None:
-        snapshot = self._snapshot(source, event)
+        take = self._snapshot
+        if take is None:
+            return  # settled: nothing more is delivered
+        snapshot = take(source, event)
         if snapshot is not None:
-            self._queue.put((_order(event), time.monotonic(), snapshot))
+            self._queue.put((self._order(event), time.monotonic(), snapshot))
+
+    def _order(self, event: BaseEvent) -> tuple[float, int, int]:
+        """Where an event goes among the others. ``emission_sequence`` orders the events of one kickoff, whatever the
+        clock does; it restarts at every top-level kickoff, so the kickoffs are ordered by the time their first event
+        seen here was made, then by the order they were seen. Runs in a copy of the emitting context."""
+        sequence = event.emission_sequence or 0
+        stamp: object = getattr(event, "timestamp", None)
+        made = stamp.timestamp() if isinstance(stamp, datetime) else time.time()
+        counter = None if self._counter is None else self._counter.get(None)
+        if counter is None:
+            return made, 0, sequence  # a CrewAI without the counter: the clock
+        with self._kickoffs_lock:
+            kickoff = self._kickoffs.get(counter)
+            if kickoff is None:
+                kickoff = self._kickoffs[counter] = (made, len(self._kickoffs))
+        return (*kickoff, sequence)
 
     def attach(self) -> None:
         _register()
@@ -176,9 +200,14 @@ class BusTransport:
         crewai_event_bus.flush(timeout=self._flush_timeout)
         self._queue.put(_STOP)
         self._writer.join(self._flush_timeout)
+        # Copies of the block's context outlive it, the one CrewAI's event loop was created in among them, and keep
+        # this transport in _active: it lets go of the stream (the writer, which delivers, has ended).
+        self._snapshot = None
+        with self._kickoffs_lock:
+            self._kickoffs.clear()
 
-    def _write(self) -> None:
-        held: list[tuple[tuple[float, int], int, float, object]] = []
+    def _write(self, deliver: Deliver) -> None:
+        held: list[tuple[tuple[float, int, int], int, float, object]] = []
         count = 0
         stopping = False
         while not stopping or held:
@@ -194,4 +223,4 @@ class BusTransport:
                 heapq.heappush(held, (order, count, arrived, snapshot))  # pyright: ignore[reportUnknownArgumentType]
             now = time.monotonic()
             while held and (stopping or now - held[0][2] >= self._window):
-                self._deliver(heapq.heappop(held)[3])
+                deliver(heapq.heappop(held)[3])

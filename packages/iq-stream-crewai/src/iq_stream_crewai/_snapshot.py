@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from crewai.events.base_events import BaseEvent
 
@@ -51,9 +51,9 @@ EVENT_FIELDS: Mapping[str, tuple[str, ...]] = {
     "tool_usage_started": ("tool_name", "tool_args", "agent_id", "agent_role", "task_id"),
     "tool_usage_finished": ("tool_name", "tool_args", "agent_id", "task_id", "output", "from_cache"),
     "tool_usage_error": ("tool_name", "tool_args", "agent_id", "task_id", "error"),
-    "flow_started": ("flow_name",),
-    "flow_finished": ("flow_name",),
-    "flow_failed": ("flow_name", "error"),
+    "flow_started": ("flow_name", "flow_id"),
+    "flow_finished": ("flow_name", "flow_id"),
+    "flow_failed": ("flow_name", "flow_id", "error"),
     "flow_paused": ("flow_name", "flow_id", "method_name", "message", "emit"),
     "method_execution_started": ("flow_name", "method_name"),
     "method_execution_finished": ("flow_name", "method_name"),
@@ -62,13 +62,17 @@ EVENT_FIELDS: Mapping[str, tuple[str, ...]] = {
     "human_feedback_received": ("flow_name", "method_name", "feedback", "outcome", "request_id"),
 }
 
-# Published as text, and cut to max_text_chars: outputs are arbitrary objects, and a task's name is its whole
+# Published as text, and cut to max_field_bytes: outputs are arbitrary objects, and a task's name is its whole
 # description when it has no name.
 _TEXT = frozenset({"output", "error", "message", "feedback", "task_name"})
 # JSON values copied, so that later changes to the event's objects do not reach the wire.
 _JSON = frozenset({"tool_args", "usage", "emit"})
 # Agent execution events carry the agent and the task, not their ids.
 _OWNED = {"agent_id": ("agent", "id"), "agent_role": ("agent", "role"), "task_id": ("task", "id")}
+
+
+#: What a scope is to ``Snapshotter.admit``: CrewAI's own from top to bottom, or CrewAI's work around an agent's run.
+Role = Literal["own", "work"]
 
 
 class Scope(NamedTuple):
@@ -81,10 +85,12 @@ class Scope(NamedTuple):
     started: str | None
     #: Whether the event opens a scope.
     opens: bool
-    #: Whether the scope it opens is CrewAI's own work.
-    machinery: bool
+    #: What the scope it opens is, if anything to ``admit``.
+    role: Role | None
     #: A model event that names no agent.
     agentless: bool
+    #: For CrewAI's summary of a full context window: True as it starts, False as it ends.
+    summary: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -134,18 +140,28 @@ def _copy_json(value: object) -> object:
     return json.loads(dumps(value))
 
 
-#: Where CrewAI works for itself: an agent's run, a task, a memory save or search. Inside, a model call that names no
-#: agent is CrewAI's own (memory analysis, output conversion), not an answer.
-_MACHINERY = frozenset(
-    {"agent_execution_started", "lite_agent_execution_started", "task_started"}
+#: Scopes whose whole content is CrewAI's own, its agents' calls included: a task's guardrail, an agent's reasoning
+#: and evaluation, memory, knowledge queries.
+_OWN = frozenset(
+    {"llm_guardrail_started", "agent_reasoning_started", "agent_evaluation_started"}
     | {"memory_save_started", "memory_query_started", "memory_retrieval_started"}
+    | {"knowledge_query_started", "knowledge_search_query_started"}
 )
-_STARTS = _OPENS | _MACHINERY
+#: Scopes in which a model call directly inside that names no agent is CrewAI's own: the conversion of a task's or an
+#: agent's output, memory's extraction after an agent's run. The agent's own loop, a flow inside, is not.
+_WORK = frozenset({"task_started", "agent_execution_started", "lite_agent_execution_started"})
+#: CrewAI's summary of a full context window: model calls with no agent, in the agent's loop, between these.
+_SUMMARY = {
+    "context_window_summarization_started": True,
+    "context_window_summarization_completed": False,
+    "context_window_summarization_failed": False,
+}
+_STARTS = _OPENS | _OWN | _WORK
 _LLM = frozenset(kind for kind in EVENT_FIELDS if kind.startswith("llm_"))
 _INTERNAL_FLOWS = frozenset({"AgentExecutor", "RecallFlow", "EncodingFlow"})
 
 #: The event types the adapter follows, published or not, to know where an event was emitted.
-SCOPE_TYPES: frozenset[str] = _STARTS | _ENDS
+SCOPE_TYPES: frozenset[str] = _STARTS | _ENDS | _SUMMARY.keys()
 
 
 def _is_internal_flow(source: object) -> bool:
@@ -157,45 +173,80 @@ def _is_internal_flow(source: object) -> bool:
     return kind.__name__ in _INTERNAL_FLOWS and kind.__module__.startswith("crewai.")
 
 
+def _is_agent_loop(source: object) -> bool:
+    """The flow an agent runs its model and its tools in: what happens there is the agent's."""
+    kind = type(source)
+    return kind.__name__ == "AgentExecutor" and kind.__module__.startswith("crewai.")
+
+
+def _is_crewai_task(source: object) -> bool:
+    """A task CrewAI makes for itself (``Crew(planning=True)``'s plan, ``crew.test()``'s evaluation), known by its
+    output model, which is CrewAI's."""
+    model: object = getattr(source, "output_pydantic", None)
+    return isinstance(model, type) and model.__module__.startswith("crewai.")
+
+
+def _role(source: object, kind: str) -> Role | None:
+    if kind in _OWN:
+        return "own"
+    if kind == "flow_started":
+        return "own" if _is_internal_flow(source) and not _is_agent_loop(source) else None
+    if kind == "task_started" and _is_crewai_task(source):
+        return "own"
+    return "work" if kind in _WORK else None
+
+
 class Snapshotter:
     """Turns an event into a ``Snapshot``: cheap, and it never keeps a reference to the event. ``admit`` then says,
     in the order the events are delivered, which ones are published."""
 
-    def __init__(self, types: frozenset[str], max_text_chars: int | None, expose_errors: bool) -> None:
+    def __init__(self, types: frozenset[str], max_field_bytes: int | None, expose_errors: bool) -> None:
         self.types = types
-        self._max_text_chars = max_text_chars
+        self._max_field_bytes = max_field_bytes
         self._expose_errors = expose_errors
-        # The open scopes inside CrewAI's own work, by the event_id of the event that opened them.
-        self._machinery: set[str] = set()
+        # The open scopes admit cares about, by the event_id of the event that opened them.
+        self._open: dict[str, Role] = {}
+        # The scopes in which CrewAI is summarizing a full context window.
+        self._summarizing: set[str] = set()
 
     def admit(self, snapshot: Snapshot) -> bool:
         """Whether to publish the event, following the scopes it opens and closes. Called under the stream's lock, in
-        delivery order, where a scope's opening event comes before anything emitted inside it."""
+        delivery order, where a scope's opening event comes before anything emitted inside it.
+
+        CrewAI's own is left out on positive evidence: whatever is inside a scope that is CrewAI's own, and a model
+        call that names no agent directly inside a task or an agent's run (outside the agent's loop) or while CrewAI
+        summarizes the context. Anything else is published, whoever made it."""
         scope = snapshot.scope
         if scope is None:
             return snapshot.publish
-        inside = scope.parent in self._machinery
+        around = self._open.get(scope.parent) if scope.parent is not None else None
+        hidden = around == "own" or (scope.agentless and (around == "work" or scope.parent in self._summarizing))
         if scope.opens:
-            if inside or scope.machinery:
-                self._machinery.add(scope.event_id)
+            # A hidden scope hides what is emitted inside it: the chunks of a hidden model call.
+            role: Role | None = "own" if hidden else scope.role
+            if role is not None:
+                self._open[scope.event_id] = role
+            hidden = role == "own"
         elif scope.started is not None:
-            self._machinery.discard(scope.started)
-        # Inside an agent's run, a task or memory, a model call that names no agent is CrewAI's own.
-        return snapshot.publish and not (inside and scope.agentless)
+            hidden = self._open.pop(scope.started, None) == "own" or hidden
+        if scope.summary is not None and scope.parent is not None:
+            if scope.summary:
+                self._summarizing.add(scope.parent)
+            else:
+                self._summarizing.discard(scope.parent)
+        return snapshot.publish and not hidden
 
     def _scope(self, source: object, event: BaseEvent, kind: str) -> Scope:
         parent: object = getattr(event, "parent_event_id", None)
         started: object = getattr(event, "started_event_id", None)
-        opens = kind in _STARTS
-        machinery = kind in _MACHINERY or (kind == "flow_started" and _is_internal_flow(source))
-        agentless = kind in _LLM and getattr(event, "agent_id", None) is None
         return Scope(
             event.event_id,
             parent if isinstance(parent, str) else None,
             started if isinstance(started, str) else None,
-            opens,
-            machinery,
-            agentless,
+            kind in _STARTS,
+            _role(source, kind),
+            kind in _LLM and getattr(event, "agent_id", None) is None,
+            _SUMMARY.get(kind),
         )
 
     def __call__(self, source: object, event: BaseEvent) -> Snapshot | None:
@@ -215,12 +266,14 @@ class Snapshotter:
                 owner, attribute = _OWNED[name]
                 value = getattr(getattr(event, owner, None), attribute, None)
                 value = None if value is None else str(value)
+            elif value is None and name == "flow_id":
+                value = getattr(source, "flow_id", None) or None  # the flow's own events carry only its name
             if value is None:
                 continue
             if name == "error" and not self._expose_errors:
                 value = MASKED
             elif name in _TEXT:
-                value = cut_text(as_text(value), self._max_text_chars)
+                value = cut_text(as_text(value), self._max_field_bytes)
             elif name in _JSON:
                 value = _copy_json(value)
             fields[name] = value

@@ -35,12 +35,13 @@ if (capture.protocol === 'ag-ui') {
   const agent = new StreamAgent({ start: async () => ({ url: 'http://iq.test/stream-id?token=sub' }) });
   const types = [];
   let outcome = null;
+  let interrupts = null;
   let runError = null;
   let error = null;
   try {
     await agent.runAgent({}, {
       onEvent: ({ event }) => { types.push(event.type); },
-      onRunFinishedEvent: (params) => { outcome = params.outcome; },
+      onRunFinishedEvent: (params) => { outcome = params.outcome; interrupts = params.interrupts ?? null; },
       onRunErrorEvent: ({ event }) => { outcome = 'error'; runError = { message: event.message, code: event.code }; },
     });
   } catch (failure) {
@@ -52,7 +53,7 @@ if (capture.protocol === 'ag-ui') {
     toolCalls: message.toolCalls?.map((call) => ({ name: call.function.name, arguments: call.function.arguments })),
     toolCallId: message.toolCallId,
   }));
-  console.log(JSON.stringify({ types, outcome, runError, error, messages }));
+  console.log(JSON.stringify({ types, outcome, interrupts, runError, error, messages }));
 } else {
   const { subscribe } = await load('@neuron-core/iq-stream/client');
   const received = [];
