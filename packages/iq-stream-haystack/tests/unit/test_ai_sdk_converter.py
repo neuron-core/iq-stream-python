@@ -5,9 +5,9 @@ from collections.abc import Hashable, Iterable
 
 from haystack.dataclasses import StreamingChunk
 from haystack.dataclasses.streaming_chunk import ToolCallDelta
+from iq_stream import frame_size
 
 from haystack_integrations.iq_stream import AISDKConverter
-from haystack_integrations.iq_stream.converters.base import frame_size
 from tests.checks import verify_ai_sdk
 from tests.fakes import RESULTS_DONE, result_chunk, text_turn, tool_turn, weather_call
 

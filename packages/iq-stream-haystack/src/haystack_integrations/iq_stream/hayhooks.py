@@ -2,7 +2,7 @@
 ``run_api_async`` (``start_stream``) or ``run_api`` (``start_stream_sync``), or any other server route.
 
 The run is published from the serving process, in a task or a thread of its own, inside an ``IQStream`` block;
-``on_result`` is where the application saves the result, before the stream's close line. These helpers do not
+``before_close`` is where the application saves the result, before the stream's close line. These helpers do not
 import Hayhooks, so they serve FastAPI routes just as well.
 """
 
@@ -14,19 +14,39 @@ import inspect
 import logging
 import threading
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from haystack import Pipeline
 from haystack.components.agents import Agent
 from haystack.dataclasses import StreamingCallbackT
-from iq_stream import IQClient
+from iq_stream import IQClient, IQError, Outcome
 
-from .stream import IQStream
+from .converters import ChunkConverter
+from .stream import IQStream, ProtocolName
+
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
 
 logger = logging.getLogger("haystack_integrations.iq_stream")
 
 Target = Agent | Pipeline
-OnResult = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+BeforeClose = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+
+
+class StreamOptions(TypedDict, total=False):
+    """The options of ``IQStream`` that the helpers pass on."""
+
+    stream_id: str | None
+    protocol: ProtocolName | ChunkConverter
+    thread_id: str | None
+    run_id: str | None
+    include_tool_results: bool
+    max_tool_result_bytes: int
+    expose_errors: bool
+    close_on_cancel: Outcome
+    close_timeout: float
+    on_error: Callable[[IQError], object] | None
+
 
 # The event loop keeps only weak references to tasks: these keep the runs alive until they end.
 _TASKS: set[asyncio.Task[None]] = set()
@@ -37,23 +57,25 @@ async def start_stream(
     target: Target,
     run_args: Mapping[str, Any],
     *,
-    on_result: OnResult | None = None,
+    before_close: BeforeClose | None = None,
     ttl: float = 3600,
-    **stream_options: Any,
+    **stream_options: Unpack[StreamOptions],
 ) -> dict[str, str | int]:
     """Starts ``target`` in a task of the running loop and returns the ticket's ``to_dict()`` (``streamId``,
     ``token``, ``url``, ``expiresAt``) without waiting for it.
 
     ``run_args`` are the keyword arguments of ``Agent.run_async``, or the data of ``Pipeline.run_async`` in its
     nested form (``{"component": {"input": ...}}``); the stream's callback is given to the agent, or to every
-    component of the pipeline that takes a ``streaming_callback``. ``on_result(stream_id, result)``, sync or async,
-    runs inside the stream's block, before its close line. ``stream_options`` go to ``IQStream`` (``stream_id``,
-    ``protocol``, ...). An exception in the run closes the stream with ``fail`` and is logged.
+    component of the pipeline that takes a ``streaming_callback``. ``before_close(stream_id, result)``, sync or
+    async, runs inside the stream's block, before its close line. ``stream_options`` go to ``IQStream``
+    (``stream_id``, ``protocol``, ``thread_id``, ``close_on_cancel``, ...). An exception in the run closes the stream
+    with ``fail`` and is logged; so is a publishing failure that leaves the block with a client opened with
+    ``on_error="raise"``.
     """
     stream = IQStream(client, **stream_options)
     kwargs = _arguments(stream, target, run_args, sync=False)
     ticket = client.ticket(stream.stream_id, ttl)
-    task = asyncio.create_task(_run_async(stream, target, kwargs, on_result))
+    task = asyncio.create_task(_run_async(stream, target, kwargs, before_close))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
     return ticket.to_dict()
@@ -64,19 +86,19 @@ def start_stream_sync(
     target: Target,
     run_args: Mapping[str, Any],
     *,
-    on_result: Callable[[str, dict[str, Any]], object] | None = None,
+    before_close: Callable[[str, dict[str, Any]], object] | None = None,
     ttl: float = 3600,
-    **stream_options: Any,
+    **stream_options: Unpack[StreamOptions],
 ) -> dict[str, str | int]:
     """``start_stream`` for synchronous code: ``target.run()`` in a thread of its own, under a copy of the caller's
-    context, and ``on_result`` called in that thread."""
+    context, and ``before_close`` called in that thread."""
     stream = IQStream(client, **stream_options)
     kwargs = _arguments(stream, target, run_args, sync=True)
     ticket = client.ticket(stream.stream_id, ttl)
     context = contextvars.copy_context()
     thread = threading.Thread(
         target=context.run,
-        args=(_run_sync, stream, target, kwargs, on_result),
+        args=(_run_sync, stream, target, kwargs, before_close),
         name=f"iq-stream-haystack {stream.stream_id}",
         daemon=True,
     )
@@ -95,30 +117,43 @@ def _arguments(stream: IQStream, target: Target, run_args: Mapping[str, Any], *,
     raise TypeError("target must be a Haystack Agent or Pipeline.")
 
 
-async def _run_async(stream: IQStream, target: Target, kwargs: dict[str, Any], on_result: OnResult | None) -> None:
+async def _run_async(
+    stream: IQStream, target: Target, kwargs: dict[str, Any], before_close: BeforeClose | None
+) -> None:
+    ran = False
     try:
         async with stream:
             result = await target.run_async(**kwargs)
-            if on_result is not None:
-                saved = on_result(stream.stream_id, result)
+            if before_close is not None:
+                saved = before_close(stream.stream_id, result)
                 if inspect.isawaitable(saved):
                     await saved
-    except Exception:
-        logger.exception("IQ stream %s: the run failed.", stream.stream_id)
+            ran = True
+    except Exception as error:
+        _log_failure(stream, error, ran)
 
 
 def _run_sync(
     stream: IQStream,
     target: Target,
     kwargs: dict[str, Any],
-    on_result: Callable[[str, dict[str, Any]], object] | None,
+    before_close: Callable[[str, dict[str, Any]], object] | None,
 ) -> None:
+    ran = False
     try:
         with stream:
             result = target.run(**kwargs)
-            if on_result is not None:
-                on_result(stream.stream_id, result)
-    except Exception:
+            if before_close is not None:
+                before_close(stream.stream_id, result)
+            ran = True
+    except Exception as error:
+        _log_failure(stream, error, ran)
+
+
+def _log_failure(stream: IQStream, error: Exception, ran: bool) -> None:
+    if ran and error is stream.error:  # leaving raised the publisher's IQError: its client has on_error="raise"
+        logger.warning("%s; the run itself completed, and before_close ran.", error)
+    else:
         logger.exception("IQ stream %s: the run failed.", stream.stream_id)
 
 
@@ -134,9 +169,9 @@ def _callback(stream: IQStream, component: object, theirs: Any = None, *, sync: 
 def _awaits_callback(component: object) -> bool:
     """Whether every chat generator that would get the callback from ``component`` in ``run_async`` has ``run_async``
     of its own. False when that is not known: an agent that passes its callback to tools hands it to sub-agents
-    and functions whose way of calling it cannot be seen."""
+    and functions whose way of calling it cannot be seen, whether they were given at construction or at run time."""
     if isinstance(component, Agent):
-        if component.tool_streaming_callback_passthrough and component.tools:
+        if component.tool_streaming_callback_passthrough:
             return False
         return _awaits_callback(component.chat_generator)
     if not getattr(component, "__haystack_supports_async__", False):

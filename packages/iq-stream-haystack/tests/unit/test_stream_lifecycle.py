@@ -9,6 +9,7 @@ import math
 import re
 import threading
 import time
+from collections.abc import Hashable
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +18,10 @@ from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage, StreamingChunk
 from haystack.hooks.human_in_the_loop import ConfirmationHook, ToolExecutionDecision
 from haystack.tools import tool
-from iq_stream import IQClient, IQError, Outcome, PublishResult
+from iq_stream import IQClient, IQError, Outcome, PublishResult, frame_size
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
-from haystack_integrations.iq_stream import IQStream
-from haystack_integrations.iq_stream.converters.base import frame_size
+from haystack_integrations.iq_stream import AGUIConverter, Frame, IQStream
 from tests.checks import verify_agui, verify_ai_sdk
 from tests.fakes import ScriptedChatGenerator, Turn, text_turn, tool_turn, weather_call, weather_script
 
@@ -106,8 +106,8 @@ def test_a_failing_tool_without_raise_on_failure_is_an_error_result_and_the_run_
     assert "db-7" not in "".join(publisher.data)
 
 
-@pytest.mark.parametrize(("cancelled_close", "outcome"), [("fail", "fail"), ("end", "end")])
-async def test_a_cancelled_run_finishes_cancelled_and_closes_as_configured(cancelled_close: str, outcome: str) -> None:
+@pytest.mark.parametrize(("close_on_cancel", "outcome"), [("fail", "fail"), ("end", "end")])
+async def test_a_cancelled_run_finishes_cancelled_and_closes_as_configured(close_on_cancel: str, outcome: str) -> None:
     started = asyncio.Event()
 
     @tool
@@ -122,7 +122,7 @@ async def test_a_cancelled_run_finishes_cancelled_and_closes_as_configured(cance
     publisher = RecordingPublisher()
 
     async def run() -> None:
-        async with IQStream(publisher, cancelled_close=cancelled_close) as stream:  # pyright: ignore[reportArgumentType]
+        async with IQStream(publisher, close_on_cancel=close_on_cancel) as stream:  # pyright: ignore[reportArgumentType]
             await agent.run_async(QUESTION, streaming_callback=stream.acallback)
 
     task = asyncio.create_task(run())
@@ -271,12 +271,13 @@ def test_a_publisher_that_raises_is_reported_once_and_the_stream_closes_with_fai
             return super().send(data, event)
 
     publisher = Raises()
-    reported: list[Exception] = []
+    reported: list[IQError] = []
     with IQStream(publisher, on_error=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
-    assert [str(error) for error in reported] == ["socket exploded"]
+    assert [(error.code, str(error.__cause__)) for error in reported] == [("publish_failed", "socket exploded")]
     assert publisher.outcome == "fail" and stream.failed and len(publisher.data) == 2
+    assert stream.error is reported[0]
 
 
 def test_a_converter_that_raises_is_logged_once_without_data_and_the_run_goes_on(
@@ -303,7 +304,32 @@ def test_a_converter_that_raises_is_logged_once_without_data_and_the_run_goes_on
     same_run(result)
     warnings = [record.getMessage() for record in caplog.records if record.name == "haystack_integrations.iq_stream"]
     assert len(warnings) == 1 and "ValueError" in warnings[0] and "Let" not in warnings[0]
-    assert publisher.outcome == "fail"
+    assert publisher.outcome == "end" and not s.failed  # every chunk was skipped alone; the run completed
+
+
+def test_a_chunk_that_cannot_be_converted_is_skipped_and_the_rest_of_the_run_is_published() -> None:
+    class BreaksOnce(AGUIConverter):
+        chunks = 0
+
+        def convert(self, chunk: StreamingChunk, source: Hashable) -> list[Frame]:
+            self.chunks += 1
+            if self.chunks == 2:
+                raise ValueError("unexpected chunk")
+            return super().convert(chunk, source)
+
+    publisher = RecordingPublisher()
+    reported: list[IQError] = []
+    converter = BreaksOnce(thread_id="thread-1", run_id="run-1")
+    with IQStream(publisher, protocol=converter, on_error=reported.append) as stream:
+        result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    same_run(result)
+    assert [error.code for error in reported] == ["encode_failed"]
+    assert isinstance(reported[0].__cause__, ValueError) and "unexpected" not in str(reported[0])
+    assert publisher.outcome == "end" and not stream.failed
+    conversation = verify_agui(publisher.data)
+    assert conversation.texts == ["Let check.", "It is sunny in Paris."]  # only the chunk "me " is missing
+    assert conversation.results == {"call_1": "Sunny, 21C in Paris"}
+    assert conversation.terminal["type"] == "RUN_FINISHED"
 
 
 def test_with_on_error_raise_the_run_is_read_to_its_end_and_leaving_the_block_raises() -> None:
@@ -335,17 +361,51 @@ def test_with_on_error_raise_the_block_s_own_exception_is_the_one_that_goes_on()
     assert publisher.close_calls == 1
 
 
+def adapter_logs(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == "haystack_integrations.iq_stream"]
+
+
+def test_with_on_error_raise_a_give_up_is_raised_and_never_logged_by_the_adapter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    publisher = GivesUp(on_error="raise")
+    with caplog.at_level(logging.WARNING), pytest.raises(IQError) as raised, IQStream(publisher) as stream:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    assert raised.value is publisher.error and adapter_logs(caplog) == []
+
+
+def test_with_on_error_raise_a_give_up_next_to_the_block_s_exception_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    publisher = GivesUp(on_error="raise")
+    with caplog.at_level(logging.WARNING), pytest.raises(OSError, match="disk full"), IQStream(publisher) as stream:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+        raise OSError("disk full")
+    # The core logs only in report mode, and nothing raised it: the adapter says it once, with the core's text.
+    assert adapter_logs(caplog) == [f"{publisher.error}; the block's own exception goes on."]
+    assert stream.failed and publisher.close_calls == 1
+
+
+def test_in_report_mode_the_core_s_give_up_is_left_to_the_core_s_log(caplog: pytest.LogCaptureFixture) -> None:
+    publisher = GivesUp()
+    with caplog.at_level(logging.WARNING), pytest.raises(OSError), IQStream(publisher) as stream:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+        raise OSError("disk full")
+    assert stream.failed and adapter_logs(caplog) == []
+
+
 def test_a_publisher_that_cannot_open_is_reported_and_the_run_goes_on(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(self: IQClient, stream_id: str) -> Any:
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(IQClient, "publisher", refuse)
     client = IQClient("http://127.0.0.1:9", "demo-app", "test-app-secret-0123456789abcdef0123")
-    reported: list[Exception] = []
+    reported: list[IQError] = []
     with IQStream(client, on_error=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
-    assert stream.failed and stream.result is None and [str(e) for e in reported] == ["can't start new thread"]
+    assert stream.failed and stream.result is None
+    assert [(e.code, str(e.__cause__)) for e in reported] == [("publish_failed", "can't start new thread")]
 
 
 def test_an_on_error_that_raises_is_logged_and_contained(caplog: pytest.LogCaptureFixture) -> None:
@@ -450,11 +510,11 @@ def test_custom_through_a_publisher_that_raises_stops_publishing_and_the_run_goe
                 raise RuntimeError("socket exploded")
             return super().send(data, event)
 
-    reported: list[Exception] = []
+    reported: list[IQError] = []
     with IQStream(Raises(), on_error=reported.append) as stream:
         assert stream.custom("tool_confirmation", {"tool": "get_weather"}) is False
         same_run(weather_agent().run(QUESTION, streaming_callback=stream.callback))
-    assert [str(error) for error in reported] == ["socket exploded"]
+    assert [str(error.__cause__) for error in reported] == ["socket exploded"]
     assert stream.failed and stream.publisher is not None
     assert stream.publisher.outcome == "fail"  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -469,6 +529,93 @@ def test_custom_writes_what_json_cannot_hold_as_its_str_in_every_protocol(protoc
     with IQStream(publisher, protocol=protocol) as stream:  # pyright: ignore[reportArgumentType]
         assert stream.custom("confirm", {"ticket": Ticket(), "at": (1, 2)})
     assert '{"ticket":"ticket-1","at":[1,2]}' in publisher.data[1]
+
+
+def test_emit_never_raises_into_the_run_whatever_its_payload_holds() -> None:
+    from ag_ui.core import CustomEvent
+
+    class Ticket:
+        def __str__(self) -> str:
+            return "ticket-1"
+
+    publisher = RecordingPublisher()
+    reported: list[IQError] = []
+    with IQStream(publisher, on_error=reported.append) as stream:
+        assert stream.emit(CustomEvent(name="confirm", value={"ticket": Ticket()}))  # written as its str()
+        assert stream.emit({("a", 1): "a key JSON cannot hold"}) is False  # dropped and reported
+        assert stream.emit("bad name", event="not a name!") is False
+        cycle: dict[str, object] = {}
+        cycle["self"] = cycle
+        assert stream.emit(cycle) is False
+        result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    same_run(result)
+    assert publisher.data[1] == '{"type":"CUSTOM","name":"confirm","value":{"ticket":"ticket-1"}}'
+    assert [(error.code, type(error.__cause__).__name__) for error in reported] == [
+        ("encode_failed", "TypeError"),
+        ("encode_failed", "ValueError"),
+        ("encode_failed", "ValueError"),
+    ]
+    assert publisher.outcome == "end" and not stream.failed
+
+
+@pytest.mark.parametrize("protocol", ["ag-ui", "ai-sdk", "haystack"])
+def test_a_nan_or_an_infinity_is_written_as_null_in_every_protocol(protocol: str) -> None:
+    from ag_ui.core import CustomEvent
+
+    def strict(data: str) -> Any:
+        return json.loads(data, parse_constant=lambda name: pytest.fail(f"{name} is not JSON"))
+
+    publisher = RecordingPublisher()
+    with IQStream(publisher, protocol=protocol) as stream:  # pyright: ignore[reportArgumentType]
+        assert stream.custom("score", {"confidence": math.nan, "range": [-math.inf, math.inf], "n": 1.5})
+        assert stream.emit({"score": math.nan})
+        assert stream.emit(CustomEvent(name="score", value=math.inf))
+    frames = [strict(data) for data in publisher.data[1:4]]
+    custom = frames[0]["value"] if protocol != "ai-sdk" else frames[0]["data"]
+    assert custom == {"confidence": None, "range": [None, None], "n": 1.5}
+    assert frames[1] == {"score": None} and frames[2]["value"] is None
+
+
+def test_custom_sends_nothing_unless_every_frame_of_it_fits() -> None:
+    class TwoFrames(AGUIConverter):
+        def custom(self, name: str, value: object) -> list[Frame]:
+            return [Frame('{"type":"CUSTOM","name":"part","value":1}'), Frame("x" * 2_000)]
+
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    reported: list[IQError] = []
+    converter = TwoFrames(thread_id="thread-1", run_id="run-1", max_frame_bytes=1024)
+    with IQStream(publisher, protocol=converter, on_error=reported.append) as stream:
+        assert stream.custom("note", None) is False
+    assert not any("part" in data for data in publisher.data)
+    assert [type(error).__name__ for error in reported] == ["FrameTooLarge"]
+    assert publisher.outcome == "end"
+
+
+def test_a_publisher_dead_on_entry_is_reported_before_the_block_runs_even_with_no_start_event() -> None:
+    class Silent:
+        def start(self) -> list[Frame]:
+            return []
+
+        def convert(self, chunk: StreamingChunk, source: object) -> list[Frame]:
+            return []
+
+        def finish(self) -> list[Frame]:
+            return []
+
+        def error(self, exc: BaseException) -> list[Frame]:
+            return []
+
+        cancelled = finish
+
+        def custom(self, name: str, value: object) -> list[Frame]:
+            return []
+
+    publisher = RecordingPublisher()
+    publisher.fail()
+    reported: list[IQError] = []
+    with IQStream(publisher, protocol=Silent(), on_error=reported.append):
+        assert reported == [publisher.error]
+    assert reported == [publisher.error]
 
 
 def test_the_readme_s_confirmation_strategy_survives_arguments_too_large_for_a_frame() -> None:
@@ -525,9 +672,10 @@ def test_creating_a_stream_opens_nothing_and_gives_the_ticket(monkeypatch: pytes
     [
         {"stream_id": "short"},
         {"protocol": "openai"},
-        {"cancelled_close": "maybe"},
+        {"close_on_cancel": "maybe"},
         {"max_tool_result_bytes": 0},
         {"close_timeout": -1},
+        {"close_timeout": 0},
         {"close_timeout": math.inf},
         {"close_timeout": math.nan},
     ],
@@ -565,11 +713,11 @@ def test_a_close_that_raises_is_retried_with_fail_so_the_stream_is_never_left_op
             return super().close(outcome, timeout)
 
     publisher = CloseBreaksOnce()
-    reported: list[Exception] = []
+    reported: list[IQError] = []
     with IQStream(publisher, on_error=reported.append) as stream:
         weather_agent().run(QUESTION, streaming_callback=stream.callback)
     assert publisher.outcome == "fail" and not publisher.alive
-    assert [str(error) for error in reported] == ["close broke"]
+    assert [str(error.__cause__) for error in reported] == ["close broke"]
     assert stream.result is not None and stream.result.outcome == "fail"
 
 

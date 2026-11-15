@@ -9,7 +9,7 @@ description = "Publish Haystack agent and pipeline runs to browsers through an I
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [{ name = "Neuron Core" }]
 keywords = ["haystack", "haystack-ai", "agents", "ag-ui", "ai-sdk", "sse", "server-sent-events", "streaming", "iq-stream"]
 classifiers = [
@@ -19,6 +19,7 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -48,8 +49,11 @@ dev = [
 
 [tool.uv]
 # The versions the plan (SDKs/haystack.md) was researched and prototyped against; the ranges above stay wide.
+# haystack-ai is capped rather than pinned: `uv pip install` in the package directory honours these constraints, and
+# the floor below must install over the lockfile. The lockfile holds 3.5.0, and on Python 3.10, which haystack-ai 3.4
+# and later do not support, 3.3.0.
 constraint-dependencies = [
-    "haystack-ai==3.5.0",
+    "haystack-ai<=3.5.0",
     "hayhooks==2.3.0",
     "fastapi-openai-compat==1.4.0",
     "ag-ui-protocol==1.0.0",
@@ -58,6 +62,11 @@ constraint-dependencies = [
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
+
+# The lowest versions of the declared ranges, which CI installs over the lockfile to run the unit tests on the lowest
+# Python of the classifiers.
+[tool.iq-stream]
+floor = ["haystack-ai==3.0.0", "ag-ui-protocol==1.0.0", "hayhooks==2.3.0"]
 
 # haystack_integrations is a namespace shared with every Haystack integration: the wheel holds our part only,
 # with no __init__.py above it.
@@ -78,7 +87,7 @@ filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
@@ -90,4 +99,4 @@ known-third-party = ["iq_stream"]
 [tool.pyright]
 include = ["src"]
 typeCheckingMode = "strict"
-pythonVersion = "3.11"
+pythonVersion = "3.10"

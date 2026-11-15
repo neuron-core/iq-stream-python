@@ -32,7 +32,7 @@ def test_a_run_with_a_tool_call_arrives_in_order_once_and_ends(iq_client: IQClie
     assert conversation.results == {"call_1": "Sunny, 21C in Paris"}
     assert received.terminal is not None and received.terminal.event == "iq:end"
     assert received.terminal.data == {"lastEventId": len(data)}
-    assert stream.publisher is not None and stream.publisher.requests == 1  # pyright: ignore[reportAttributeAccessIssue]
+    assert stream.publisher is not None and stream.publisher.requests == 1
     assert stream.result is not None and stream.result.last_event_id == len(data)
     assert result["last_message"].text == "It is sunny in Paris."
     # Relayed while the run went on: the call's end reached the browser before the tool had answered.
@@ -85,13 +85,13 @@ def test_a_tool_silent_past_the_read_timeout_keeps_one_request(iq_servers: TestS
     conversation = verify_agui(in_order_once(received))
     assert conversation.results == {"call_1": "Sunny, 21C in Paris"}
     assert received.terminal is not None and received.terminal.event == "iq:end"
-    assert stream.publisher is not None and stream.publisher.requests == 1  # pyright: ignore[reportAttributeAccessIssue]
+    assert stream.publisher is not None and stream.publisher.requests == 1
     assert not stream.failed
 
 
-@pytest.mark.parametrize(("cancelled_close", "terminal"), [("fail", "iq:fail"), ("end", "iq:end")])
+@pytest.mark.parametrize(("close_on_cancel", "terminal"), [("fail", "iq:fail"), ("end", "iq:end")])
 async def test_a_cancelled_run_tells_the_browser(
-    iq_client: IQClient, iq_servers: TestServers, cancelled_close: str, terminal: str
+    iq_client: IQClient, iq_servers: TestServers, close_on_cancel: str, terminal: str
 ) -> None:
     started = asyncio.Event()
     agent = Agent(chat_generator=ScriptedChatGenerator(tool_turn_and_answer()), tools=[async_weather_tool(30, started)])
@@ -99,7 +99,7 @@ async def test_a_cancelled_run_tells_the_browser(
     subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
 
     async def run() -> None:
-        options = {"cancelled_close": cancelled_close}
+        options = {"close_on_cancel": close_on_cancel}
         async with IQStream(iq_client, ticket.stream_id, **options) as stream:  # pyright: ignore[reportArgumentType]
             await agent.run_async(QUESTION, streaming_callback=stream.acallback)
 
@@ -261,7 +261,7 @@ def test_a_confirmation_that_waits_past_the_read_timeout_keeps_the_stream(iq_ser
     by_type = {json.loads(frame.data)["type"]: frame.at for frame in received.frames}
     assert by_type["TOOL_CALL_RESULT"] - by_type["CUSTOM"] >= 2.5
     assert received.terminal is not None and received.terminal.event == "iq:end"
-    assert stream.publisher is not None and stream.publisher.requests == 1  # pyright: ignore[reportAttributeAccessIssue]
+    assert stream.publisher is not None and stream.publisher.requests == 1
 
 
 def test_a_run_past_the_stream_s_byte_limit_goes_on_unpublished(iq_servers: TestServers) -> None:

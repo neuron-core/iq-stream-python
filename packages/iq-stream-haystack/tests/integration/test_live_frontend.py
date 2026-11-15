@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -23,31 +24,12 @@ from iq_stream.testing import Subscription, TestServers, subscribe_in_background
 
 from haystack_integrations.iq_stream import IQStream
 from tests.fakes import ScriptedChatGenerator, fallback_agent, text_turn, tool_turn, weather_call
-from tests.live import QUESTION, async_weather_tool, failing_agent, recording, weather_agent, weather_tool
+from tests.live import QUESTION, async_weather_tool, failing_agent, js_missing, recording, weather_agent, weather_tool
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 JS_DIR = os.environ.get("IQ_STREAM_JS_DIR", "")
-NEEDED = (
-    "@neuron-core/iq-stream/dist/ag-ui",
-    "@neuron-core/iq-stream/dist/ai-sdk",
-    "@ag-ui/client",
-    "@ag-ui/core",
-    "ai",
-)
 
-
-def _missing() -> str | None:
-    if not JS_DIR:
-        return "IQ_STREAM_JS_DIR is not set: point it at a built checkout of neuron-core/iq-stream-js"
-    for package in NEEDED:
-        if not (Path(JS_DIR) / "node_modules" / package).exists():
-            return f"{package} is missing from {JS_DIR}/node_modules: run npm install and the build there"
-    if shutil.which("node") is None:
-        return "node is not on the PATH"
-    return None
-
-
-pytestmark = pytest.mark.skipif(_missing() is not None, reason=_missing() or "")
+pytestmark = pytest.mark.skipif(js_missing() is not None, reason=js_missing() or "")
 
 
 @pytest.fixture(scope="module")
@@ -209,6 +191,19 @@ def test_ai_sdk_a_custom_event_is_a_data_part(node_dir: Path, iq_client: IQClien
     assert rebuilt["data"] == [
         {"type": "data-tool_confirmation", "data": {"toolCallId": "call_1", "tool": "get_weather"}}
     ]
+
+
+def test_ai_sdk_a_custom_value_with_a_nan_keeps_the_answer(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    def run(stream: IQStream) -> None:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+        stream.custom("score", {"confidence": math.nan})  # as a 0/0 division gives
+
+    rebuilt = rebuild(node_dir, "ai-sdk", published(iq_client, iq_servers, "ai-sdk", run))
+    assert rebuilt["status"] == "ready" and rebuilt["error"] is None
+    assert rebuilt["texts"] == ["Let me check.", "It is sunny in Paris."]
+    assert rebuilt["data"] == [{"type": "data-score", "data": {"confidence": None}}]
 
 
 def test_ai_sdk_a_tool_call_cut_off_by_a_failing_generator_is_an_error_part(

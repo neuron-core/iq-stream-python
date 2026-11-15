@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
+import math
 import threading
 import uuid
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
-from typing import Protocol, TypedDict, Unpack
+from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 from haystack.dataclasses import StreamingChunk, TextContent, ToolCallResult
-from iq_stream import DEFAULT_MAX_FRAME_BYTES, FrameTooLarge
+from iq_stream import DEFAULT_MAX_FRAME_BYTES, FrameTooLarge, frame_size
+
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
 
 #: The text a browser gets in place of an error message, unless the stream exposes errors.
 MASKED_ERROR = "An error occurred."
@@ -25,7 +28,6 @@ INVALID_ARGUMENTS = "The tool call's arguments are not valid JSON."
 MODEL_FINISH = frozenset({"stop", "length", "content_filter", "tool_calls"})
 
 _ENCODER = json.JSONEncoder(ensure_ascii=False)
-_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 @dataclass(frozen=True)
@@ -80,18 +82,35 @@ def new_id(prefix: str) -> str:
 
 
 def dumps(value: object) -> str:
-    """Compact JSON, non-ASCII text unescaped, as the browser's JSON.parse reads it."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-
-
-def frame_size(data: str, event: str | None = None) -> int:
-    """The bytes of a frame's line, without its newline, measured as the core measures it."""
-    head = '{"data":' if event is None else '{"event":"' + event + '","data":'
-    text = head + _ENCODER.encode(data) + "}"
+    """Compact JSON, non-ASCII text unescaped, as the browser's JSON.parse reads it. What JSON cannot hold is written
+    as its ``str()``, and a NaN or an infinity as ``null``, as JSON.stringify writes them: a bare ``NaN`` would make
+    the browser reject the frame."""
     try:
-        return len(text.encode("utf-8"))
-    except UnicodeEncodeError:
-        return len(_SURROGATE.sub(lambda match: f"\\u{ord(match.group()):04x}", text).encode("utf-8"))
+        return _dumps(value)
+    except ValueError:  # a non-finite float, or a reference cycle, which _finite raises again
+        return _dumps(_finite(value, set()))
+
+
+def _dumps(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str, allow_nan=False)
+
+
+def _finite(value: object, seen: set[int]) -> object:
+    """``value`` with every non-finite float in its dicts, lists and tuples replaced by ``None``."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if not isinstance(value, dict | list | tuple):
+        return value
+    marker = id(cast(object, value))
+    if marker in seen:
+        raise ValueError("Circular reference detected")
+    seen.add(marker)
+    if isinstance(value, dict):
+        copy: object = {key: _finite(item, seen) for key, item in cast(dict[object, object], value).items()}
+    else:
+        copy = [_finite(item, seen) for item in cast(list[object] | tuple[object, ...], value)]
+    seen.discard(marker)
+    return copy
 
 
 def result_text(result: ToolCallResult) -> str:
