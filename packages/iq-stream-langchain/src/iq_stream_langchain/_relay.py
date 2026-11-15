@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 
 import langgraph.errors
 from iq_stream import AsyncPublisherLike, FrameTooLarge, IQError, Outcome, PublisherLike
@@ -30,8 +30,7 @@ if TYPE_CHECKING:
     from langgraph.pregel import Pregel  # pyright: ignore[reportMissingTypeStubs]
     from langgraph.types import StreamPart
 
-#: The close line of a cancelled run.
-CancelledOutcome = Literal["fail", "end"]
+T = TypeVar("T")
 
 # A drain request (langgraph 1.2) stops the run on purpose: a cancel, not a failure.
 _DRAINED: tuple[type[BaseException], ...] = tuple(
@@ -41,14 +40,84 @@ _DRAINED: tuple[type[BaseException], ...] = tuple(
 )
 
 
+def check_close_on_cancel(close_on_cancel: object) -> None:
+    if close_on_cancel not in ("fail", "end"):
+        raise ValueError('close_on_cancel is "fail" or "end".')
+
+
 def stopped(pub: PublisherLike | AsyncPublisherLike) -> bool:
     """Whether the publisher takes no more frames. One that gave up with ``on_error="raise"`` raises its error here:
     that option fails the run, and the relay must not keep it quiet by sending nothing."""
     if pub.alive:
         return False
-    if pub.error is not None:
-        pub.send("")  # raises with on_error="raise"; a no-op on a publisher that gave up otherwise
+    if pub.error is not None and pub.on_error == "raise":
+        raise pub.error.with_traceback(None)
     return True
+
+
+def cancelling() -> bool:
+    """Whether the current task is being cancelled. A cancel that lands in the caller's loop body leaves the loop over
+    a relay as a ``break`` does, and only the task tells them apart (Python 3.11 and later)."""
+    task = asyncio.current_task()
+    count = getattr(task, "cancelling", None)
+    return callable(count) and cast("int", count()) > 0
+
+
+async def aclose_publisher(pub: AsyncPublisherLike | PublisherLike, outcome: Outcome) -> None:
+    """Closes either kind of publisher from asyncio code."""
+    if inspect.iscoroutinefunction(pub.close):
+        await cast("AsyncPublisherLike", pub).close(outcome)
+    else:
+        # A synchronous publisher's close waits for the server: not on the loop's thread.
+        await asyncio.to_thread(cast("PublisherLike", pub).close, outcome)
+
+
+class Feed(Generic[T]):
+    """An async iterator read by a task of its own, at most two items ahead of the reader.
+
+    A cancel of the reader's task then lands in its wait for the next item, not inside the iterator: LangGraph lets
+    a cancel through only once its running nodes have stopped, and a node may take its time (a shielded cleanup, a
+    transaction it finishes first). The page hears of the cancel before that.
+    """
+
+    def __init__(self, source: AsyncIterator[T]) -> None:
+        self._source = source
+        # (False, item), or (True, the error the source raised, or None at its end)
+        self._items: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue(maxsize=1)
+        self._task = asyncio.ensure_future(self._pump())
+
+    async def _pump(self) -> None:
+        error: BaseException | None = None
+        try:
+            async for item in self._source:
+                await self._items.put((False, item))
+        except asyncio.CancelledError:
+            # Stopped while the source waited at its yield: close it as a loop that is left does.
+            aclose = getattr(self._source, "aclose", None)
+            if callable(aclose):
+                await cast("Callable[[], Awaitable[object]]", aclose)()
+            raise
+        except BaseException as caught:  # the run's own error, given to the reader
+            error = caught
+        await self._items.put((True, error))
+
+    def __aiter__(self) -> Feed[T]:
+        return self
+
+    async def __anext__(self) -> T:
+        ended, value = await self._items.get()
+        if not ended:
+            return cast("T", value)
+        if value is not None:
+            raise cast("BaseException", value)
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        """Stops the source if it still runs, and returns once it has."""
+        self._task.cancel()
+        await asyncio.wait({self._task})
+        if not self._task.cancelled():
+            self._task.exception()  # retrieved: an error of the source's own cleanup changes nothing here
 
 
 class _Run:
@@ -61,12 +130,11 @@ class _Run:
         also_yield: Sequence[str],
         metadata: Metadata,
         expose_errors: bool,
-        cancelled: CancelledOutcome,
+        close_on_cancel: Outcome,
         on_oversize: Callable[[Oversize], None] | None,
     ) -> None:
         check_metadata(metadata)
-        if cancelled not in ("fail", "end"):
-            raise ValueError('cancelled is "fail" or "end".')
+        check_close_on_cancel(close_on_cancel)
         if isinstance(stream_mode, str) or isinstance(also_yield, str):
             raise ValueError("stream_mode and also_yield are sequences of mode names.")
         self.pub = pub
@@ -74,7 +142,7 @@ class _Run:
         self.modes = list(dict.fromkeys([*stream_mode, *also_yield]))
         self.metadata: Metadata = metadata
         self.expose_errors = expose_errors
-        self.cancelled: CancelledOutcome = cancelled
+        self.close_on_cancel: Outcome = close_on_cancel
         self.reports = Reports(pub.stream_id, on_oversize, "part")
 
     def send(self, data: str) -> None:
@@ -122,7 +190,7 @@ class _Run:
     def cancel(self) -> None:
         with contextlib.suppress(IQError):
             self.send(CANCELLED_PART)
-            cast("PublisherLike", self.pub).close(self.cancelled)
+            cast("PublisherLike", self.pub).close(self.close_on_cancel)
 
     def left(self) -> None:
         """The loop over the relay was left: the ``Cancelled`` part, and the close line when it is ``fail``. An
@@ -131,28 +199,24 @@ class _Run:
         exception."""
         with contextlib.suppress(IQError):
             self.send(CANCELLED_PART)
-            if self.cancelled == "fail":
+            if self.close_on_cancel == "fail":
                 cast("PublisherLike", self.pub).close("fail")
 
-    async def aleft(self) -> None:
+    async def astop(self) -> None:
+        """The run is being stopped, before the graph is: the ``Cancelled`` part, and the close line at once when it
+        is ``fail``."""
         with contextlib.suppress(IQError):
             self.send(CANCELLED_PART)
-            if self.cancelled == "fail":
+            if self.close_on_cancel == "fail":
                 await aclose_publisher(self.pub, "fail")
 
-    async def acancel(self) -> None:
-        with contextlib.suppress(IQError):
-            self.send(CANCELLED_PART)
-            await aclose_publisher(self.pub, self.cancelled)
-
-
-async def aclose_publisher(pub: AsyncPublisherLike | PublisherLike, outcome: Outcome) -> None:
-    """Closes either kind of publisher from asyncio code."""
-    if inspect.iscoroutinefunction(pub.close):
-        await cast("AsyncPublisherLike", pub).close(outcome)
-    else:
-        # A synchronous publisher's close waits for the server: not on the loop's thread.
-        await asyncio.to_thread(cast("PublisherLike", pub).close, outcome)
+    async def astopped(self, *, cancelled: bool) -> None:
+        """The graph has stopped, and saved what it saves: ``end``, when asked, for a cancel. A loop left by a
+        ``break`` or by the caller's own exception leaves ``end`` to the caller's block, which closes ``fail`` after
+        an exception; a cancel that landed in the loop body is told apart by the task."""
+        if self.close_on_cancel == "end" and (cancelled or cancelling()):
+            with contextlib.suppress(IQError):
+                await aclose_publisher(self.pub, "end")
 
 
 def relay(
@@ -165,7 +229,7 @@ def relay(
     also_yield: Sequence[str] = (),
     metadata: Metadata = "slim",
     expose_errors: bool = False,
-    cancelled: CancelledOutcome = "fail",
+    close_on_cancel: Outcome = "fail",
     on_oversize: Callable[[Oversize], None] | None = None,
     **stream_kwargs: Any,
 ) -> Generator[StreamPart[Any, Any], None, None]:
@@ -176,16 +240,16 @@ def relay(
     requested from the graph and yielded, not published. A run that raises publishes an ``error`` part and the
     exception goes on, so that the publisher's ``with`` block closes the stream with ``fail``. A run that is
     cancelled (a ``KeyboardInterrupt``, a drain request) publishes a ``Cancelled`` error part and closes the
-    publisher with ``cancelled`` itself. A loop left early publishes the ``Cancelled`` part too, at once, and closes
-    with ``fail``; with ``cancelled="end"`` the ``with`` block closes, with ``end``, or with ``fail`` when the loop
-    was left by an exception of the caller's code. A run that finishes, or pauses on an interrupt, is left
-    to the ``with`` block, which closes with ``end`` after the application has saved the answer.
+    publisher with ``close_on_cancel`` itself. A loop left early publishes the ``Cancelled`` part too, at once, and
+    closes with ``fail``; with ``close_on_cancel="end"`` the ``with`` block closes, with ``end``, or with ``fail``
+    when the loop was left by an exception of the caller's code. A run that finishes, or pauses on an interrupt, is
+    left to the ``with`` block, which closes with ``end`` after the application has saved the answer.
 
     ``stream_kwargs`` go to ``graph.stream()``: ``context``, ``durability``, ``interrupt_before``, ``control``, ...
     """
     if inspect.iscoroutinefunction(pub.close):
         raise TypeError("relay() takes a synchronous publisher; give an AsyncPublisher to arelay().")
-    run = _Run(pub, stream_mode, also_yield, metadata, expose_errors, cancelled, on_oversize)
+    run = _Run(pub, stream_mode, also_yield, metadata, expose_errors, close_on_cancel, on_oversize)
     return _relay(run, graph, input, config, stream_kwargs)
 
 
@@ -235,17 +299,19 @@ def arelay(
     also_yield: Sequence[str] = (),
     metadata: Metadata = "slim",
     expose_errors: bool = False,
-    cancelled: CancelledOutcome = "fail",
+    close_on_cancel: Outcome = "fail",
     on_oversize: Callable[[Oversize], None] | None = None,
     **stream_kwargs: Any,
 ) -> AsyncGenerator[StreamPart[Any, Any], None]:
     """``relay()`` over ``graph.astream()``. A cancelled task publishes the ``Cancelled`` part and closes the
-    stream with ``cancelled``. A loop left early under ``contextlib.aclosing()`` is handled as by ``relay()``.
+    stream with ``close_on_cancel``, also when the cancel lands in the caller's loop body (Python 3.11 and later). A
+    loop left early under ``contextlib.aclosing()`` is handled as by ``relay()``. The ``Cancelled`` part and a
+    ``fail`` close line go out before the graph is stopped, an ``end`` one after.
 
     ``pub`` is usually an ``AsyncPublisher``. A synchronous ``Publisher`` fits too, for graphs whose nodes block the
     loop and would starve the asynchronous publisher's keepalive: ``send()`` is the same call.
     """
-    run = _Run(pub, stream_mode, also_yield, metadata, expose_errors, cancelled, on_oversize)
+    run = _Run(pub, stream_mode, also_yield, metadata, expose_errors, close_on_cancel, on_oversize)
     return _arelay(run, graph, input, config, stream_kwargs)
 
 
@@ -253,31 +319,36 @@ async def _arelay(
     run: _Run, graph: Pregel[Any, Any, Any, Any], input: Any, config: Any, stream_kwargs: dict[str, Any]
 ) -> AsyncGenerator[StreamPart[Any, Any], None]:
     run.send(metadata_part(config))
+    parts: AsyncIterator[StreamPart[Any, Any]] = cast("Any", graph).astream(
+        input, config, stream_mode=run.modes, subgraphs=True, version="v2", **stream_kwargs
+    )
+    feed = Feed(parts)
     try:
-        parts: AsyncIterator[StreamPart[Any, Any]] = cast("Any", graph).astream(
-            input, config, stream_mode=run.modes, subgraphs=True, version="v2", **stream_kwargs
-        )
-        try:
-            async for part in parts:
-                run.publish(part)
+        async for part in feed:
+            run.publish(part)
+            try:
                 yield part
-        finally:
-            # An async generator is not closed when a loop over it is left: the run would go on until it is collected.
-            aclose = getattr(parts, "aclose", None)
-            if callable(aclose):
-                await cast("Callable[[], Awaitable[None]]", aclose)()
-    except GeneratorExit:  # aclose(): the loop was left, or the caller's code in it raised
-        await run.aleft()
+            except GeneratorExit:  # aclose(): the loop was left, the caller's code in it raised, or its task cancelled
+                await run.astop()
+                await feed.aclose()
+                await run.astopped(cancelled=False)
+                raise
+    except GeneratorExit:
         raise
     except _DRAINED:
-        await run.acancel()
+        await run.astop()
+        await run.astopped(cancelled=True)
         raise
     except Exception as error:
         run.fail(error)
         raise
-    except BaseException:  # CancelledError, KeyboardInterrupt
-        await run.acancel()
+    except BaseException:  # CancelledError, in the wait for the next part; KeyboardInterrupt
+        await run.astop()
+        await feed.aclose()
+        await run.astopped(cancelled=True)
         raise
+    finally:
+        await feed.aclose()
 
 
 def _final_state(part: Mapping[str, Any], final: Any) -> Any:
@@ -304,7 +375,7 @@ def publish_run(
     also_yield: Sequence[str] = (),
     metadata: Metadata = "slim",
     expose_errors: bool = False,
-    cancelled: CancelledOutcome = "fail",
+    close_on_cancel: Outcome = "fail",
     on_oversize: Callable[[Oversize], None] | None = None,
     **stream_kwargs: Any,
 ) -> Any:
@@ -321,7 +392,7 @@ def publish_run(
         also_yield=[*also_yield, "values"],
         metadata=metadata,
         expose_errors=expose_errors,
-        cancelled=cancelled,
+        close_on_cancel=close_on_cancel,
         on_oversize=on_oversize,
         **stream_kwargs,
     )
@@ -340,7 +411,7 @@ async def apublish_run(
     also_yield: Sequence[str] = (),
     metadata: Metadata = "slim",
     expose_errors: bool = False,
-    cancelled: CancelledOutcome = "fail",
+    close_on_cancel: Outcome = "fail",
     on_oversize: Callable[[Oversize], None] | None = None,
     **stream_kwargs: Any,
 ) -> Any:
@@ -355,7 +426,7 @@ async def apublish_run(
         also_yield=[*also_yield, "values"],
         metadata=metadata,
         expose_errors=expose_errors,
-        cancelled=cancelled,
+        close_on_cancel=close_on_cancel,
         on_oversize=on_oversize,
         **stream_kwargs,
     )

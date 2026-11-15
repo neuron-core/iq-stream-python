@@ -208,6 +208,56 @@ def research_supervisor() -> Any:
     return create_agent(model, [research], checkpointer=InMemorySaver(), name="supervisor")
 
 
+@tool
+def send_email(to: str, body: str) -> str:
+    """Send an email; a human approves it first."""
+    return f"sent to {to}"
+
+
+#: A draft long enough that HumanInTheLoopMiddleware's interrupt (which repeats the arguments in its description)
+#: does not fit the short server's 1 KiB frame, while each half of the streamed arguments does.
+DRAFT = "Dear team, " + "the quarterly figures are attached. " * 12
+
+
+def hitl_agent(body: str = DRAFT) -> Any:
+    """A `create_agent` agent whose `send_email` call waits for a human's decision (HumanInTheLoopMiddleware)."""
+    from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+    model = FakeToolCallingModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="", tool_calls=[tool_call("send_email", {"to": "team@example.com", "body": body}, "c1")]
+                ),  # type: ignore[list-item]
+                "Sent.",
+            ]
+        )
+    )
+    middleware = HumanInTheLoopMiddleware(interrupt_on={"send_email": True})
+    return create_agent(model, [send_email], middleware=[middleware], checkpointer=InMemorySaver())
+
+
+def stubborn_agent(cleanup: float, entered: asyncio.Event) -> Any:
+    """A tool that finishes its work before it lets a cancel through (a transaction it must not leave half done).
+    ``entered`` is set once the tool runs."""
+
+    @tool
+    async def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        entered.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.shield(asyncio.sleep(cleanup))
+            raise
+        return "sunny"
+
+    model = FakeToolCallingModel(
+        messages=iter([AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")]), "Sunny."])  # type: ignore[list-item]
+    )
+    return create_agent(model, [get_weather], checkpointer=InMemorySaver())
+
+
 def failing_agent(**options: Any) -> Any:
     model = FakeToolCallingModel(
         messages=iter([AIMessage(content="This answer will never be finished at all")]), fail_after_tokens=3

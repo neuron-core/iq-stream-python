@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from iq_stream import AsyncPublisherLike, FrameTooLarge, PublisherLike
 
-from ._encode import MASKED_MESSAGE, dumps, error_part
+from ._encode import MASKED_MESSAGE, dumps, error_part, mask_failed_tools
 from ._relay import stopped
 from ._reports import Oversize, Reports
 
@@ -24,6 +24,7 @@ _STREAM_MODES = frozenset({"values", "updates", "checkpoints", "tasks", "debug",
 
 
 def _masked(data: Any) -> Any:
+    data = mask_failed_tools(data)
     if not isinstance(data, Mapping):
         return cast("object", data)
     fields = cast("Mapping[str, Any]", data)
@@ -82,7 +83,7 @@ def iq_transformer(
             data: Any = params["data"]
             if event["method"] == "messages" and isinstance(data, (tuple, list)):
                 data = cast("Sequence[Any]", data)[0]
-            if not expose_errors:
+            if not expose_errors and event["method"] != "custom":  # custom data is the application's own
                 data = _masked(data)
             try:
                 frame = dumps(
@@ -109,6 +110,9 @@ def iq_transformer(
         def fail(self, err: BaseException) -> None:
             if self.root and pub.alive:
                 with contextlib.suppress(FrameTooLarge):
-                    pub.send(error_part(err, expose=expose_errors))
+                    try:
+                        pub.send(error_part(err, expose=expose_errors))
+                    except FrameTooLarge:  # an exposed message that does not fit goes masked
+                        pub.send(error_part(err))
 
     return IQTransformer

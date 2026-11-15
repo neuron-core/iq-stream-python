@@ -138,8 +138,8 @@ def test_stream_options_go_to_the_graph() -> None:
 def test_mistakes_are_refused_at_the_call() -> None:
     publisher = RecordingPublisher()
     agent = weather_agent()
-    with pytest.raises(ValueError, match="cancelled"):
-        relay(publisher, agent, USER, cancelled="later")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="close_on_cancel"):
+        relay(publisher, agent, USER, close_on_cancel="later")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="metadata"):
         relay(publisher, agent, USER, metadata="some")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="sequences"):

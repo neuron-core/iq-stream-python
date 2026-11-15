@@ -14,17 +14,26 @@ import uuid
 from typing import Any
 
 import pytest
-from fakes import USER, FakeToolCallingModel, tool_call, weather_agent
+from fakes import USER, FakeToolCallingModel, hitl_agent, tool_call, weather_agent
 from iq_stream.testing import RecordingPublisher
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AIMessageChunk
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Interrupt, interrupt
 from typing_extensions import TypedDict
 
-from iq_stream_langchain import MASKED_MESSAGE, SLIM_METADATA, Oversize, encode_part, error_part, publish_run, relay
+from iq_stream_langchain import (
+    DEFAULT_STREAM_MODE,
+    MASKED_MESSAGE,
+    SLIM_METADATA,
+    Oversize,
+    encode_part,
+    error_part,
+    publish_run,
+    relay,
+)
 from iq_stream_langchain._encode import TRUNCATED_MARKER
 
 FULL_METADATA = {
@@ -217,9 +226,12 @@ def test_an_interrupt_over_the_limit_is_cut_and_never_dropped() -> None:
         )
     last = json.loads(publisher.data[-1])
     assert last["type"] == "updates"
-    assert last["data"] == {
-        "__interrupt__": [{"value": None, "id": final["__interrupt__"][0].id, "truncated": True}]
-    }, "a value that is not a string is left out; the id resumes the run"
+    [cut] = last["data"]["__interrupt__"]
+    assert cut["id"] == final["__interrupt__"][0].id, "the id resumes the run"
+    assert cut["truncated"] is True
+    assert cut["value"]["question"] == "send it?", "the structure and the short strings stay"
+    assert cut["value"]["draft"].startswith("ddd") and cut["value"]["draft"].endswith(TRUNCATED_MARKER)
+    assert 900 < publisher.frame_size(publisher.data[-1]) <= 1024, "cut as little as possible"
     assert reports == [Oversize("updates", reports[0].size, 1024, truncated=True)]
     assert publisher.outcome == "end"
 
@@ -229,6 +241,74 @@ def test_an_interrupt_over_the_limit_is_cut_and_never_dropped() -> None:
     value = json.loads(publisher.data[-1])["data"]["__interrupt__"][0]["value"]
     assert value.startswith("Approve this draft: ddd") and value.endswith(TRUNCATED_MARKER)
     assert 900 < publisher.frame_size(publisher.data[-1]) <= 1024, "cut as little as possible"
+
+
+def test_a_human_in_the_loop_interrupt_keeps_what_a_client_needs_to_ask() -> None:
+    """HumanInTheLoopMiddleware's value repeats the tool's arguments; @ai-sdk/langchain reads action_requests."""
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with publisher:
+        final = publish_run(publisher, hitl_agent(), USER, {"configurable": {"thread_id": "hitl"}})
+    [cut] = json.loads(publisher.data[-1])["data"]["__interrupt__"]
+    assert cut["id"] == final["__interrupt__"][0].id
+    [request] = cut["value"]["action_requests"]
+    assert request["name"] == "send_email"
+    assert request["args"]["to"] == "team@example.com"
+    assert request["args"]["body"].endswith(TRUNCATED_MARKER) and request["args"]["body"].startswith("Dear team")
+    assert cut["value"]["review_configs"] == [
+        {"action_name": "send_email", "allowed_decisions": ["approve", "edit", "reject", "respond"]}
+    ]
+    assert publisher.frame_size(publisher.data[-1]) <= 1024
+
+
+def test_an_interrupt_whose_structure_does_not_fit_keeps_its_id() -> None:
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with publisher:
+        final = publish_run(
+            publisher,
+            interrupting_agent({f"field_{index}": index for index in range(200)}),
+            USER,
+            {"configurable": {"thread_id": "wide"}},
+        )
+    assert json.loads(publisher.data[-1])["data"] == {
+        "__interrupt__": [{"value": None, "id": final["__interrupt__"][0].id, "truncated": True}]
+    }
+
+
+def test_a_failed_tool_result_is_masked_wherever_it_goes() -> None:
+    """A tool that reports its own failure (handle_tool_error, an invalid call) returns a ToolMessage whose content is
+    the error's text, with status "error"."""
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        raise ToolException("the API key sk-123 was refused")
+
+    get_weather.handle_tool_error = True
+
+    def agent() -> Any:
+        model = FakeToolCallingModel(
+            messages=iter(
+                [AIMessage(content="", tool_calls=[tool_call("get_weather", {"city": "Turin"}, "c1")]), "Sorry."]  # type: ignore[list-item]
+            )
+        )
+        return create_agent(model, [get_weather])
+
+    publisher = RecordingPublisher()
+    with publisher:
+        final = publish_run(publisher, agent(), USER, stream_mode=(*DEFAULT_STREAM_MODE, "values", "tasks"))
+    assert final["messages"][-2].content == "the API key sk-123 was refused", "the state keeps it"
+    assert not any("sk-123" in data for data in publisher.data)
+    parts = [json.loads(data) for data in publisher.data]
+    tool_message = next(part for part in parts if part["type"] == "messages" and part["data"][0]["type"] == "tool")
+    assert tool_message["data"][0]["content"] == MASKED_MESSAGE and tool_message["data"][0]["status"] == "error"
+    update = next(part for part in parts if part["type"] == "updates" and "tools" in part["data"])
+    assert update["data"]["tools"]["messages"][0]["content"] == MASKED_MESSAGE
+    assert publisher.outcome == "end"
+
+    exposed = RecordingPublisher()
+    with exposed:
+        publish_run(exposed, agent(), USER, expose_errors=True)
+    assert any("sk-123" in data for data in exposed.data)
 
 
 def test_non_finite_floats_are_null() -> None:
