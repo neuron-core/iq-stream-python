@@ -14,7 +14,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from haystack.components.agents import Agent
@@ -22,7 +22,7 @@ from iq_stream import IQClient
 from iq_stream.testing import Subscription, TestServers, subscribe_in_background
 
 from haystack_integrations.iq_stream import IQStream
-from tests.fakes import ScriptedChatGenerator, text_turn, tool_turn, weather_call
+from tests.fakes import ScriptedChatGenerator, fallback_agent, text_turn, tool_turn, weather_call
 from tests.live import QUESTION, async_weather_tool, failing_agent, recording, weather_agent, weather_tool
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
@@ -138,6 +138,25 @@ def test_ag_ui_a_cancelled_run_finishes_cancelled(node_dir: Path, iq_client: IQC
     assert rebuilt["toolCalls"] == [{"id": "call_1", "name": "get_weather", "args": {"city": "Paris"}}]
 
 
+@pytest.mark.parametrize("kind", ["text", "tool"])
+def test_ag_ui_an_answer_retried_by_a_fallback_generator_stays_apart(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers, kind: Literal["text", "tool"]
+) -> None:
+    agent = fallback_agent(kind)
+    received = published(iq_client, iq_servers, "ag-ui", lambda s: agent.run(QUESTION, streaming_callback=s.callback))
+    rebuilt = rebuild(node_dir, "ag-ui", received)
+    assert rebuilt["invalid"] == [] and rebuilt["failures"] == []
+    if kind == "text":
+        assert rebuilt["texts"] == ["The weather in Par", "It is sunny in Paris."]
+        return
+    assert rebuilt["toolCalls"] == [
+        {"id": "call_A", "name": "get_weather", "args": '{"city": "Ro'},
+        {"id": "call_B", "name": "get_weather", "args": {"city": "Paris"}},
+    ]
+    assert rebuilt["toolResults"] == [{"toolCallId": "call_B", "content": "Sunny in Paris"}]
+    assert rebuilt["texts"] == ["It is sunny in Paris."]
+
+
 # -- AI SDK --------------------------------------------------------------------------------------------------------
 
 
@@ -190,6 +209,21 @@ def test_ai_sdk_a_custom_event_is_a_data_part(node_dir: Path, iq_client: IQClien
     assert rebuilt["data"] == [
         {"type": "data-tool_confirmation", "data": {"toolCallId": "call_1", "tool": "get_weather"}}
     ]
+
+
+def test_ai_sdk_a_tool_call_cut_off_by_a_failing_generator_is_an_error_part(
+    node_dir: Path, iq_client: IQClient, iq_servers: TestServers
+) -> None:
+    received = published(
+        iq_client, iq_servers, "ai-sdk", lambda s: fallback_agent("tool").run(QUESTION, streaming_callback=s.callback)
+    )
+    rebuilt = rebuild(node_dir, "ai-sdk", received)
+    assert rebuilt["invalid"] == [] and rebuilt["status"] == "ready" and rebuilt["error"] is None
+    assert [(t["toolCallId"], t["state"], t["input"], t["output"], t["errorText"]) for t in rebuilt["tools"]] == [
+        ("call_A", "output-error", '{"city": "Ro', None, "The tool call's arguments are not valid JSON."),
+        ("call_B", "output-available", {"city": "Paris"}, "Sunny in Paris", None),
+    ]
+    assert rebuilt["texts"] == ["It is sunny in Paris."]
 
 
 # -- native --------------------------------------------------------------------------------------------------------

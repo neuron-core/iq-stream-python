@@ -37,6 +37,15 @@ function replay() {
 
 const message = (error) => String(error?.message ?? error);
 
+/** A tool call's arguments as an object, or as the text they are when a broken stream cut them off. */
+function args(text) {
+  try {
+    return JSON.parse(text || '{}');
+  } catch {
+    return text;
+  }
+}
+
 async function agUi() {
   const invalid = [];
   for (const frame of recording.frames) {
@@ -71,7 +80,7 @@ async function agUi() {
     texts: assistants.map((m) => m.content ?? '').filter(Boolean),
     reasoning: agent.messages.filter((m) => m.role === 'reasoning').map((m) => m.content),
     toolCalls: assistants.flatMap((m) => m.toolCalls ?? [])
-      .map((call) => ({ id: call.id, name: call.function.name, args: JSON.parse(call.function.arguments || '{}') })),
+      .map((call) => ({ id: call.id, name: call.function.name, args: args(call.function.arguments) })),
     toolResults: agent.messages.filter((m) => m.role === 'tool').map((m) => ({ toolCallId: m.toolCallId, content: m.content })),
     finished,
     runError,

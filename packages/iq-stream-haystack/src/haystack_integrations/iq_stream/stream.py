@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import inspect
 import logging
+import math
 import re
 import threading
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -48,9 +50,10 @@ class IQStream:
     closes the stream with ``end``, or with ``fail`` when the block raised; a cancelled run closes with
     ``cancelled_close``. The run's exception goes on unchanged. Publishing never breaks the run: an error is reported
     once to ``on_error`` (else logged as a warning), publishing stops, the stream is closed with ``fail``, and the
-    run is read to its end.
+    run is read to its end. With a client opened with ``on_error="raise"``, leaving the block then raises the error
+    publishing stopped on, unless the block raised already.
 
-    ``client`` is an ``IQClient``, whose publisher the block opens, or a publisher that is already open
+    ``client`` is an ``IQClient``, whose publisher the block opens, or a synchronous publisher that is already open
     (``iq_stream.PublisherLike``, such as the testing kit's ``RecordingPublisher``). Creating the object opens
     nothing, so the process that hands out the ticket may create one to learn the stream id, and the worker that
     runs the agent another with the same id.
@@ -76,6 +79,11 @@ class IQStream:
             self._given: PublisherLike | None = None
             stream_id = client.new_stream_id() if stream_id is None else stream_id
         else:
+            if inspect.iscoroutinefunction(getattr(client, "close", None)):
+                # Haystack calls back from worker threads, where an asyncio publisher cannot be used.
+                raise TypeError(
+                    "IQStream takes a synchronous publisher: client.publisher(), or RecordingPublisher in tests."
+                )
             self._client = None
             self._given = client
             if stream_id is not None and stream_id != client.stream_id:
@@ -89,6 +97,13 @@ class IQStream:
             raise ValueError("cancelled_close must be 'end' or 'fail'.")
         if max_tool_result_bytes < 1:
             raise ValueError("max_tool_result_bytes must be at least 1.")
+        if (
+            isinstance(close_timeout, bool)
+            or not isinstance(close_timeout, int | float)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not math.isfinite(close_timeout)
+            or close_timeout < 0
+        ):
+            raise ValueError("close_timeout must be a finite number of seconds, at least 0.")
         self._stream_id = stream_id
         self._protocol = protocol
         self._thread_id = thread_id or stream_id
@@ -146,7 +161,7 @@ class IQStream:
     # -- the callbacks handed to Haystack ----------------------------------------------------------------------------
 
     def callback(self, chunk: StreamingChunk) -> None:
-        """The streaming callback for ``run()``, and for ``run_async()`` with a chat generator that has no
+        """The streaming callback for ``run()``, and for ``run_async()`` whenever a generator that gets it has no
         ``run_async``. Thread-safe; never raises, never blocks on the network."""
         if self._state != "open":
             return
@@ -154,12 +169,18 @@ class IQStream:
             with self._lock:
                 if self._publishing():
                     assert self._converter is not None
-                    self._send(self._converter.convert(chunk, source_key()))
+                    sent = self._send(self._converter.convert(chunk, source_key()))
+                else:
+                    sent = False
         except Exception as error:
-            self._fail(error)
+            self._failed(error)
+            return
+        if not sent:
+            self._note_gave_up()
 
     async def acallback(self, chunk: StreamingChunk) -> None:
-        """The streaming callback for ``run_async()``. It awaits nothing: frames are queued."""
+        """The streaming callback for ``run_async()`` when every generator that gets it has ``run_async``: Haystack
+        refuses a coroutine callback where it runs a generator in a thread. It awaits nothing: frames are queued."""
         self.callback(chunk)
 
     @overload
@@ -194,7 +215,8 @@ class IQStream:
 
     def emit(self, payload: BaseEvent | Mapping[str, object] | str, event: str | None = None) -> bool:
         """Publishes one frame as given, in order with the run's: an AG-UI event, a mapping (as JSON) or a string.
-        Returns whether it was queued. ``FrameTooLarge`` is raised for a frame over the limit."""
+        Returns whether it was queued. It never raises: a frame over the limit is dropped and reported to
+        ``on_error`` (else logged), and the stream goes on."""
         if isinstance(payload, BaseEvent):
             data = encode_event(payload)
         elif isinstance(payload, str):
@@ -205,8 +227,9 @@ class IQStream:
 
     def custom(self, name: str, value: object) -> bool:
         """Publishes a named event of the application's own in the stream's protocol: an AG-UI ``CUSTOM`` event, an
-        AI SDK ``data-<name>`` chunk, or ``{"type": "custom"}``. A human-in-the-loop strategy uses it to publish its
-        request before it blocks. Returns whether it was queued."""
+        AI SDK ``data-<name>`` chunk, or ``{"type": "custom"}``; what JSON cannot hold is written as its ``str()``. A
+        human-in-the-loop strategy uses it to publish its request before it blocks. Returns whether it was queued,
+        and never raises, as ``emit``."""
         return self._emit(lambda: self._require_converter().custom(name, value))
 
     # -- lifecycle --------------------------------------------------------------------------------------------------
@@ -224,7 +247,8 @@ class IQStream:
             with self._lock:
                 self._send(self._converter.start())
         except Exception as error:
-            self._fail(error)
+            self._failed(error)
+        self._note_gave_up()
         return self
 
     def __exit__(
@@ -291,35 +315,65 @@ class IQStream:
             and self._converter is not None
         )
 
-    def _send(self, frames: Iterable[Frame]) -> None:
-        """Queues frames; the caller holds the lock. Stops at the first refusal: the publisher has given up."""
+    def _send(self, frames: Iterable[Frame]) -> bool:
+        """Queues frames; the caller holds the lock. Stops at the first refusal, and returns False then: the
+        publisher has given up."""
         assert self._publisher is not None
-        for frame in frames:
-            if not self._publisher.send(frame.data, frame.event):
-                return
+        return all(self._publisher.send(frame.data, frame.event) for frame in frames)
 
     def _emit(self, frames: Callable[[], Iterable[Frame]]) -> bool:
-        with self._lock:
-            if not self._publishing():
-                return False
-            assert self._publisher is not None
-            built = list(frames())
-            for frame in built:  # nothing is sent unless every frame fits
-                size = self._publisher.frame_size(frame.data, frame.event)
-                if size > self._publisher.max_frame_bytes:
-                    raise FrameTooLarge(size, self._publisher.max_frame_bytes)
-            self._send(built)
-            return self._publisher.alive
+        # Called from inside the run (a confirmation strategy, a tool): it fails open as the callback does.
+        try:
+            with self._lock:
+                sent = self._publishing() and self._send(self._fitting(frames()))
+        except FrameTooLarge as error:  # this frame is dropped; the stream goes on
+            self._report(error, f"a frame of {error.size} bytes was not published; the limit is {error.limit}.")
+            return False
+        except Exception as error:
+            self._failed(error)
+            return False
+        if not sent:
+            self._note_gave_up()
+        return sent
 
-    def _fail(self, error: Exception) -> None:
+    def _fitting(self, frames: Iterable[Frame]) -> list[Frame]:
+        """The frames, when every one fits: nothing is sent otherwise."""
+        assert self._publisher is not None
+        built = list(frames)
+        for frame in built:
+            size = self._publisher.frame_size(frame.data, frame.event)
+            if size > self._publisher.max_frame_bytes:
+                raise FrameTooLarge(size, self._publisher.max_frame_bytes)
+        return built
+
+    def _failed(self, error: Exception) -> None:
+        """Publishing stopped on ``error``: reported once, unless it stopped for another reason already."""
         with self._lock:
             if self._error is not None:
                 return
             self._error = error
+        # The publisher's own error (a publisher opened with on_error="raise" raises it) was reported by the core.
+        core = self._publisher is not None and error is self._publisher.error
+        self._report(error, None if core else f"publishing stopped after {type(error).__name__}; the run goes on.")
+
+    def _note_gave_up(self) -> None:
+        """Takes the core's publisher giving up (unreachable, stream too large, ...) as the reason publishing stopped,
+        once: ``on_error`` hears of it too, while the core logged it already."""
+        publisher = self._publisher
+        if self._error is not None or publisher is None or publisher.alive or publisher.error is None:
+            return
+        error = publisher.error
+        with self._lock:
+            if self._error is not None:
+                return
+            self._error = error
+        self._report(error, None)
+
+    def _report(self, error: Exception, warning: str | None) -> None:
+        """Hands ``error`` to ``on_error``; without one, logs ``warning`` (its type and never its text) if given."""
         if self._on_error is None:
-            logger.warning(
-                "IQ stream %s: publishing stopped after %s; the run goes on.", self._stream_id, type(error).__name__
-            )
+            if warning is not None:
+                logger.warning("IQ stream %s: %s", self._stream_id, warning)
             return
         try:
             self._on_error(error)
@@ -357,14 +411,25 @@ class IQStream:
                     else:
                         self._send(self._converter.error(exc))
             except Exception as error:
-                self._fail(error)
+                self._failed(error)
+        self._note_gave_up()
         if self._error is not None or (exc is not None and not cancelled):
             outcome: Outcome = "fail"
         else:
             outcome = self._cancelled_close if cancelled else "end"
+        raised: Exception | None = None
         try:
             self._result = publisher.close(outcome, self._close_timeout)
         except Exception as error:
-            self._fail(error)
+            if error is publisher.error:  # opened with on_error="raise": the error publishing stopped on
+                raised = error
+            else:
+                self._failed(error)
+                if publisher.alive:  # a failed stream is closed, never left open
+                    with contextlib.suppress(Exception):
+                        self._result = publisher.close("fail")
         finally:
             self._state = "closed"
+        self._note_gave_up()
+        if raised is not None and exc is None:  # the block's own exception, when there is one, is the one to see
+            raise raised

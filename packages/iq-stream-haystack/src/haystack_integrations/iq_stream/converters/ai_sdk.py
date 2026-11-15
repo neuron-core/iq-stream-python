@@ -8,7 +8,7 @@ from typing import Unpack
 from haystack.dataclasses import ToolCallResult
 
 from ._messages import Call, MessageConverter
-from .base import ConverterOptions, Frame, dumps
+from .base import INVALID_ARGUMENTS, ConverterOptions, Frame, dumps
 
 # Haystack's finish reasons, in the AI SDK's spelling.
 _FINISH_REASONS = {"stop": "stop", "length": "length", "content_filter": "content-filter", "tool_calls": "tool-calls"}
@@ -20,7 +20,8 @@ class AISDKConverter(MessageConverter):
 
     The whole run is one assistant message, whose id is ``message_id``. Deltas too large for a frame are split; a
     tool's output is truncated with a marker; a ``tool-input-available`` too large for a frame is left out, since
-    the input deltas carried the arguments already.
+    the input deltas carried the arguments already. A call whose arguments are not JSON, cut off by a broken
+    stream or by the length limit, ends with ``tool-input-error``: Haystack runs no such call.
     """
 
     def __init__(self, *, message_id: str, **options: Unpack[ConverterOptions]) -> None:
@@ -109,17 +110,33 @@ class AISDKConverter(MessageConverter):
     def _end_calls(self, calls: list[Call]) -> list[str]:
         out: list[str] = []
         for call in calls:
-            self._waiting.add(call.id)
             try:
                 arguments: object = json.loads(call.text or "{}")
             except ValueError:
-                arguments = call.text
+                out.append(self._input_error(call))
+                continue
+            self._waiting.add(call.id)
             chunk = dumps(
                 {"type": "tool-input-available", "toolCallId": call.id, "toolName": call.name, "input": arguments}
             )
             if self.fit.fits(chunk):
                 out.append(chunk)
         return out
+
+    def _input_error(self, call: Call) -> str:
+        def build(text: str) -> str:
+            return dumps(
+                {
+                    "type": "tool-input-error",
+                    "toolCallId": call.id,
+                    "toolName": call.name,
+                    "input": text,
+                    "errorText": INVALID_ARGUMENTS,
+                }
+            )
+
+        chunk = build(call.text)
+        return chunk if self.fit.fits(chunk) else self.fit.whole(build(""))  # the input deltas carried it
 
     def _replay_call(self, call: Call) -> list[str]:
         return [*self._start_call(call, ""), *self._end_calls([call])]

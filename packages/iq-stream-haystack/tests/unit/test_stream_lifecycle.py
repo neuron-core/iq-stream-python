@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,12 +17,12 @@ from haystack.components.agents import Agent
 from haystack.dataclasses import ChatMessage, StreamingChunk
 from haystack.hooks.human_in_the_loop import ConfirmationHook, ToolExecutionDecision
 from haystack.tools import tool
-from iq_stream import FrameTooLarge, IQClient, IQError
-from iq_stream.testing import RecordingPublisher
+from iq_stream import IQClient, IQError, Outcome, PublishResult
+from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
 from haystack_integrations.iq_stream import IQStream
 from haystack_integrations.iq_stream.converters.base import frame_size
-from tests.checks import verify_agui
+from tests.checks import verify_agui, verify_ai_sdk
 from tests.fakes import ScriptedChatGenerator, Turn, text_turn, tool_turn, weather_call, weather_script
 
 QUESTION = [ChatMessage.from_user("Weather in Paris?")]
@@ -222,33 +225,42 @@ def same_run(result: dict[str, Any]) -> None:
     assert [m.to_dict() for m in result["messages"]] == [m.to_dict() for m in expected["messages"]]
 
 
-def test_a_publisher_that_gave_up_never_breaks_the_run_which_is_read_to_its_end() -> None:
+class GivesUp(RecordingPublisher):
+    """Gives up at its fourth frame, as a publisher whose server went away or whose stream grew too large."""
+
+    def send(self, data: str, event: str | None = None) -> bool:
+        if self.frames_sent == 3 and self.error is None:
+            self.fail()
+        return super().send(data, event)
+
+
+def test_a_publisher_that_gave_up_never_breaks_the_run_which_is_read_to_its_end(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     publisher = RecordingPublisher()
     publisher.fail()
     reported: list[Exception] = []
     generator = ScriptedChatGenerator(weather_script())
     agent = Agent(chat_generator=generator, tools=[get_weather])
-    with IQStream(publisher, on_error=reported.append) as stream:
+    with caplog.at_level(logging.WARNING), IQStream(publisher, on_error=reported.append) as stream:
         result = agent.run(QUESTION, streaming_callback=stream.callback)
     same_run(result)
     assert generator.calls == 2
     assert publisher.data == [] and stream.failed
     assert isinstance(stream.error, IQError)
-    assert reported == []  # the core reports its own errors
+    assert reported == [publisher.error]  # on_error hears of the core's error, once
+    assert not [r for r in caplog.records if r.name == "haystack_integrations.iq_stream"]  # the core logged it
 
 
 def test_a_publisher_that_gives_up_mid_run_stops_publishing_and_the_run_goes_on() -> None:
-    class GivesUp(RecordingPublisher):
-        def send(self, data: str, event: str | None = None) -> bool:
-            if self.frames_sent == 3:
-                self.fail()
-            return super().send(data, event)
-
     publisher = GivesUp()
-    with IQStream(publisher) as stream:
+    reported: list[Exception] = []
+    with IQStream(publisher, on_error=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
+        assert reported == [publisher.error]  # as soon as the adapter saw it, before the block was left
     same_run(result)
     assert len(publisher.data) == 3 and stream.failed
+    assert reported == [publisher.error]
 
 
 def test_a_publisher_that_raises_is_reported_once_and_the_stream_closes_with_fail() -> None:
@@ -294,14 +306,33 @@ def test_a_converter_that_raises_is_logged_once_without_data_and_the_run_goes_on
     assert publisher.outcome == "fail"
 
 
-def test_a_publisher_that_raises_on_every_call_is_contained() -> None:
+def test_with_on_error_raise_the_run_is_read_to_its_end_and_leaving_the_block_raises() -> None:
+    publisher = GivesUp(on_error="raise")
+    reported: list[Exception] = []
+    results: list[dict[str, Any]] = []
+    with pytest.raises(IQError) as raised, IQStream(publisher, on_error=reported.append) as stream:
+        results.append(weather_agent().run(QUESTION, streaming_callback=stream.callback))
+        assert stream.custom("progress", 1) is False  # nothing raises into the run
+    same_run(results[0])
+    assert raised.value is publisher.error and reported == [publisher.error]
+    assert publisher.close_calls == 1 and len(publisher.data) == 3
+
+
+def test_with_on_error_raise_a_publisher_dead_from_the_start_still_lets_the_run_complete() -> None:
     publisher = RecordingPublisher(on_error="raise")
     publisher.fail()
-    reported: list[Exception] = []
-    with IQStream(publisher, on_error=reported.append) as stream:
-        result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
-    same_run(result)
-    assert len(reported) == 1 and isinstance(reported[0], IQError)
+    results: list[dict[str, Any]] = []
+    with pytest.raises(IQError), IQStream(publisher) as stream:
+        results.append(weather_agent().run(QUESTION, streaming_callback=stream.callback))
+    same_run(results[0])
+
+
+def test_with_on_error_raise_the_block_s_own_exception_is_the_one_that_goes_on() -> None:
+    publisher = GivesUp(on_error="raise")
+    with pytest.raises(OSError, match="disk full"), IQStream(publisher) as stream:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+        raise OSError("disk full")
+    assert publisher.close_calls == 1
 
 
 def test_a_publisher_that_cannot_open_is_reported_and_the_run_goes_on(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,11 +380,27 @@ def test_every_frame_fits_a_small_limit(protocol: str) -> None:
         agent.run(QUESTION, streaming_callback=stream.callback)
     assert not stream.failed and publisher.outcome == "end"
     assert all(frame_size(item) <= 1024 for item in publisher.data)
+    # What the browser rebuilds from the pieces is the whole text, reasoning and arguments.
+    texts, thinking, arguments = ["word " * 2_000, "word " * 2_000], ["think " * 1_000], {"city": "€" * 3_000}
+    marker = "[truncated, 900000 characters in total]"
     if protocol == "ag-ui":
         conversation = verify_agui(publisher.data)
-        assert conversation.texts == ["word " * 2_000, "word " * 2_000]
-        assert json.loads(conversation.calls[0][2]) == {"city": "€" * 3_000}
-        assert conversation.results["c1"].endswith("[truncated, 900000 characters in total]")
+        assert (conversation.texts, conversation.reasoning) == (texts, thinking)
+        assert json.loads(conversation.calls[0][2]) == arguments
+        assert conversation.results["c1"].endswith(marker)
+    elif protocol == "ai-sdk":
+        message = verify_ai_sdk(publisher.data)
+        assert (message.texts, message.reasoning) == (texts, thinking)
+        assert json.loads("".join(message.tools["c1"]["deltas"])) == arguments
+        assert message.tools["c1"]["output"].endswith(marker)
+    else:
+        chunks = [chunk for chunk in events(publisher) if chunk["type"] == "chunk"]
+        assert "".join(chunk["content"] for chunk in chunks) == "".join(texts)
+        assert "".join(chunk["reasoning"]["reasoning_text"] for chunk in chunks if chunk["reasoning"]) == thinking[0]
+        deltas = [delta for chunk in chunks for delta in chunk["tool_calls"] or []]
+        assert json.loads("".join(delta["arguments"] or "" for delta in deltas)) == arguments
+        result = next(chunk["tool_call_result"] for chunk in chunks if chunk["tool_call_result"])
+        assert result["result"].endswith(marker)
 
 
 # -- frames of the application's own -------------------------------------------------------------------------------
@@ -369,8 +416,7 @@ def test_emit_publishes_events_mappings_and_strings_in_order() -> None:
         assert stream.emit(StateSnapshotEvent(snapshot={"step": 1}))
         assert stream.emit({"type": "CUSTOM", "name": "note", "value": "é"})
         assert stream.emit("plain", event="note")
-        with pytest.raises(FrameTooLarge):
-            stream.emit("x" * 2_000)
+        assert stream.emit("x" * 2_000) is False  # dropped, and the stream goes on
         assert stream.custom("progress", {"done": 1})
     assert publisher.data[1:5] == [
         '{"type":"STATE_SNAPSHOT","snapshot":{"step":1}}',
@@ -380,6 +426,76 @@ def test_emit_publishes_events_mappings_and_strings_in_order() -> None:
     ]
     assert publisher.frames[3].event == "note"
     assert stream.emit("too late") is False
+
+
+@pytest.mark.parametrize("protocol", ["ag-ui", "ai-sdk", "haystack"])
+def test_custom_and_emit_never_raise_into_the_run_and_drop_only_a_frame_too_large(protocol: str) -> None:
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    reported: list[Exception] = []
+    with IQStream(publisher, protocol=protocol, on_error=reported.append) as stream:  # pyright: ignore[reportArgumentType]
+        assert stream.custom("note", {"text": "x" * 2_000}) is False
+        assert stream.emit({"text": "x" * 2_000}) is False
+        assert stream.custom("note", {"text": "small"})
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    assert [type(error).__name__ for error in reported] == ["FrameTooLarge", "FrameTooLarge"]
+    assert not stream.failed and publisher.outcome == "end"
+    assert sum('"small"' in item for item in publisher.data) == 1
+    assert not any("x" * 1_000 in item for item in publisher.data)
+
+
+def test_custom_through_a_publisher_that_raises_stops_publishing_and_the_run_goes_on() -> None:
+    class Raises(RecordingPublisher):
+        def send(self, data: str, event: str | None = None) -> bool:
+            if "CUSTOM" in data:
+                raise RuntimeError("socket exploded")
+            return super().send(data, event)
+
+    reported: list[Exception] = []
+    with IQStream(Raises(), on_error=reported.append) as stream:
+        assert stream.custom("tool_confirmation", {"tool": "get_weather"}) is False
+        same_run(weather_agent().run(QUESTION, streaming_callback=stream.callback))
+    assert [str(error) for error in reported] == ["socket exploded"]
+    assert stream.failed and stream.publisher is not None
+    assert stream.publisher.outcome == "fail"  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.parametrize("protocol", ["ag-ui", "ai-sdk", "haystack"])
+def test_custom_writes_what_json_cannot_hold_as_its_str_in_every_protocol(protocol: str) -> None:
+    class Ticket:
+        def __str__(self) -> str:
+            return "ticket-1"
+
+    publisher = RecordingPublisher()
+    with IQStream(publisher, protocol=protocol) as stream:  # pyright: ignore[reportArgumentType]
+        assert stream.custom("confirm", {"ticket": Ticket(), "at": (1, 2)})
+    assert '{"ticket":"ticket-1","at":[1,2]}' in publisher.data[1]
+
+
+def test_the_readme_s_confirmation_strategy_survives_arguments_too_large_for_a_frame() -> None:
+    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+    strategy = re.search(r"^class AskTheBrowser:\n.*?(?=^hook = )", readme, re.DOTALL | re.MULTILINE)
+    assert strategy is not None
+    namespace: dict[str, Any] = {"wait_for_answer": lambda tool_call_id: True}
+    exec("from typing import Any\nfrom haystack.hooks.human_in_the_loop import ToolExecutionDecision\n"
+         "from haystack_integrations.iq_stream import IQStream\n" + strategy.group(), namespace)  # fmt: skip
+
+    @tool
+    def save_note(text: str) -> str:
+        """Saves a note."""
+        return "Saved."
+
+    note = weather_call().__class__(tool_name="save_note", arguments={"text": "n" * 2_000}, id="c1")
+    script = [tool_turn([note]), text_turn(["Done."])]
+    hook = ConfirmationHook(confirmation_strategies={"save_note": namespace["AskTheBrowser"]()})
+    agent = Agent(chat_generator=ScriptedChatGenerator(script), tools=[save_note], hooks={"before_tool": [hook]})
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with IQStream(publisher, on_error=lambda error: None) as stream:
+        result = agent.run(QUESTION, streaming_callback=stream.callback, hook_context={"stream": stream})
+    assert result["last_message"].text == "Done."
+    conversation = verify_agui(publisher.data)
+    assert conversation.custom == [("tool_confirmation", {"toolCallId": "c1", "tool": "save_note", "arguments": None})]
+    assert conversation.results == {"c1": "Saved."}
+    assert publisher.outcome == "end" and not stream.failed
 
 
 # -- the object itself ---------------------------------------------------------------------------------------------
@@ -411,6 +527,9 @@ def test_creating_a_stream_opens_nothing_and_gives_the_ticket(monkeypatch: pytes
         {"protocol": "openai"},
         {"cancelled_close": "maybe"},
         {"max_tool_result_bytes": 0},
+        {"close_timeout": -1},
+        {"close_timeout": math.inf},
+        {"close_timeout": math.nan},
     ],
 )
 def test_invalid_options_are_refused(options: dict[str, Any]) -> None:
@@ -428,3 +547,51 @@ def test_exit_returns_false_so_the_exception_is_never_swallowed() -> None:
     stream = IQStream(RecordingPublisher())
     stream.__enter__()
     assert stream.__exit__(KeyError, KeyError("x"), None) is False
+
+
+def test_an_asynchronous_publisher_is_refused_since_haystack_calls_back_from_threads() -> None:
+    with pytest.raises(TypeError, match="synchronous publisher"):
+        IQStream(AsyncRecordingPublisher())  # pyright: ignore[reportArgumentType]
+
+
+def test_a_close_that_raises_is_retried_with_fail_so_the_stream_is_never_left_open() -> None:
+    class CloseBreaksOnce(RecordingPublisher):
+        attempts = 0
+
+        def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("close broke")
+            return super().close(outcome, timeout)
+
+    publisher = CloseBreaksOnce()
+    reported: list[Exception] = []
+    with IQStream(publisher, on_error=reported.append) as stream:
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    assert publisher.outcome == "fail" and not publisher.alive
+    assert [str(error) for error in reported] == ["close broke"]
+    assert stream.result is not None and stream.result.outcome == "fail"
+
+
+async def test_leaving_an_async_block_closes_off_the_event_loop() -> None:
+    class SlowClose(RecordingPublisher):
+        def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+            time.sleep(1.0)  # as the core waits out min_open, then for the server's answer
+            return super().close(outcome, timeout)
+
+    gaps: list[float] = []
+
+    async def heartbeat() -> None:
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(0.05)
+            gaps.append(time.monotonic() - last)
+            last = time.monotonic()
+
+    beat = asyncio.create_task(heartbeat())
+    publisher = SlowClose()
+    async with IQStream(publisher) as stream:
+        await weather_agent().run_async(QUESTION, streaming_callback=stream.acallback)
+    beat.cancel()
+    assert publisher.outcome == "end"
+    assert max(gaps) < 0.5, max(gaps)  # the loop kept running while the close waited a second

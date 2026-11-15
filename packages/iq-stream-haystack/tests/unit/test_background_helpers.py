@@ -11,7 +11,8 @@ from typing import Any
 import pytest
 from haystack import Pipeline
 from haystack.components.agents import Agent
-from haystack.dataclasses import ChatMessage, StreamingChunk
+from haystack.components.generators.chat import FallbackChatGenerator
+from haystack.dataclasses import ChatMessage, StreamingChunk, ToolCall
 from haystack.tools import tool
 from iq_stream import IQClient
 from iq_stream.testing import RecordingPublisher
@@ -19,7 +20,12 @@ from iq_stream.testing import RecordingPublisher
 from haystack_integrations.iq_stream import hayhooks
 from haystack_integrations.iq_stream.hayhooks import start_stream, start_stream_sync
 from tests.checks import verify_agui, verify_ai_sdk
-from tests.fakes import ScriptedChatGenerator, SyncOnlyChatGenerator, Turn, text_turn, weather_script
+from tests.fakes import ScriptedChatGenerator, SyncOnlyChatGenerator, Turn, text_turn, tool_turn, weather_script
+
+try:
+    from haystack.tools import AgentTool
+except ImportError:  # haystack-ai releases before AgentTool
+    AgentTool = None
 
 QUESTION = [ChatMessage.from_user("Weather in Paris?")]
 SECRET = "test-app-secret-0123456789abcdef0123"
@@ -152,6 +158,56 @@ async def test_an_agent_on_a_sync_only_generator_gets_the_sync_callback(
     await finished(recorders, stream_id)
     assert recorders[stream_id].outcome == "end"
     assert verify_agui(recorders[stream_id].data).texts[-1] == "It is sunny in Paris."
+
+
+async def test_an_agent_whose_generators_all_have_run_async_gets_the_async_callback(
+    client: IQClient, recorders: dict[str, RecordingPublisher], caplog: pytest.LogCaptureFixture
+) -> None:
+    release = threading.Event()
+    release.set()
+    agent = slow_agent(release, FallbackChatGenerator([ScriptedChatGenerator(weather_script())]))
+    with caplog.at_level(logging.WARNING):
+        ticket = await start_stream(client, agent, {"messages": QUESTION})
+        await finished(recorders, str(ticket["streamId"]))
+    assert recorders[str(ticket["streamId"])].outcome == "end"
+    assert not [record for record in caplog.records if "sync streaming callback" in record.getMessage()]
+
+
+def sub_agent_coordinator() -> Agent:
+    assert AgentTool is not None
+    sub = Agent(chat_generator=SyncOnlyChatGenerator([text_turn(["Sub-agent: ", "sunny."])]))
+    research = AgentTool(agent=sub, name="research", description="Research a question")
+    call = ToolCall(tool_name="research", arguments={"messages": [{"role": "user", "content": "q"}]}, id="r1")
+    return Agent(
+        chat_generator=ScriptedChatGenerator([tool_turn([call]), text_turn(["Done."])]),
+        tools=[research],
+        tool_streaming_callback_passthrough=True,
+    )
+
+
+@pytest.mark.parametrize("reaches", ["fallback", "sub-agent"])
+async def test_an_agent_reaching_a_generator_without_run_async_gets_the_sync_callback(
+    client: IQClient, recorders: dict[str, RecordingPublisher], reaches: str
+) -> None:
+    if reaches == "fallback":
+        release = threading.Event()
+        release.set()
+        agent = slow_agent(release, FallbackChatGenerator([SyncOnlyChatGenerator(weather_script())]))
+    elif AgentTool is None:
+        pytest.skip("this haystack-ai has no AgentTool")
+    else:
+        agent = sub_agent_coordinator()
+    saved: list[dict[str, Any]] = []
+    ticket = await start_stream(client, agent, {"messages": QUESTION}, on_result=lambda _, result: saved.append(result))
+    stream_id = str(ticket["streamId"])
+    await finished(recorders, stream_id)
+    assert recorders[stream_id].outcome == "end" and len(saved) == 1
+    conversation = verify_agui(recorders[stream_id].data)
+    if reaches == "fallback":
+        assert conversation.texts[-1] == "It is sunny in Paris."
+    else:  # the sub-agent answered, rather than failing on a coroutine callback
+        assert conversation.results == {"r1": "Sub-agent: sunny."}
+        assert conversation.texts == ["Sub-agent: sunny.", "Done."]
 
 
 def test_start_stream_sync_runs_in_a_thread_and_saves_before_the_close(

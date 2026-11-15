@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from haystack.components.agents import Agent
 from haystack.hooks.human_in_the_loop import ConfirmationHook, ToolExecutionDecision
-from iq_stream import IQClient
+from iq_stream import IQClient, IQError
 from iq_stream.testing import TestServers, free_port, subscribe, subscribe_in_background
 
 from haystack_integrations.iq_stream import IQStream
@@ -24,7 +24,7 @@ def test_a_run_with_a_tool_call_arrives_in_order_once_and_ends(iq_client: IQClie
     ticket = iq_client.ticket()
     subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
     with IQStream(iq_client, ticket.stream_id) as stream:
-        result = weather_agent(tool_seconds=0.3).run(QUESTION, streaming_callback=stream.callback)
+        result = weather_agent(tool_seconds=0.6).run(QUESTION, streaming_callback=stream.callback)
     received = subscription.result(30)
     data = in_order_once(received)
     conversation = verify_agui(data)
@@ -37,7 +37,7 @@ def test_a_run_with_a_tool_call_arrives_in_order_once_and_ends(iq_client: IQClie
     assert result["last_message"].text == "It is sunny in Paris."
     # Relayed while the run went on: the call's end reached the browser before the tool had answered.
     by_type = {json.loads(frame.data)["type"]: frame.at for frame in received.frames}
-    assert by_type["TOOL_CALL_RESULT"] - by_type["TOOL_CALL_END"] >= 0.2
+    assert by_type["TOOL_CALL_RESULT"] - by_type["TOOL_CALL_END"] >= 0.3
 
 
 async def test_an_async_run_arrives_as_ai_sdk_chunks(iq_client: IQClient, iq_servers: TestServers) -> None:
@@ -179,13 +179,43 @@ def test_a_late_subscriber_gets_iq_gone_once_the_answer_is_saved(iq_client: IQCl
     assert ticket.stream_id in saved  # what the page loads instead
 
 
-def test_an_unreachable_server_never_breaks_the_run() -> None:
-    client = IQClient(f"http://127.0.0.1:{free_port()}", "demo-app", "test-app-secret-0123456789abcdef0123",
-                      retry_budget=0.5, min_open=0)  # fmt: skip
-    with IQStream(client) as stream:
+def unreachable_client(**options: Any) -> IQClient:
+    return IQClient(f"http://127.0.0.1:{free_port()}", "demo-app", "test-app-secret-0123456789abcdef0123",
+                    retry_budget=0.5, min_open=0, **options)  # fmt: skip
+
+
+def test_an_unreachable_server_never_breaks_the_run_and_on_error_hears_of_it() -> None:
+    reported: list[Exception] = []
+    with IQStream(unreachable_client(), on_error=reported.append) as stream:
         result = weather_agent().run(QUESTION, streaming_callback=stream.callback)
     assert result["last_message"].text == "It is sunny in Paris."
     assert stream.failed and stream.error is not None and stream.error.code == "unreachable"  # pyright: ignore[reportAttributeAccessIssue]
+    assert reported == [stream.error]
+
+
+def test_a_client_opened_with_on_error_raise_fails_the_block_once_the_run_is_done() -> None:
+    results: list[dict[str, Any]] = []
+    with pytest.raises(IQError) as raised, IQStream(unreachable_client(on_error="raise")) as stream:
+        results.append(weather_agent().run(QUESTION, streaming_callback=stream.callback))
+    assert results[0]["last_message"].text == "It is sunny in Paris."
+    assert raised.value.code == "unreachable" and raised.value is stream.error
+
+
+def test_a_confirmation_request_too_large_for_the_short_server_is_dropped_and_the_run_ends(
+    iq_servers: TestServers,
+) -> None:
+    client = IQClient(iq_servers.short.url, iq_servers.app_key, iq_servers.app_secret, min_open=0, max_frame_bytes=1024)
+    ticket = client.ticket()
+    subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
+    reported: list[Exception] = []
+    with IQStream(client, ticket.stream_id, on_error=reported.append) as stream:
+        assert stream.custom("tool_confirmation", {"arguments": "x" * 2_000}) is False
+        assert stream.custom("tool_confirmation", {"arguments": None})
+        weather_agent().run(QUESTION, streaming_callback=stream.callback)
+    received = subscription.result(30)
+    assert verify_agui(in_order_once(received)).custom == [("tool_confirmation", {"arguments": None})]
+    assert received.terminal is not None and received.terminal.event == "iq:end"
+    assert [type(error).__name__ for error in reported] == ["FrameTooLarge"] and not stream.failed
 
 
 def test_frames_on_the_wire_match_the_types_of_a_scripted_run(iq_client: IQClient, iq_servers: TestServers) -> None:
@@ -241,10 +271,12 @@ def test_a_run_past_the_stream_s_byte_limit_goes_on_unpublished(iq_servers: Test
     agent = Agent(chat_generator=ScriptedChatGenerator([text_turn(words)]))
     ticket = client.ticket()
     subscription = subscribe_in_background(iq_servers.short.url, ticket.stream_id, ticket.token)
-    with IQStream(client, ticket.stream_id) as stream:
+    reported: list[Exception] = []
+    with IQStream(client, ticket.stream_id, on_error=reported.append) as stream:
         result = agent.run(QUESTION, streaming_callback=stream.callback)
     received = subscription.result(30)
     assert result["last_message"].text == "".join(words)
-    assert stream.failed
+    assert stream.failed and reported == [stream.error]
+    assert stream.error is not None and stream.error.code == "stream_too_large"  # pyright: ignore[reportAttributeAccessIssue]
     assert received.terminal is not None and received.terminal.event == "iq:fail"
     assert received.terminal.data["reason"] == "too_large"

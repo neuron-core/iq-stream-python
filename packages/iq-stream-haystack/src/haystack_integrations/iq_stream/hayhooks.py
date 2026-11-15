@@ -123,12 +123,26 @@ def _run_sync(
 
 
 def _callback(stream: IQStream, component: object, theirs: Any = None, *, sync: bool = False) -> StreamingCallbackT:
-    """The stream's callback for a component: async where Haystack awaits it, which an agent does only when its chat
-    generator has ``run_async``; teed with the component's own callback if the data gave one."""
-    inner = component.chat_generator if isinstance(component, Agent) else component
-    if not sync and getattr(inner, "__haystack_supports_async__", False):
-        return stream.acallback if theirs is None else stream.tee(cast(StreamingCallbackT, theirs))
-    return stream.callback if theirs is None else stream.tee(cast(StreamingCallbackT, theirs))
+    """The stream's callback for a component, teed with the component's own callback if the data gave one: async
+    only where every generator that gets it awaits it, since Haystack refuses a coroutine callback where it runs a
+    generator in a thread; the sync one works everywhere, at the cost of Haystack's warning."""
+    if theirs is not None:
+        return stream.tee(cast(StreamingCallbackT, theirs))
+    return stream.acallback if not sync and _awaits_callback(component) else stream.callback
+
+
+def _awaits_callback(component: object) -> bool:
+    """Whether every chat generator that would get the callback from ``component`` in ``run_async`` has ``run_async``
+    of its own. False when that is not known: an agent that passes its callback to tools hands it to sub-agents
+    and functions whose way of calling it cannot be seen."""
+    if isinstance(component, Agent):
+        if component.tool_streaming_callback_passthrough and component.tools:
+            return False
+        return _awaits_callback(component.chat_generator)
+    if not getattr(component, "__haystack_supports_async__", False):
+        return False
+    wrapped: object = getattr(component, "chat_generators", ())  # FallbackChatGenerator's, run each in its own way
+    return all(_awaits_callback(generator) for generator in cast(list[object], wrapped))
 
 
 def _with_callbacks(

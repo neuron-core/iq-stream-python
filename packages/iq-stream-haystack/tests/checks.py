@@ -168,6 +168,9 @@ def verify_ai_sdk(data: list[str]) -> UIMessage:
             message.tools[chunk["toolCallId"]].update(output=chunk["output"], state="output-available")
         elif kind == "tool-output-error":
             message.tools[chunk["toolCallId"]].update(error=chunk["errorText"], state="output-error")
+        elif kind == "tool-input-error":
+            tool = message.tools[chunk["toolCallId"]]
+            tool.update(input=chunk["input"], error=chunk["errorText"], state="output-error")
         elif kind.startswith("data-"):
             message.data.append((kind[5:], chunk["data"]))
         elif kind in ("finish", "error", "abort"):

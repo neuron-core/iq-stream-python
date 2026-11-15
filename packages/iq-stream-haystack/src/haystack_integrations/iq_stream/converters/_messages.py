@@ -6,11 +6,13 @@ from __future__ import annotations
 import json
 from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Unpack
+from typing import Literal, Unpack
 
 from haystack.dataclasses import StreamingChunk, ToolCall, ToolCallResult
 
 from .base import MODEL_FINISH, BaseConverter, ConverterOptions, Frame, new_id
+
+Block = Literal["reasoning", "text", "call"]
 
 
 @dataclass
@@ -37,6 +39,10 @@ class Message:
     reasoning_id: str | None = None
     texts: int = 0
     calls: dict[int, Call] = field(default_factory=lambda: {})
+    #: The block indexes that carried something, by kind, and the highest: a provider numbers a message's blocks
+    #: upwards, so a block that starts again, or below the highest, belongs to another model call.
+    blocks: dict[Block, set[int]] = field(default_factory=lambda: {"reasoning": set(), "text": set(), "call": set()})
+    top: int = -1
 
 
 class MessageConverter(BaseConverter):
@@ -55,6 +61,12 @@ class MessageConverter(BaseConverter):
 
     def convert(self, chunk: StreamingChunk, source: Hashable) -> list[Frame]:
         out: list[str] = []
+        open_message = self._messages.get(source)
+        if open_message is not None and _starts_another(open_message, chunk):
+            # The model call that streamed the open message failed without a finish_reason, and the same caller
+            # streams another one: FallbackChatGenerator retrying with the next generator. The two stay apart.
+            del self._messages[source]
+            out += self._close(open_message)
         reasoning = chunk.reasoning.reasoning_text if chunk.reasoning is not None else ""
         if reasoning:
             message = self._message(source, out)
@@ -88,6 +100,11 @@ class MessageConverter(BaseConverter):
                 out += self._call_delta(call, delta.arguments)
         if chunk.tool_call_result is not None:
             out += self._result(chunk.tool_call_result)
+        message = self._messages.get(source)
+        if message is not None and chunk.index is not None and (reasoning or chunk.content or chunk.tool_calls):
+            message.blocks[_block(chunk)].add(chunk.index)
+            message.blocks["call"].update(delta.index for delta in chunk.tool_calls or [])
+            message.top = max(message.top, chunk.index)
         if chunk.finish_reason in MODEL_FINISH:
             message = self._messages.pop(source, None)
             if message is not None:
@@ -213,3 +230,30 @@ class MessageConverter(BaseConverter):
             self._unanswered.remove(same_tool[0])
             return same_tool[0].id
         return None
+
+
+def _block(chunk: StreamingChunk) -> Block:
+    if chunk.tool_calls:
+        return "call"
+    return "reasoning" if chunk.reasoning is not None and not chunk.content else "text"
+
+
+def _starts_another(message: Message, chunk: StreamingChunk) -> bool:
+    """Whether ``chunk``, from the caller whose ``message`` is open, begins another model message: a tool call delta
+    at an index the message used, with another provider id, or without ids but named again after its arguments; or a
+    block that starts at an index the message used for that kind (or for a tool call), or below its highest. OpenAI's
+    chat completions number text and tool calls apart, both from 0, so a tool call does not count the text's index;
+    some providers repeat a call's id and name on every fragment, so those alone mean nothing."""
+    for delta in chunk.tool_calls or []:
+        call = message.calls.get(delta.index)
+        if call is None:
+            continue
+        if delta.id and not call.generated and delta.id != call.id:
+            return True
+        if not delta.id and call.generated and delta.tool_name and call.arguments:
+            return True
+    if not chunk.start or chunk.index is None or chunk.tool_call_result is not None:
+        return False
+    kind = _block(chunk)
+    used = message.blocks[kind] if kind == "call" else message.blocks[kind] | message.blocks["call"]
+    return chunk.index < message.top or chunk.index in used

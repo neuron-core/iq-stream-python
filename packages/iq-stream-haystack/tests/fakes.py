@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from haystack import component
+from haystack.components.agents import Agent
+from haystack.components.generators.chat import FallbackChatGenerator
 from haystack.dataclasses import (
     ChatMessage,
     ComponentInfo,
@@ -25,7 +27,7 @@ from haystack.dataclasses import (
     select_streaming_callback,
 )
 from haystack.dataclasses.streaming_chunk import ToolCallDelta
-from haystack.tools import ToolsType
+from haystack.tools import ToolsType, tool
 
 Shape = Literal["openai", "mock", "anthropic"]
 
@@ -161,6 +163,7 @@ class ScriptedChatGenerator(_Scripted):
         messages: list[ChatMessage],
         streaming_callback: StreamingCallbackT | None = None,
         tools: ToolsType | None = None,
+        generation_kwargs: dict[str, Any] | None = None,  # FallbackChatGenerator passes it
     ) -> dict[str, Any]:
         callback = select_streaming_callback(None, streaming_callback, requires_async=False)
         return self._stream_sync(messages, callback)
@@ -171,6 +174,7 @@ class ScriptedChatGenerator(_Scripted):
         messages: list[ChatMessage],
         streaming_callback: StreamingCallbackT | None = None,
         tools: ToolsType | None = None,
+        generation_kwargs: dict[str, Any] | None = None,  # FallbackChatGenerator passes it
     ) -> dict[str, Any]:
         callback = select_streaming_callback(None, streaming_callback, requires_async=True)
         turn = self._turn(messages)
@@ -197,6 +201,7 @@ class SyncOnlyChatGenerator(_Scripted):
         messages: list[ChatMessage],
         streaming_callback: StreamingCallbackT | None = None,
         tools: ToolsType | None = None,
+        generation_kwargs: dict[str, Any] | None = None,  # FallbackChatGenerator passes it
     ) -> dict[str, Any]:
         callback = select_streaming_callback(None, streaming_callback, requires_async=False)
         return self._stream_sync(messages, callback)
@@ -230,3 +235,31 @@ def result_chunk(call: ToolCall, result: Any = "Sunny, 21C", *, error: bool = Fa
 RESULTS_DONE = StreamingChunk(
     content="", finish_reason="tool_call_results", meta={"finish_reason": "tool_call_results"}
 )
+
+
+def fallback_agent(kind: Literal["text", "tool"]) -> Agent:
+    """A FallbackChatGenerator whose first generator breaks mid-answer, the second answering instead with the same
+    callback. ``text``: the first had streamed half a sentence. ``tool``: it had opened call_A and streamed half its
+    arguments; the second calls call_B."""
+    broken = RuntimeError("the provider's stream broke")
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Get the weather for a city."""
+        return f"Sunny in {city}"
+
+    if kind == "text":
+        half = text_turn(["The weather ", "in Par"]).chunks
+        first = ScriptedChatGenerator([Turn(half, ChatMessage.from_assistant(""), broken, fail_after=2)])
+        second = ScriptedChatGenerator([text_turn(["It is ", "sunny in Paris."])])
+        return Agent(chat_generator=FallbackChatGenerator([first, second]))
+    opening = ToolCallDelta(index=0, tool_name="get_weather", id="call_A")
+    half = [
+        StreamingChunk(content="", index=0, start=True, tool_calls=[opening]),
+        StreamingChunk(content="", index=0, tool_calls=[ToolCallDelta(index=0, arguments='{"city": "Ro')]),
+    ]
+    answer = text_turn(["It is sunny in Paris."])
+    first = ScriptedChatGenerator([Turn(half, ChatMessage.from_assistant(""), broken, fail_after=2), answer])
+    call_b = ToolCall(tool_name="get_weather", arguments={"city": "Paris"}, id="call_B")
+    second = ScriptedChatGenerator([tool_turn([call_b]), answer])
+    return Agent(chat_generator=FallbackChatGenerator([first, second]), tools=[get_weather])

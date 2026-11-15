@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Unpack
 
 from ag_ui.core import (
@@ -27,7 +28,7 @@ from ag_ui.core import (
 from haystack.dataclasses import ToolCallResult
 
 from ._messages import Call, MessageConverter
-from .base import ConverterOptions, Frame, new_id
+from .base import ConverterOptions, Frame, dumps, new_id
 
 
 def encode_event(event: BaseEvent) -> str:
@@ -66,7 +67,9 @@ class AGUIConverter(MessageConverter):
         return self._frames([*self._close_all(), encode_event(RunErrorEvent(message=message, code="error"))])
 
     def custom(self, name: str, value: object) -> list[Frame]:
-        return [Frame(self.fit.whole(encode_event(CustomEvent(name=name, value=value))))]
+        # Through the JSON the other protocols write, so that what JSON cannot hold becomes its str() here too.
+        event = CustomEvent(name=name, value=json.loads(dumps(value)))
+        return [Frame(self.fit.whole(encode_event(event)))]
 
     def _start_reasoning(self, reasoning_id: str) -> list[str]:
         return [

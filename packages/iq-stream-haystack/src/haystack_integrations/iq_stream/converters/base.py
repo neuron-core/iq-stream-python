@@ -19,6 +19,8 @@ from iq_stream import DEFAULT_MAX_FRAME_BYTES, FrameTooLarge
 MASKED_ERROR = "An error occurred."
 #: The content of a tool result that is not published (``include_tool_results=False``).
 OMITTED_RESULT = "[tool result omitted]"
+#: Why a tool call whose arguments are not JSON gets no result: Haystack drops such a call.
+INVALID_ARGUMENTS = "The tool call's arguments are not valid JSON."
 #: The finish reasons that end one model message; ``tool_call_results`` ends a batch of tool results instead.
 MODEL_FINISH = frozenset({"stop", "length", "content_filter", "tool_calls"})
 
