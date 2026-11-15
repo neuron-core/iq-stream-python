@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from time import monotonic
 from types import TracebackType
+from typing import Literal
 
 from ._answer import NO_ANSWER, Answer, PublishResult, refusal
 from ._core import PUB_TOKEN_TTL, Core
@@ -113,6 +114,11 @@ class Publisher:
     def requests(self) -> int:
         """Requests opened for this stream: 1 unless one was lost and the stream continued in another."""
         return self._writer.requests
+
+    @property
+    def on_error(self) -> Literal["report", "raise"]:
+        """The client's ``on_error``: whether ``send()`` and ``close()`` raise the error the publisher gave up on."""
+        return "raise" if self._settings.raise_errors else "report"
 
     @property
     def alive(self) -> bool:

@@ -154,8 +154,9 @@ The client holds no connection and no thread until a publisher or a request need
 | `close(outcome="end", timeout=10.0) -> PublishResult` | Sends the close line and returns the server's answer; awaited, and shielded from cancellation, in `AsyncPublisher`. The first outcome wins and every call returns the same result. `timeout` counts from the moment the close line may go out. |
 | `abort()` | Drops the connection and leaves the stream open, without a close line: it ends with the server's idle timeout, or with `close_stream()` from another process. |
 | `with` / `async with` | Closes with `end` on a normal exit, and with `fail` on an exception, a `KeyboardInterrupt` or a cancellation, which then goes on. |
-| `frame_size(data, event=None)`, `max_frame_bytes` | The size a frame would have on the wire, envelope and escapes included, and the limit it must fit. |
-| `frames_sent`, `bytes_sent`, `alive`, `error`, `requests`, `stream_id` | What was queued, whether the publisher gave up and why, and how many requests the stream took. |
+| `frame_size(data, event=None)`, `max_frame_bytes` | The size a frame would have on the wire, envelope and escapes included, and the limit it must fit. `iq_stream.frame_size()` is the same function, for code that has no publisher at hand. |
+| `frames_sent`, `bytes_sent`, `alive`, `error`, `requests`, `stream_id` | What was queued, whether the publisher gave up and why, and how many requests the stream took. `bytes_sent` counts the lines as they go on the wire; the server charges a stream more than that for each frame (its text as subscribers receive it, rounded up, plus 32 bytes), so it is a lower bound on what counts against `MAX_STREAM_BYTES`. |
+| `on_error` | The client's `on_error`, `"report"` or `"raise"`: an adapter that stops encoding once `alive` is false reads it to know whether the run should see the error. |
 
 Code that takes a publisher types it with `PublisherLike` or `AsyncPublisherLike`, protocols of this surface that the real publishers and the testing kit's recorders all fit.
 

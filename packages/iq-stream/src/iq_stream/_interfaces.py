@@ -4,7 +4,7 @@ recorders all fit, so an adapter types its parameters with these and its tests p
 from __future__ import annotations
 
 from types import TracebackType
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ._answer import PublishResult
 from ._errors import IQError
@@ -23,6 +23,12 @@ class _Surface(Protocol):
 
     @property
     def bytes_sent(self) -> int: ...
+
+    @property
+    def requests(self) -> int: ...
+
+    @property
+    def on_error(self) -> Literal["report", "raise"]: ...
 
     @property
     def alive(self) -> bool: ...

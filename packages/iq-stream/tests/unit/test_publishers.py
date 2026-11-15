@@ -7,6 +7,7 @@ import asyncio
 import os
 import threading
 import time
+from typing import Any
 
 import pytest
 from fakes import STREAM, Harness, Pending, closed_end, closed_fail, open_, until
@@ -276,3 +277,14 @@ async def test_apublisher_returns_an_async_publisher_whose_request_opens_when_th
     request = await h.request(0)
     request.respond(200, lastEventId=0, closed=True, outcome="end")
     assert (await pub.close()).closed is True
+
+
+@pytest.mark.parametrize("mode", ["report", "raise"])
+async def test_a_publisher_tells_an_adapter_which_on_error_mode_it_runs_under(setup: Any, mode: str) -> None:
+    h = setup(on_error=mode)
+    pub = h.publisher()
+    await asyncio.sleep(0)
+    try:
+        assert (pub.on_error, pub.requests) == (mode, 1)
+    finally:
+        pub.abort()

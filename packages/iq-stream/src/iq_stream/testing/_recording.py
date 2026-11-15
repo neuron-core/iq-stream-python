@@ -61,6 +61,10 @@ class _Recorder:
         return 1
 
     @property
+    def on_error(self) -> Literal["report", "raise"]:
+        return "raise" if self._raise else "report"
+
+    @property
     def alive(self) -> bool:
         return self.error is None and self.outcome is None and not self.aborted
 

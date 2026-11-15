@@ -149,3 +149,15 @@ async def test_the_recorders_fit_the_protocols_an_adapter_types_its_publisher_wi
     # The real publishers fit them too (the type checker says so): a function typed with one takes either.
     real: tuple[type[PublisherLike], type[AsyncPublisherLike]] = (Publisher, AsyncPublisher)
     assert real == (Publisher, AsyncPublisher)
+
+
+def test_the_recorders_report_their_on_error_mode_and_one_request() -> None:
+    assert (RecordingPublisher().on_error, RecordingPublisher(on_error="raise").on_error) == ("report", "raise")
+    assert (AsyncRecordingPublisher().requests, AsyncRecordingPublisher(on_error="raise").on_error) == (1, "raise")
+
+
+def test_frame_size_is_also_a_function_of_the_package() -> None:
+    from iq_stream import frame_size
+
+    assert frame_size("a") == RecordingPublisher().frame_size("a") == len('{"data":"a"}')
+    assert frame_size("a", "token") == len('{"event":"token","data":"a"}')

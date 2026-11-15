@@ -36,5 +36,7 @@ def iq_client(iq_servers: TestServers) -> IQClient:
 
 @pytest.fixture
 def iq_short_client(iq_servers: TestServers) -> IQClient:
-    """A client of the short server, whose frame limit (1,024 bytes) it knows."""
+    """A client of the short server, whose frame limit (1,024 bytes) it knows. Its keepalive is the default 20 s,
+    longer than that server's 2 s read timeout, so a silent run there exercises resuming; a test of keepalives makes
+    its own client with ``keepalive=0.5``."""
     return IQClient(iq_servers.short.url, iq_servers.app_key, iq_servers.app_secret, min_open=0.0, max_frame_bytes=1024)
