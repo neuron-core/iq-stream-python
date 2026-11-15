@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import re
 import threading
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 from types import TracebackType
 from typing import Any, Literal
 
@@ -280,13 +281,43 @@ class CrewAIStream:
         raise_errors = exc is None
         if self._transport is not None and self._transport.blocking:
             # The bus is flushed before the closing frames, which blocks: all of it in a thread.
-            await asyncio.shield(asyncio.to_thread(lambda: self._close(self._finish(exc), raise_errors)))
+            await _in_thread(lambda: self._close(self._finish(exc), raise_errors))
         else:
             # The closing frames go out at once, even when the task is being cancelled; only the server's answer is
             # waited for, in a thread, and shielded so that a cancellation cannot drop the close line.
             outcome = self._finish(exc)
-            await asyncio.shield(asyncio.to_thread(self._close, outcome, raise_errors))
+            await _in_thread(lambda: self._close(outcome, raise_errors))
         return False
+
+
+async def _in_thread(work: Callable[[], None]) -> None:
+    """Runs ``work`` in a thread of its own and waits for it, shielded from cancellation. Not the loop's default
+    executor: ``kickoff_async`` holds one of its threads for a whole crew run, and a busy server would make the close
+    line wait for other requests' crews."""
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[None] = loop.create_future()
+    # Retrieved even when nobody waits any more (the task was cancelled meanwhile), so that asyncio logs nothing.
+    done.add_done_callback(lambda future: future.cancelled() or future.exception())
+
+    def settle(error: BaseException | None) -> None:
+        if done.done():
+            return
+        if error is None:
+            done.set_result(None)
+        else:
+            done.set_exception(error)
+
+    def run() -> None:
+        error: BaseException | None = None
+        try:
+            work()
+        except BaseException as caught:
+            error = caught
+        with contextlib.suppress(RuntimeError):  # the loop is closed: nobody is waiting
+            loop.call_soon_threadsafe(settle, error)
+
+    threading.Thread(target=run, name="iq-stream-crewai close").start()
+    await asyncio.shield(done)
 
 
 def publish(

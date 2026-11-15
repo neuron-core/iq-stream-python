@@ -12,7 +12,10 @@ from ._snapshot import Snapshot, Snapshotter
 _EVENT_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _DELTAS = frozenset({"llm_stream_chunk", "llm_thinking_chunk"})
 # What may be cut when a frame is over the limit, in no particular order: the longest goes first.
-_CUTTABLE = ("output", "error", "message", "feedback", "tool_args", "task_name", "usage")
+_CUTTABLE = (
+    *("output", "error", "message", "feedback", "tool_args", "task_name", "usage"),
+    *("agent_role", "crew_name", "flow_name", "method_name", "tool_name", "model"),
+)
 
 
 class NativeEncoder:
@@ -27,6 +30,8 @@ class NativeEncoder:
         return []
 
     def frames(self, snapshot: Snapshot) -> list[Frame]:
+        if not self._snapshot.admit(snapshot):
+            return []
         name = snapshot.type if _EVENT_NAME.fullmatch(snapshot.type) else None
         payload = {"seq": snapshot.seq, **snapshot.fields} if snapshot.seq is not None else dict(snapshot.fields)
         if snapshot.type in _DELTAS:

@@ -33,7 +33,7 @@ answer(ticket.stream_id, "What is the capital of France?")
 
 The block taps CrewAI through a scoped stream sink, the mechanism CrewAI's own frame streaming is built on. It sees every event emitted in the block's context and in the threads CrewAI starts from it, in the thread that emits it, before any listener of the global event bus: several crews in one process never see each other's events, nothing overtakes an event on its way to the stream, and nothing is left to flush when `kickoff()` returns. Each event is copied, encoded under one lock per stream and handed to the core's `send()`, which only queues.
 
-In asyncio, the same object is used with `async with`. The adapter still uses the core's synchronous publisher, because CrewAI emits from worker threads even in `akickoff()`; the closing frames go out before anything is awaited, and the server's answer is awaited in a thread.
+In asyncio, the same object is used with `async with`. The adapter still uses the core's synchronous publisher, because CrewAI emits from worker threads even in `akickoff()`; the closing frames go out before anything is awaited, and the server's answer is awaited in a thread of its own, not in the loop's default executor, where each `kickoff_async()` holds a thread for its whole run.
 
 ```python
 import asyncio
@@ -143,7 +143,9 @@ A failed or cancelled run reaches the page twice, as `RUN_ERROR` (or `RUN_FINISH
 | `agent_execution_*`, `crew_kickoff_*`, `flow_started`, `flow_finished`, `flow_failed`, `human_feedback_received` | none | their ids, names, `output`, `error`, `total_tokens` |
 | block exits | `RUN_FINISHED`, `RUN_FINISHED` with outcome `cancelled`, or `RUN_ERROR` | none |
 
-Every `crewai` frame also has `seq`, the event's `emission_sequence`. Members without a value are left out. The flows that CrewAI runs inside every agent are left out, and an event that is already an AG-UI event (as flows written for `ag-ui-crewai` emit them) is forwarded as it is.
+Every `crewai` frame also has `seq`, the event's `emission_sequence`. Members without a value are left out. An event that is already an AG-UI event (as flows written for `ag-ui-crewai` emit them) is forwarded as it is.
+
+What CrewAI does for itself is left out of both protocols: the flows it runs inside every agent and for memory, and, inside a task, an agent's run or a memory save or search, every model call that no agent made (memory's analysis, the conversion of a task's output, a model your tool calls itself). Elsewhere a model call is published whoever made it, `llm.call()` in the block or in a flow method included.
 
 ## Which close line
 
@@ -184,8 +186,9 @@ An `Encoder` has four methods: `snapshot(source, event)` runs in the emitting th
 - **Tool results are matched by tool, agent and arguments.** CrewAI's tool events carry no tool call id; two concurrent calls of the same tool by the same agent with the same arguments get their results in the order they started.
 - **Models without function calling** stream CrewAI's ReAct text (`Thought:`, `Action:`, `Final Answer:`), published as the model wrote it; the tool call is announced when the tool starts.
 - **Every model call is a message.** A crew with several tasks or agents publishes one assistant message per model call, intermediate ones included; the `name` of each message is the agent's role.
-- **What does not inherit the block's context is not published**: a thread pool your code created before the block and feeds without copying the context, or a job handed to another process. Work CrewAI starts is included, nested crews and delegated agents among it.
-- **The sink is not a declared public API of CrewAI**, though its own frame streaming and the AG-UI bridge use it. `transport="bus"` is the fallback for a CrewAI without it: handlers on the global event bus run in a thread pool, after other listeners and out of order, so a writer thread holds each event for 50 ms and releases them in emission order, and the block's exit waits for the bus to flush. It adds latency and depends on that margin.
+- **What does not run in the block's context is not published.** Work CrewAI starts is included, nested crews and delegated agents among it. Work your code hands to its own threads or pools is not, wherever they were created (a Python thread does not inherit the context), unless it runs in a copy: `pool.submit(contextvars.copy_context().run, crew.kickoff)`, or `asyncio.to_thread()`, which copies it. Neither is a job handed to another process.
+- **CrewAI's own model calls in a flow method are published**: `@human_feedback(llm=...)` classifies the feedback with a model call inside your method, which the adapter cannot tell from yours.
+- **The sink is not a declared public API of CrewAI**, though its own frame streaming and the AG-UI bridge use it. `transport="bus"` is the fallback for a CrewAI without it: handlers on the global event bus run in a thread pool, after other listeners and out of order, so a writer thread holds each event for 50 ms and releases them in the order they were made (their timestamp, then their `emission_sequence`, which restarts at every kickoff), and the block's exit waits for the bus to flush. It adds latency and depends on that margin.
 
 Not covered: serving HTTP or receiving the user's message, AG-UI's shared state and messages snapshots, resuming a paused flow, memory, knowledge, MCP and A2A events, a task's `human_input=True` (it reads the terminal and emits no event), and the AI SDK's UI message stream, for which CrewAI has no converter.
 

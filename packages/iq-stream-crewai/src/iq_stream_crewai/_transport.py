@@ -9,11 +9,12 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from crewai.events.base_events import BaseEvent
 
-from ._snapshot import EVENT_FIELDS
+from ._snapshot import EVENT_FIELDS, SCOPE_TYPES
 
 Deliver = Callable[[object], None]
 Snapshot = Callable[[object, BaseEvent], "object | None"]
@@ -59,14 +60,17 @@ class SinkTransport:
     blocking = False
 
     def __init__(self, snapshot: Snapshot, deliver: Deliver) -> None:
-        self._snapshot = snapshot
-        self._deliver = deliver
+        self._snapshot: Snapshot | None = snapshot
+        self._deliver: Deliver | None = deliver
         self._token: contextvars.Token[Any] | None = None
 
     def _sink(self, source: object, event: BaseEvent) -> None:
-        snapshot = self._snapshot(source, event)
+        take, deliver = self._snapshot, self._deliver
+        if take is None or deliver is None:
+            return
+        snapshot = take(source, event)
         if snapshot is not None:
-            self._deliver(snapshot)
+            deliver(snapshot)
 
     def attach(self) -> None:
         assert _sinks is not None
@@ -75,11 +79,13 @@ class SinkTransport:
     def detach(self) -> None:
         assert _sinks is not None
         if self._token is not None:
-            # A ValueError: exited in another context than it was entered in. Threads started in the block keep the
-            # sink in their copies of the context anyway; the stream ignores what they emit once it is closed.
+            # A ValueError: exited in another context than it was entered in.
             with contextlib.suppress(ValueError):
                 _sinks.reset_stream_sinks(self._token)
             self._token = None
+        # Copies of the block's context outlive it: threads started in the block, and the event loop CrewAI's bus
+        # creates on its first event, in that event's context. The sink they keep lets go of the stream.
+        self._snapshot = self._deliver = None
 
     def settle(self) -> None:
         pass
@@ -113,18 +119,28 @@ def _register() -> None:
     with _register_lock:
         if _registered:
             return
+        # The scope events too, published or not: they tell where an event was emitted.
+        wanted = EVENT_FIELDS.keys() | SCOPE_TYPES
         for kind in set(_event_classes()):
             default = kind.model_fields.get("type")
-            if default is not None and default.default in EVENT_FIELDS:
+            if default is not None and default.default in wanted:
                 crewai_event_bus.register_handler(kind, _handler)
         _registered = True
+
+
+def _order(event: BaseEvent) -> tuple[float, int]:
+    """Where an event goes among the others. ``emission_sequence`` restarts at every top-level kickoff, so it orders
+    only the events of one kickoff; the time the event was made, in the emitting thread, orders the kickoffs."""
+    stamp: object = getattr(event, "timestamp", None)
+    made = stamp.timestamp() if isinstance(stamp, datetime) else time.time()
+    return made, event.emission_sequence or 0
 
 
 class BusTransport:
     """Handlers on the global event bus. They run in the bus's thread pool, after any other listener of the same
     event and out of emission order, so a writer thread holds each event for ``window`` seconds and releases what it
-    holds in ``emission_sequence`` order; on exit the bus is flushed first. Degraded: it adds latency, depends on a
-    timing margin, and ``flush()`` waits for every listener in the process."""
+    holds in the order the events were made; on exit the bus is flushed first. Degraded: it adds latency, depends on
+    a timing margin, and ``flush()`` waits for every listener in the process."""
 
     blocking = True
 
@@ -140,7 +156,7 @@ class BusTransport:
     def take(self, source: object, event: BaseEvent) -> None:
         snapshot = self._snapshot(source, event)
         if snapshot is not None:
-            self._queue.put((event.emission_sequence or 0, time.monotonic(), snapshot))
+            self._queue.put((_order(event), time.monotonic(), snapshot))
 
     def attach(self) -> None:
         _register()
@@ -162,7 +178,7 @@ class BusTransport:
         self._writer.join(self._flush_timeout)
 
     def _write(self) -> None:
-        held: list[tuple[int, int, float, object]] = []
+        held: list[tuple[tuple[float, int], int, float, object]] = []
         count = 0
         stopping = False
         while not stopping or held:
@@ -173,9 +189,9 @@ class BusTransport:
             if item is _STOP:
                 stopping = True
             elif isinstance(item, tuple):
-                seq, arrived, snapshot = item  # pyright: ignore[reportUnknownVariableType]
+                order, arrived, snapshot = item  # pyright: ignore[reportUnknownVariableType]
                 count += 1
-                heapq.heappush(held, (seq, count, arrived, snapshot))  # pyright: ignore[reportUnknownArgumentType]
+                heapq.heappush(held, (order, count, arrived, snapshot))  # pyright: ignore[reportUnknownArgumentType]
             now = time.monotonic()
             while held and (stopping or now - held[0][2] >= self._window):
                 self._deliver(heapq.heappop(held)[3])

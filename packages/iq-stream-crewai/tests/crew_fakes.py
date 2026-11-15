@@ -167,6 +167,56 @@ class FakeReActLLM(BaseLLM):
         return self.call(messages, **kwargs)
 
 
+# Memory's analyses, by a phrase of their system prompts (crewai/translations/en.json, "memory").
+MEMORY_ANSWERS = {
+    "You extract discrete": {"memories": ["The user asked about the capital of France."]},
+    "You analyze content to be stored": {"suggested_scope": "/geography", "categories": ["geography"]},
+    "You analyze a query": {"keywords": ["France"], "suggested_scopes": ["/"], "complexity": "simple"},
+    "You are comparing new content": {"actions": [], "insert_new": True, "insert_reason": "new"},
+}
+
+
+class FakeMemoryLLM(BaseLLM):
+    """The model of a crew's ``Memory``: no function calling, every answer a JSON text, as memory's analysis expects;
+    without streaming, as CrewAI makes memory's model calls."""
+
+    calls: int = 0
+
+    def __init__(self, **data: Any) -> None:
+        data.setdefault("model", "fake-memory")
+        super().__init__(**data)
+
+    def supports_function_calling(self) -> bool:
+        return False
+
+    def call(
+        self,
+        messages: Any,
+        tools: Any = None,
+        callbacks: Any = None,
+        available_functions: Any = None,
+        from_task: Any = None,
+        from_agent: Any = None,
+        response_model: Any = None,
+    ) -> Any:
+        self.calls += 1
+        prompt = json.dumps(messages)
+        answer = json.dumps(next(value for key, value in MEMORY_ANSWERS.items() if key in prompt))
+        where = {"from_task": from_task, "from_agent": from_agent}
+        with llm_call_context():
+            self._emit_call_started_event(messages=messages, tools=tools, **where)
+            self._emit_call_completed_event(response=answer, call_type=LLMCallType.LLM_CALL, messages=messages, **where)
+        return answer
+
+    async def acall(self, messages: Any, **kwargs: Any) -> Any:
+        return self.call(messages, **kwargs)
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    """An embedder for ``Memory``, without a model."""
+    return [[float(len(text) % 7), 1.0, 0.5, 0.25] for text in texts]
+
+
 class LookupTool(BaseTool):
     name: str = "lookup"
     description: str = "Look up a value."

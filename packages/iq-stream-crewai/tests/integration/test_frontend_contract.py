@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from crew_fakes import ANSWER, TERM, LookupTool, make_crew
+from crew_fakes import ANSWER, TERM, FakeMemoryLLM, LookupTool, embed, make_crew
+from crewai.memory.unified_memory import Memory
 from iq_stream import IQClient
 from iq_stream.testing import Subscription, TestServers, subscribe_in_background
 
@@ -76,6 +77,27 @@ def test_ag_ui_a_run_with_a_tool_call(iq_client: IQClient, iq_servers: TestServe
     assert tool_call["name"] == "lookup" and json.loads(tool_call["arguments"]) == {"term": TERM}
     assert tool["role"] == "tool" and tool["content"] == f"value:{TERM}"
     assert text == {"role": "assistant", "content": ANSWER}
+
+
+def test_ag_ui_a_crew_with_memory(iq_client: IQClient, iq_servers: TestServers, tmp_path: Path) -> None:
+    # Memory's analysis answers JSON through model calls of its own: none of it is a message of the conversation.
+    memory = Memory(llm=FakeMemoryLLM(), embedder=embed, storage=str(tmp_path / "memory"))
+    crew = make_crew()
+    crew.memory = memory
+    ticket = iq_client.ticket()
+    subscription = subscribe_in_background(iq_servers.default.url, ticket.stream_id, ticket.token)
+    try:
+        with publish(iq_client, ticket.stream_id):
+            crew.kickoff()
+    finally:
+        memory.close()
+    result = replay("ag-ui", subscription.result(30), tmp_path)
+    assert result["error"] is None and result["outcome"] == "success"
+    assert [message.get("content") for message in result["messages"] if message["role"] == "assistant"] == [
+        None,
+        ANSWER,
+    ]
+    assert result["messages"][-1] == {"role": "assistant", "content": ANSWER}
 
 
 def test_ag_ui_a_failing_run(iq_client: IQClient, iq_servers: TestServers, tmp_path: Path) -> None:

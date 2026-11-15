@@ -143,6 +143,8 @@ class AgUiEncoder:
     def frames(self, snapshot: Snapshot | Foreign) -> list[Frame]:
         if isinstance(snapshot, Foreign):
             return self._fit.whole(snapshot.payload)
+        if not self._snapshot.admit(snapshot):
+            return []
         handler = self._handlers.get(snapshot.type)
         return [] if handler is None else handler(snapshot)
 

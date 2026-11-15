@@ -6,7 +6,8 @@ import json
 from typing import Any
 
 import pytest
-from crew_fakes import ANSWER, TERM, LookupTool, make_crew
+from crew_fakes import ANSWER, TERM, FakeStreamingLLM, LookupTool, make_crew
+from crewai import Agent, Crew, Task
 from iq_stream.testing import RecordingPublisher
 
 from iq_stream_crewai import EVENT_TYPES, publish
@@ -90,3 +91,35 @@ def test_long_text_values_are_cut_to_max_text_chars() -> None:
     # The answer streamed in chunks is not cut.
     chunks = [json.loads(frame.data)["chunk"] for frame in publisher.frames if frame.event == "llm_stream_chunk"]
     assert "".join(chunks).endswith(ANSWER)
+
+
+def test_long_names_are_cut_to_fit_the_frame() -> None:
+    llm = FakeStreamingLLM(tool_args=[{"term": TERM}])
+    agent = Agent(role="R" * 3000, goal="g", backstory="b", llm=llm, tools=[LookupTool()], max_retry_limit=0)
+    crew = Crew(name="C" * 3000, agents=[agent], tasks=[Task(description="d", expected_output="o", agent=agent)])
+    publisher = RecordingPublisher(max_frame_bytes=1024)
+    with publish(publisher, protocol="crewai") as run:
+        crew.kickoff()
+    for frame in publisher.frames:
+        assert publisher.frame_size(frame.data, frame.event) <= 1024
+    seen = frames(publisher)
+    assert [name for name, _ in seen].count("agent_execution_started") == 1
+    roles = [data["agent_role"] for _, data in seen if "agent_role" in data]
+    assert len(roles) == 5  # agent started and completed, two model calls, the tool
+    assert all(role.startswith("RRR") and role.endswith("characters truncated]") for role in roles)
+    assert seen[0][1]["crew_name"].endswith("characters truncated]")
+    assert run.errors == []
+
+
+def test_values_are_copied_when_the_event_is_emitted() -> None:
+    from crewai.events.types.tool_usage_events import ToolUsageStartedEvent
+
+    from iq_stream_crewai._snapshot import Snapshotter
+
+    event = ToolUsageStartedEvent(tool_name="lookup", tool_args={"term": "x", "seen": ["a"]})
+    snapshot = Snapshotter(frozenset(EVENT_TYPES), None, False)(None, event)
+    assert snapshot is not None
+    assert isinstance(event.tool_args, dict)
+    event.tool_args["seen"].append("b")  # the tool, or the agent, changes its arguments after the event
+    event.tool_args["term"] = "y"
+    assert snapshot.fields["tool_args"] == {"term": "x", "seen": ["a"]}

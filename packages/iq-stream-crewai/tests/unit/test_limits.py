@@ -117,3 +117,17 @@ def test_the_cost_per_token_stays_small() -> None:
         encoder.frames(encoder.snapshot(None, event))  # type: ignore[arg-type]
     per_token = (time.perf_counter() - started) / count
     assert per_token < 200e-6, f"{per_token * 1e6:.1f} µs per token"
+
+
+def test_the_fitter_measures_every_frame_that_might_not_fit() -> None:
+    # Frames short enough are sent without measuring; a character of the data can take up to six bytes in the line
+    # (a lone surrogate, escaped), three for most CJK text and four for an emoji.
+    from iq_stream._frame import frame_size
+
+    for limit in (1024, 4096):
+        fitter = Fitter(limit, frame_size, lambda error: None)
+        for char in ("é", "中", "😀", "\ud800", '"', "\\"):
+            for count in range(50, 1600, 25):
+                payload = {"type": "X", "delta": char * count}
+                for frames in (fitter.whole(payload), fitter.split(payload, "delta"), fitter.cut(payload, ["delta"])):
+                    assert all(frame_size(data, event) <= limit for event, data in frames), (limit, char, count)

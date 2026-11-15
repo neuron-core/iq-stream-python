@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import threading
 import time
@@ -12,9 +13,11 @@ from agui_checks import checked, conversation, types
 from crew_fakes import ANSWER, TERM, LookupTool, make_crew
 from crewai.events import crewai_event_bus
 from crewai.events.base_events import BaseEvent
+from crewai.events.types.llm_events import LLMStreamChunkEvent
+from iq_stream import Outcome, PublishResult
 from iq_stream.testing import RecordingPublisher
 
-from iq_stream_crewai import publish
+from iq_stream_crewai import Frame, publish
 from iq_stream_crewai._snapshot import EVENT_FIELDS
 from iq_stream_crewai._transport import _event_classes
 
@@ -105,3 +108,72 @@ def test_two_runs_in_two_threads() -> None:
         thread.join(60)
     for publisher, answer in zip(publishers, answers, strict=True):
         assert conversation(checked(publisher.data)).text == answer
+
+
+def test_several_kickoffs_in_one_block_keep_their_order() -> None:
+    # emission_sequence restarts at every top-level kickoff, kickoff_for_each's copies included.
+    publisher = RecordingPublisher()
+    with publish(publisher, protocol="crewai", transport="bus"):
+        make_crew(name="one", delay=0.002).kickoff()
+        make_crew(name="two", delay=0.002).kickoff()
+        make_crew(name="each", terms=[]).kickoff_for_each(inputs=[{}, {}])
+    crews = [
+        (frame.event, json.loads(frame.data)["crew_name"])
+        for frame in publisher.frames
+        if frame.event and frame.event.startswith("crew_kickoff")
+    ]
+    names = ["crew-one", "crew-two", "crew-each", "crew-each"]
+    assert crews == [(f"crew_kickoff_{state}", name) for name in names for state in ("started", "completed")]
+
+    publisher = RecordingPublisher()
+    with publish(publisher, transport="bus"):
+        make_crew(name="one", answer="Answer one.", delay=0.002).kickoff()
+        make_crew(name="two", answer="Answer two.", delay=0.002).kickoff()
+    events = checked(publisher.data)
+    assert list(conversation(events).texts.values()) == ["Answer one.", "Answer two."]
+    steps = [(event["type"], event["stepName"]) for event in events if event["type"].startswith("STEP_")]
+    assert steps == [
+        ("STEP_STARTED", "task:Answer question one"),
+        ("STEP_FINISHED", "task:Answer question one"),
+        ("STEP_STARTED", "task:Answer question two"),
+        ("STEP_FINISHED", "task:Answer question two"),
+    ]
+
+
+def test_a_thread_that_outlives_the_block_is_not_even_copied_while_the_close_line_is_on_its_way() -> None:
+    copied: list[str] = []
+    late = threading.Event()
+
+    class Lates:
+        def snapshot(self, source: object, event: BaseEvent) -> str | None:
+            if getattr(event, "call_id", None) != "late":
+                return None
+            copied.append("late")
+            return "late"
+
+        def start(self) -> list[Frame]:
+            return []
+
+        def frames(self, snapshot: str) -> list[Frame]:
+            return [("chunk", "{}")]
+
+        def finish(self, error: BaseException | None) -> list[Frame]:
+            return [("finish", "{}")]
+
+    def straggler() -> None:
+        late.wait(5)
+        crewai_event_bus.emit(None, LLMStreamChunkEvent(chunk="x", call_id="late"))
+
+    class AtClose(RecordingPublisher):
+        def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+            late.set()  # the real publisher waits here for min_open and the server's answer
+            thread.join(5)
+            return super().close(outcome, timeout)
+
+    publisher = AtClose()
+    with publish(publisher, protocol=Lates(), transport="bus"):
+        thread = threading.Thread(target=contextvars.copy_context().run, args=(straggler,))
+        thread.start()
+    assert not thread.is_alive()
+    assert copied == []
+    assert [frame.event for frame in publisher.frames] == ["finish"]

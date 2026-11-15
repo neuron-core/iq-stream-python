@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import gc
 import json
 import logging
 import threading
-from collections.abc import Iterable
+import time
+import weakref
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -16,6 +20,7 @@ from crew_fakes import ANSWER, FakeStreamingLLM, LookupTool, make_crew
 from crewai import Agent
 from crewai.events import crewai_event_bus
 from crewai.events.base_events import BaseEvent
+from crewai.events.stream_context import _stream_sinks  # pyright: ignore[reportPrivateUsage]
 from crewai.events.types.llm_events import LLMStreamChunkEvent
 from iq_stream import IQClient, IQError, Outcome, PublishResult
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
@@ -337,3 +342,175 @@ def test_enable_token_streaming() -> None:
     with publish(publisher):
         crew.kickoff()
     assert types(checked(publisher.data)).count("TEXT_MESSAGE_CONTENT") == 6
+
+
+def test_a_refusal_in_the_middle_of_an_event_s_frames_stops_them() -> None:
+    # A model without streaming: its answer is three frames of one event, and the publisher refuses the first.
+    publisher = Dying(after=2, on_error="raise")
+    with pytest.raises(IQError), publish(publisher) as run:
+        make_crew(terms=[], stream=False).kickoff()
+    assert publisher.sends == 3  # RUN_STARTED, STEP_STARTED, the refused TEXT_MESSAGE_START, and nothing after it
+    assert [type(error) for error in run.errors] == [IQError]
+
+
+class AtClose(RecordingPublisher):
+    """Runs ``hook`` when the close line is being sent, before it is recorded: the real publisher waits there for
+    ``min_open`` and the server's answer, while a cancelled crew's worker threads go on emitting."""
+
+    def __init__(self, hook: Callable[[], None]) -> None:
+        super().__init__()
+        self.hook = hook
+
+    def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+        self.hook()
+        return super().close(outcome, timeout)
+
+
+class Late:
+    """An encoder that sees only two events: one whose copy is still being made when the block exits, and one
+    emitted after the closing frames."""
+
+    def __init__(self) -> None:
+        self.copied: list[str] = []
+        self.gate = threading.Event()
+
+    def snapshot(self, source: object, event: BaseEvent) -> str | None:
+        call_id = getattr(event, "call_id", None)
+        if call_id not in ("in flight", "late"):
+            return None
+        self.copied.append(call_id)
+        if call_id == "in flight":
+            self.gate.wait(5)
+        return call_id
+
+    def start(self) -> Iterable[Frame]:
+        return []
+
+    def frames(self, snapshot: str) -> Iterable[Frame]:
+        return [("chunk", json.dumps({"call_id": snapshot}))]
+
+    def finish(self, error: BaseException | None) -> Iterable[Frame]:
+        return [("finish", "{}")]
+
+
+def test_nothing_is_published_after_the_closing_frames_while_the_close_line_is_on_its_way() -> None:
+    encoder = Late()
+    late = threading.Event()
+    threads: list[threading.Thread] = []
+
+    def emit(call_id: str) -> None:
+        if call_id == "late":
+            late.wait(5)
+        crewai_event_bus.emit(None, LLMStreamChunkEvent(chunk="x", call_id=call_id))
+
+    def at_close() -> None:
+        encoder.gate.set()  # the copy in flight is finished now, after the closing frames
+        late.set()
+        for thread in threads:
+            thread.join(5)
+
+    publisher = AtClose(at_close)
+    with publish(publisher, protocol=encoder) as run:
+        for call_id in ("in flight", "late"):
+            thread = threading.Thread(target=contextvars.copy_context().run, args=(emit, call_id))
+            thread.start()
+            threads.append(thread)
+        deadline = time.monotonic() + 5
+        while encoder.copied != ["in flight"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert not any(thread.is_alive() for thread in threads)
+    assert [frame.event for frame in publisher.frames] == ["finish"]
+    assert encoder.copied == ["in flight"]  # the late event was not even copied
+    assert publisher.outcome == "end" and run.errors == []
+
+
+def test_a_block_leaves_no_sink_behind() -> None:
+    with publish(RecordingPublisher()):
+        make_crew(terms=[]).kickoff()
+    assert _stream_sinks.get() == ()  # else every later event of this thread would call it
+
+
+async def test_an_async_block_leaves_no_sink_behind() -> None:
+    async with publish(RecordingPublisher()):
+        await make_crew(terms=[]).akickoff()
+    assert _stream_sinks.get() == ()
+
+
+def test_a_copy_of_the_context_that_outlives_the_block_does_not_keep_the_stream() -> None:
+    # As CrewAI's bus does when its first event is emitted in a block: it creates its event loop, whose handles keep
+    # a copy of the context for the life of the process.
+    with publish(RecordingPublisher()) as run:
+        kept = contextvars.copy_context()
+    stream = weakref.ref(run)
+    del run
+    gc.collect()
+    assert stream() is None
+    assert kept.run(_stream_sinks.get)  # the inert sink is still there
+
+
+async def test_the_close_line_does_not_wait_for_the_loop_s_executor() -> None:
+    # kickoff_async runs a whole crew in the loop's default executor: with every thread of it busy with other
+    # requests' crews, the close line still goes now.
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    gate = threading.Event()
+    busy = loop.run_in_executor(None, gate.wait, 10)
+    publisher = RecordingPublisher()
+
+    async def block() -> None:
+        async with publish(publisher):
+            pass
+
+    try:
+        await asyncio.wait_for(block(), 2)
+    finally:
+        gate.set()
+        await busy
+        executor.shutdown()
+    assert publisher.outcome == "end"
+
+
+class SlowClose(RecordingPublisher):
+    """The server's answer takes half a second, as the real publisher's close() can wait for min_open."""
+
+    def close(self, outcome: Outcome = "end", timeout: float = 10.0) -> PublishResult:
+        time.sleep(0.5)
+        return super().close(outcome, timeout)
+
+
+async def test_the_loop_runs_while_the_close_line_is_answered() -> None:
+    ticks = 0
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(tick())
+    publisher = SlowClose()
+    try:
+        async with publish(publisher) as run:
+            pass
+    finally:
+        ticker.cancel()
+    assert publisher.outcome == "end" and run.result is not None
+    assert ticks >= 10
+
+
+def test_work_handed_to_a_pool_is_published_when_it_runs_in_a_copy_of_the_context() -> None:
+    publisher = RecordingPublisher()
+    with publish(publisher), ThreadPoolExecutor(max_workers=1) as pool:
+        # A pool's threads do not inherit the context, wherever the pool was created.
+        assert pool.submit(make_crew(terms=[]).kickoff).result().raw == ANSWER
+        copied = make_crew(terms=[], answer="Copied.").kickoff
+        pool.submit(contextvars.copy_context().run, copied).result()
+    assert list(conversation(checked(publisher.data)).texts.values()) == ["Copied."]
+
+
+async def test_asyncio_to_thread_carries_the_block_s_context() -> None:
+    publisher = RecordingPublisher()
+    async with publish(publisher):
+        await asyncio.to_thread(make_crew(terms=[]).kickoff)
+    assert conversation(checked(publisher.data)).text == ANSWER

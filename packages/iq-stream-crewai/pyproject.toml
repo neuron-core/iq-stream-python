@@ -82,6 +82,12 @@ filterwarnings = [
     # CrewAI reading its own deprecated fields.
     "ignore:function_calling_llm is deprecated:DeprecationWarning:crewai",
     "ignore:deprecated:DeprecationWarning:crewai",
+    # CrewAI's memory on Python 3.12 and later, partly through its models' default factories, which pydantic calls.
+    "ignore:datetime.datetime.utcnow:DeprecationWarning:(crewai|pydantic)",
+    # CrewAI 1.15.2, the lowest supported, leaves connections to its own sqlite databases open; Python 3.13 warns
+    # when one is collected.
+    "ignore:unclosed database in <sqlite3.Connection object:ResourceWarning",
+    "ignore:Exception ignored in. <sqlite3.Connection object:pytest.PytestUnraisableExceptionWarning",
 ]
 
 [tool.ruff]

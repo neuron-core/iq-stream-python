@@ -347,3 +347,32 @@ def test_a_result_without_a_started_tool_is_announced_with_it() -> None:
     ]
     talk = conversation(events)
     assert list(talk.tool_args.values()) == ['{"term":"y"}'] and list(talk.tool_results.values()) == ["v"]
+
+
+def test_a_tool_s_events_bind_to_the_call_of_their_own_agent() -> None:
+    from crewai.events.types.llm_events import LLMCallCompletedEvent, LLMCallStartedEvent, LLMCallType
+    from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent, ToolUsageStartedEvent
+
+    args = {"term": "x"}
+    now = datetime.now()
+    publisher = RecordingPublisher()
+    with publish(publisher):
+        emit = crewai_event_bus.emit
+        for agent in ("A", "B"):  # two agents stream a call of the same tool with the same arguments
+            call_id = f"call-{agent}"
+            emit(None, LLMCallStartedEvent(call_id=call_id, agent_id=agent, messages=[]))
+            emit(None, _tool_chunk(call_id, f"tc-{agent}", json.dumps(args)))
+            emit(None, LLMCallCompletedEvent(response=[], call_type=LLMCallType.TOOL_CALL, call_id=call_id))
+        for agent in ("B", "A"):  # B's tool runs first
+            emit(None, ToolUsageStartedEvent(tool_name="lookup", tool_args=args, agent_id=agent))
+            finished = ToolUsageFinishedEvent(
+                tool_name="lookup",
+                tool_args=args,
+                agent_id=agent,
+                output=f"by {agent}",
+                started_at=now,
+                finished_at=now,
+            )
+            emit(None, finished)
+    talk = conversation(checked(publisher.data))
+    assert talk.tool_results == {"tc-A": "by A", "tc-B": "by B"}
