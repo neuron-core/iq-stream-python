@@ -14,7 +14,7 @@ from agno.os.interfaces.agui.stream import stream_agno_response_as_agui_events
 from agno.workflow import Workflow
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 from pydantic import TypeAdapter
-from recorded import Errors, collect, payloads, types
+from recorded import Errors, collect, needs_cancelled_outcome, payloads, types
 from scripted_model import SLOW, team, weather_agent
 
 from iq_stream_agno import MASKED_ERROR, apublish, publish
@@ -51,7 +51,7 @@ def collapse(sequence: list[str]) -> list[str]:
 def test_the_weather_run_has_the_plan_s_sequence() -> None:
     publisher = RecordingPublisher()
     agent = weather_agent()
-    list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, protocol="agui", exclude=QUIET))
+    list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui", exclude=QUIET))
     assert collapse(types(publisher, raw=False)) == [
         "RUN_STARTED",
         "text",
@@ -75,7 +75,7 @@ def test_the_weather_run_has_the_plan_s_sequence() -> None:
 def test_the_same_events_through_agno_s_own_stream_give_the_same_sequence() -> None:
     events = list(weather_agent().run("Weather?", stream=True, stream_events=True))
     publisher = RecordingPublisher()
-    list(publish(iter(events), publisher, protocol="agui"))
+    list(publish(iter(events), publisher, protocol="ag-ui"))
     agno_types = [
         str(event.type.value)
         for event in stream_agno_response_as_agui_events(iter(events), thread_id="t", run_id=events[0].run_id)
@@ -86,7 +86,7 @@ def test_the_same_events_through_agno_s_own_stream_give_the_same_sequence() -> N
 async def test_a_failed_run_ends_with_a_masked_run_error() -> None:
     publisher = AsyncRecordingPublisher()
     stream = weather_agent(fail_on_turn=2).arun("Weather?", stream=True, stream_events=True)
-    await collect(apublish(stream, publisher, protocol="agui"))
+    await collect(apublish(stream, publisher, protocol="ag-ui"))
     valid(publisher)
     last = payloads(publisher)[-1]
     assert last["type"] == "RUN_ERROR" and last["message"] == MASKED_ERROR and last["code"] == "RuntimeError"
@@ -94,13 +94,14 @@ async def test_a_failed_run_ends_with_a_masked_run_error() -> None:
     assert publisher.outcome == "fail"
 
 
+@needs_cancelled_outcome
 async def test_a_cancelled_run_finishes_with_the_cancelled_outcome() -> None:
     SLOW["seconds"] = 0.3
     publisher = AsyncRecordingPublisher()
     stream = weather_agent(tool_name="slow_weather").arun(
         "Weather?", stream=True, stream_events=True, run_id="agui-cancel"
     )
-    async for event in apublish(stream, publisher, protocol="agui"):
+    async for event in apublish(stream, publisher, protocol="ag-ui"):
         if event.event == "ToolCallStarted":
             Agent.cancel_run("agui-cancel")
     valid(publisher)
@@ -119,15 +120,16 @@ def test_an_iterator_that_raises_ends_with_run_error() -> None:
             yield event
 
     with pytest.raises(RuntimeError):
-        list(publish(events(), publisher, protocol="agui"))
+        list(publish(events(), publisher, protocol="ag-ui"))
     valid(publisher)
     last = payloads(publisher)[-1]
     assert last["type"] == "RUN_ERROR" and last["message"] == MASKED_ERROR and publisher.outcome == "fail"
 
 
+@needs_cancelled_outcome
 def test_a_caller_that_stops_finishes_the_run_as_cancelled_with_its_spans_closed() -> None:
     publisher = RecordingPublisher()
-    stream = publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher, protocol="agui")
+    stream = publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui")
     for event in stream:
         if event.event == "RunContent":
             break
@@ -143,7 +145,7 @@ def test_oversize_arguments_are_split_and_an_oversize_result_is_cut() -> None:
     errors = Errors()
     agent = weather_agent(tool_args={"city": city})
     stream = agent.run("Weather?", stream=True, stream_events=True)
-    list(publish(stream, publisher, protocol="agui", exclude=QUIET, on_error=errors))
+    list(publish(stream, publisher, protocol="ag-ui", exclude=QUIET, on_dropped=errors))
     valid(publisher)
     assert all(publisher.frame_size(data) <= 1_024 for data in publisher.data)
     args = [payload["delta"] for payload in payloads(publisher) if payload["type"] == "TOOL_CALL_ARGS"]
@@ -155,15 +157,16 @@ def test_oversize_arguments_are_split_and_an_oversize_result_is_cut() -> None:
     assert all(error.code is None and "limit is 1024" in str(error) for error in errors)
 
 
-def test_event_names_name_each_frame_after_its_type() -> None:
+def test_event_names_are_refused_with_ag_ui_whose_stream_agent_reads_only_unnamed_frames() -> None:
     publisher = RecordingPublisher()
-    list(publish(weather_agent().run("Weather?", stream=True), publisher, protocol="agui", event_names=True))
-    assert [frame.event for frame in publisher.frames] == types(publisher)
+    with pytest.raises(ValueError, match="event_names"):
+        publish(iter([]), publisher, protocol="ag-ui", event_names=True)
+    assert publisher.outcome == "fail" and publisher.close_calls == 1
 
 
 def test_a_team_run_converts_and_ends_with_the_leader() -> None:
     publisher = RecordingPublisher()
-    list(publish(team().run("Weather?", stream=True, stream_events=True), publisher, protocol="agui"))
+    list(publish(team().run("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui"))
     valid(publisher)
     kinds = types(publisher, raw=False)
     assert kinds[0] == "RUN_STARTED" and kinds[-1] == "RUN_FINISHED" and kinds.count("RUN_FINISHED") == 1
@@ -173,7 +176,7 @@ def test_a_team_run_converts_and_ends_with_the_leader() -> None:
 async def test_a_team_whose_member_speaks_first_ends_with_the_leader_s_error_under_the_team_s_run_id() -> None:
     publisher = AsyncRecordingPublisher()
     received = await collect(
-        apublish(team(leader_fails=True, preamble=False).arun("Weather?", stream=True), publisher, protocol="agui")
+        apublish(team(leader_fails=True, preamble=False).arun("Weather?", stream=True), publisher, protocol="ag-ui")
     )
     valid(publisher)
     team_run_id = received[-1].run_id
@@ -189,7 +192,7 @@ async def test_a_team_whose_member_speaks_first_ends_with_the_leader_s_error_und
 def test_a_failing_tool_s_error_text_is_masked_in_every_frame() -> None:
     publisher = RecordingPublisher()
     agent = weather_agent(tool_name="broken_tool")
-    list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, protocol="agui"))
+    list(publish(agent.run("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui"))
     valid(publisher)
     assert "secret database password" not in "".join(publisher.data)
     (result,) = [row for row in payloads(publisher) if row["type"] == "TOOL_CALL_RESULT"]
@@ -209,7 +212,65 @@ async def test_a_workflow_s_error_text_is_masked_in_ag_ui_too() -> None:
     publisher = AsyncRecordingPublisher()
     workflow = Workflow(id="failing-wf", name="Failing WF", steps=steps, telemetry=False)
     with pytest.raises(RuntimeError, match="workflow blew up"):
-        await collect(apublish(workflow.arun("Go", stream=True, stream_events=True), publisher, protocol="agui"))
+        await collect(apublish(workflow.arun("Go", stream=True, stream_events=True), publisher, protocol="ag-ui"))
     valid(publisher)
     assert "workflow blew up" not in "".join(publisher.data)
     assert payloads(publisher)[-1]["type"] == "RUN_ERROR" and publisher.outcome == "fail"
+
+
+async def test_a_nested_run_s_failed_tool_is_masked_in_the_raw_copies() -> None:
+    from agno.agent import Agent as Member
+    from agno.team import Team
+    from agno.workflow import Step
+    from scripted_model import ScriptedModel, broken_tool
+
+    member = Member(id="m", name="M", role="r", model=ScriptedModel(tool_name="broken_tool"), tools=[broken_tool])
+    leader = ScriptedModel(tool_name="delegate_task_to_member", tool_args={"member_id": "m", "task": "weather"})
+    broken = [
+        Team(id="team", name="Team", model=leader, members=[member], telemetry=False),
+        Workflow(id="wf", name="WF", steps=[Step(name="s", agent=weather_agent(tool_name="broken_tool"))]),
+    ]
+    for entity in broken:
+        publisher = AsyncRecordingPublisher()
+        await collect(apublish(entity.arun("Weather?", stream=True, stream_events=True), publisher, protocol="ag-ui"))
+        valid(publisher)
+        assert "secret database password" not in "".join(publisher.data) and publisher.outcome == "end"
+    # The workflow's ending has no AG-UI handler: Agno's converter copies it whole, its step runs included, into RAW.
+    raw = [row["event"] for row in payloads(publisher) if row["type"] == "RAW"]
+    ending = [event for event in raw if event["event"] == "WorkflowCompleted"][-1]
+    (tool,) = ending["step_executor_runs"][0]["tools"]
+    assert tool["tool_call_error"] is True and tool["result"] == MASKED_ERROR
+
+
+def test_an_error_event_s_additional_data_is_left_out_of_its_raw_copy() -> None:
+    from agno.run.agent import RunCompletedEvent, RunErrorEvent, RunStartedEvent
+
+    publisher = RecordingPublisher()
+    secret = {"dsn": "postgres://admin:hunter2@db.internal/app"}
+    events = [
+        RunStartedEvent(run_id="team-run"),
+        # A member's error: not the run's end, so Agno's converter copies it into RAW.
+        RunErrorEvent(run_id="member-run", parent_run_id="team-run", content="refused", additional_data=secret),
+        RunCompletedEvent(run_id="team-run", content="Sorry."),
+    ]
+    list(publish(iter(events), publisher, protocol="ag-ui"))
+    (error,) = [row["event"] for row in payloads(publisher) if row.get("event", {}).get("event") == "RunError"]
+    assert error["content"] == MASKED_ERROR
+    assert error.get("additional_data") is None and "hunter2" not in "".join(publisher.data)
+
+
+def test_a_nested_workflow_s_failure_does_not_end_the_outer_workflow() -> None:
+    from agno.run.workflow import WorkflowCompletedEvent, WorkflowErrorEvent, WorkflowStartedEvent
+
+    publisher = RecordingPublisher()
+    # A workflow run as a step of another: its events name no parent, only their depth.
+    events = [
+        WorkflowStartedEvent(run_id="inner", nested_depth=1),
+        WorkflowErrorEvent(run_id="inner", nested_depth=1, error="inner failed"),
+        WorkflowStartedEvent(run_id="outer"),
+        WorkflowCompletedEvent(run_id="outer", content="Done anyway."),
+    ]
+    list(publish(iter(events), publisher, protocol="ag-ui"))
+    rows = payloads(publisher)
+    assert rows[-1]["type"] == "RUN_FINISHED" and "RUN_ERROR" not in types(publisher)
+    assert publisher.outcome == "end"

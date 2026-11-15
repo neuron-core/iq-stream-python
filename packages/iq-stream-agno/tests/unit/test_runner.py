@@ -8,11 +8,11 @@ from typing import Any
 import pytest
 from agno.agent import Agent
 from agno.db.in_memory import InMemoryDb
-from iq_stream import IQClient
+from iq_stream import IQClient, Outcome
 from recorded import RecordingClient, names, types
 from scripted_model import SLOW, weather_agent
 
-from iq_stream_agno import RunSummary, StreamHandle, continue_run, running, start_run
+from iq_stream_agno import PublishOptions, RunSummary, StreamHandle, continue_run, running, start_run
 
 
 async def test_start_run_answers_before_the_first_event_and_the_task_publishes_the_run() -> None:
@@ -44,7 +44,7 @@ async def test_start_run_keeps_the_caller_s_metadata_and_options() -> None:
         agent,
         "Weather?",
         run_id="chosen-run",
-        protocol="agui",
+        protocol="ag-ui",
         metadata={"tenant": "acme"},
         publish_options={"exclude": ("ModelRequestStarted",)},
     )
@@ -63,10 +63,11 @@ async def test_a_run_that_cannot_start_fails_its_stream_and_says_why() -> None:
         def arun(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
             raise TypeError("bad argument")
 
-    handle = start_run(client, Broken(model=None, telemetry=False), "Weather?")
+    handle = start_run(client, Broken(model=None, telemetry=False), "Weather?", protocol="ag-ui")
     summary = await asyncio.wait_for(handle.task, 10)
     assert summary.status == "error" and isinstance(summary.error, TypeError)
-    assert client.recorders[0].outcome == "fail"
+    # The browser hears it as from any failed run: RUN_STARTED, then RUN_ERROR.
+    assert types(client.recorders[0]) == ["RUN_STARTED", "RUN_ERROR"] and client.recorders[0].outcome == "fail"
 
 
 async def test_an_entity_whose_arun_does_not_stream_fails_its_stream_and_the_task_returns_its_summary() -> None:
@@ -82,10 +83,12 @@ async def test_an_entity_whose_arun_does_not_stream_fails_its_stream_and_the_tas
     assert client.recorders[0].outcome == "fail" and client.recorders[0].close_calls == 1
 
 
-async def test_cancelling_the_task_cancels_the_run_and_fails_the_stream() -> None:
+@pytest.mark.parametrize("close_on_cancel", ["fail", "end"])
+async def test_cancelling_the_task_cancels_the_run_and_closes_with_close_on_cancel(close_on_cancel: Outcome) -> None:
     SLOW["seconds"] = 1.0
     client = RecordingClient()
-    handle = start_run(client, weather_agent(tool_name="slow_weather"), "Weather?")
+    options: PublishOptions = {"close_on_cancel": close_on_cancel}
+    handle = start_run(client, weather_agent(tool_name="slow_weather"), "Weather?", publish_options=options)
     (publisher,) = client.recorders
     for _ in range(500):
         if "ToolCallStarted" in names(publisher):
@@ -94,7 +97,7 @@ async def test_cancelling_the_task_cancels_the_run_and_fails_the_stream() -> Non
     handle.task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await handle.task
-    assert publisher.outcome == "fail"
+    assert publisher.outcome == close_on_cancel
 
 
 async def test_continue_run_publishes_the_next_leg_on_a_new_stream() -> None:

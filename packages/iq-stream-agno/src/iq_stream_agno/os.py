@@ -1,11 +1,12 @@
 """An AgentOS interface whose routes start a run and answer with a ticket at once; the run's events reach the browser
-through IQ-Stream, from a task that publishes them. Needs the ``os`` extra (and ``agui`` for the AG-UI route)."""
+through IQ-Stream, from a task that publishes them. Needs the ``os`` extra (and ``ag-ui`` for the AG-UI route)."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import inspect
+import logging
 from collections.abc import AsyncIterable
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
@@ -22,7 +23,7 @@ except ImportError as error:  # pragma: no cover - depends on the installed extr
 from iq_stream import IQClient
 
 from ._common import AguiRequest, Protocol
-from ._runner import PublishOptions, StreamHandle, checked_options, continue_run, launch, start_run
+from ._runner import PublishOptions, StreamHandle, begin_continue, begin_run, checked_options, launch
 from ._tee import RunSummary
 
 if TYPE_CHECKING:
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
     from agno.workflow import Workflow
 
 __all__ = ["ContinueRequest", "IQStream", "RunRequest"]
+
+logger = logging.getLogger("iq_stream_agno")
 
 
 class RunRequest(BaseModel):
@@ -56,11 +59,12 @@ class IQStream(BaseInterface):
 
     - ``POST /runs`` — ``{"message", "session_id"?, "user_id"?}``; starts the run and answers with its ticket.
     - ``POST /agui`` — an AG-UI ``RunAgentInput``, for an agent or a team when ``ag-ui-protocol`` is installed: read
-      as Agno's own AG-UI route reads it, and published in AG-UI as ``apublish(protocol="agui")`` publishes.
+      as Agno's own AG-UI route reads it, and published in AG-UI as ``apublish(protocol="ag-ui")`` publishes.
     - ``POST /runs/{run_id}/continue`` — the next leg of a paused run, on a new stream.
     - ``POST /runs/{run_id}/cancel`` — cancels a run this interface is publishing.
 
-    A ticket is ``{"streamId", "token", "url", "expiresAt", "runId", "sessionId"}``.
+    A ticket is ``{"streamId", "token", "url", "expiresAt", "runId", "sessionId"}``. A run id is refused (409) while
+    its run has not reached its ending here; a paused run may be continued as soon as its pause is published.
     """
 
     type = "iq-stream"
@@ -94,8 +98,12 @@ class IQStream(BaseInterface):
         self.ttl = ttl
         self.publish_options: PublishOptions = publish_options or {}
         self.shutdown_timeout = shutdown_timeout
-        # Runs this interface is publishing: who started each, so that only they can cancel it.
+        # Runs this interface is publishing whose ending has not passed yet: who started each, so that only they can
+        # cancel it. A run leaves when its ending passes, not when its close line is answered (held back until the
+        # stream is min_open old), so that a browser may continue a paused run as soon as it reads the pause.
         self._runs: dict[str, tuple[StreamHandle, str | None]] = {}
+        # Every task still publishing, closing ones included, which a shutdown waits for.
+        self._tasks: set[asyncio.Task[RunSummary]] = set()
 
     @property
     def _family(self) -> Literal["agents", "teams", "workflows"]:
@@ -109,15 +117,18 @@ class IQStream(BaseInterface):
             user_id = _resolve_user(request, body.user_id)
             session_id = body.session_id or str(uuid4())
             await _assert_session_writable(self.entity, session_id, user_id, request)
-            handle = start_run(
+            handle = begin_run(
                 self.client,
                 self.entity,
                 body.message,
                 session_id=session_id,
-                user_id=user_id,
+                run_id=None,
+                stream_id=None,
                 ttl=self.ttl,
                 protocol=self.protocol,
                 publish_options=self.publish_options,
+                run_kwargs={"user_id": user_id},
+                on_settled=self._settled,
             )
             self._keep(handle, user_id)
             return handle.to_dict()
@@ -135,16 +146,18 @@ class IQStream(BaseInterface):
             if reason:
                 raise HTTPException(status_code=403, detail=reason)
             self._refuse_running(run_id)  # with no await between it and _keep()
-            handle = continue_run(
+            handle = begin_continue(
                 self.client,
                 entity,
                 run_id=run_id,
                 session_id=body.session_id,
                 requirements=_requirements(body.tools),
-                user_id=user_id,
+                stream_id=None,
                 ttl=self.ttl,
                 protocol=self.protocol,
                 publish_options=self.publish_options,
+                run_kwargs={"user_id": user_id},
+                on_settled=self._settled,
             )
             self._keep(handle, user_id)
             return handle.to_dict()
@@ -182,7 +195,7 @@ class IQStream(BaseInterface):
     async def _start_agui(self, run_input: Any, user_id: str | None, request: Request) -> StreamHandle:
         """What Agno's AG-UI route does (``run_entity()``) up to the conversion, with its own helpers: the inputs read
         from the request, then a new run, or the paused run that trailing tool results answer, which Agno continues
-        under that run's id. The events then go through the tee, as with ``apublish(protocol="agui")``: masked, sized
+        under that run's id. The events then go through the tee, as with ``apublish(protocol="ag-ui")``: masked, sized
         and closed like those of every other route."""
         from agno.os.interfaces.agui.input import (
             extract_context,
@@ -197,11 +210,13 @@ class IQStream(BaseInterface):
 
         entity: Any = self.entity
         thread_id: str = run_input.thread_id
+        # As run_entity(): RunAgentInput takes an empty runId, and Agno would give the run another id than the root's.
+        request_run_id: str = run_input.run_id or str(uuid4())
         messages: list[Any] = run_input.messages or []
         state = validate_state(run_input.state, thread_id)
         dependencies = extract_context(run_input.context)
         context = RunContext(
-            run_id=run_input.run_id,
+            run_id=request_run_id,
             session_id=thread_id,
             user_id=user_id,
             client_tools=parse_client_tools(run_input.tools) or None,
@@ -231,8 +246,15 @@ class IQStream(BaseInterface):
                 return resumed
 
         else:
-            run_id = run_input.run_id
+            run_id = request_run_id
             images, audio, videos, files = extract_media(messages)
+            if _is_remote(entity):
+                # As run_entity(): a RunContext does not cross the wire, so the state and the context go as fields.
+                extra.update(session_state=state, dependencies=dependencies)
+                if context.client_tools:
+                    logger.warning("AG-UI client tools are not forwarded to remote agents or teams")
+            else:
+                extra["run_context"] = context
 
             def events() -> AsyncIterable[object]:
                 return entity.arun(
@@ -246,12 +268,13 @@ class IQStream(BaseInterface):
                     audio=audio or None,
                     videos=videos or None,
                     files=files or None,
-                    run_context=context,
                     **extra,
                 )
 
         self._refuse_running(run_id)  # with no await between it and _keep()
-        checked = dataclasses.replace(self._checked, protocol="agui", transform=None, root_run_id=run_id)
+        checked = dataclasses.replace(
+            self._checked, protocol="ag-ui", event_names=False, transform=None, root_run_id=run_id
+        )
         ticket = self.client.ticket(None, self.ttl)
         before_close = self.publish_options.get("before_close")
         return launch(
@@ -262,22 +285,30 @@ class IQStream(BaseInterface):
             thread_id,
             checked,
             before_close,
-            AguiRequest(thread_id, run_input.run_id, state),
+            AguiRequest(thread_id, request_run_id, state),
+            on_settled=self._settled,
         )
 
     def _refuse_running(self, run_id: str) -> None:
-        """A run id names one run in flight here: a second request for it would take its place in the registry."""
+        """A run id names one run in flight here, until its ending passes: a second request for it would take its
+        place in the registry."""
         if run_id in self._runs:
             raise HTTPException(status_code=409, detail="The run is already in flight")
 
     def _keep(self, handle: StreamHandle, user_id: str | None) -> None:
         self._runs[handle.run_id] = (handle, user_id)
+        self._tasks.add(handle.task)
 
-        def forget(_: asyncio.Task[RunSummary]) -> None:
-            if self._runs.get(handle.run_id, (None,))[0] is handle:
-                del self._runs[handle.run_id]
+        def forget(task: asyncio.Task[RunSummary]) -> None:
+            self._tasks.discard(task)
+            self._settled(handle)
 
         handle.task.add_done_callback(forget)
+
+    def _settled(self, handle: StreamHandle) -> None:
+        """The run's ending passed: it is no longer in flight here, though its stream may still be closing."""
+        if self._runs.get(handle.run_id, (None,))[0] is handle:
+            del self._runs[handle.run_id]
 
     def get_scope_mappings(self) -> dict[str, list[str]]:
         scope = [f"{self._family}:run"]
@@ -290,9 +321,10 @@ class IQStream(BaseInterface):
         return None
 
     async def aclose(self) -> None:
-        """AgentOS's shutdown (agno 3): waits up to ``shutdown_timeout`` for the runs in flight, then cancels the
-        rest, whose streams close with ``fail``. On agno 2.x, which has no such hook, call it from your lifespan."""
-        tasks = [handle.task for handle, _ in self._runs.values()]
+        """AgentOS's shutdown (agno 3): waits up to ``shutdown_timeout`` for the runs it publishes, streams still
+        closing included, then cancels the rest, whose streams close with ``close_on_cancel`` (``fail`` by default).
+        On agno 2.x, which has no such hook, call it from your lifespan."""
+        tasks = list(self._tasks)
         if not tasks:
             return
         _, pending = await asyncio.wait(tasks, timeout=self.shutdown_timeout)
@@ -309,6 +341,16 @@ def _has_agui() -> bool:
     except ImportError:
         return False
     return True
+
+
+def _is_remote(entity: object) -> bool:
+    """Whether the entity runs in another AgentOS: ``RemoteAgent`` or ``RemoteTeam``."""
+    try:
+        from agno.agent import RemoteAgent
+        from agno.team.remote import RemoteTeam
+    except ImportError:  # pragma: no cover - both are in agno 2.9 and later
+        return False
+    return isinstance(entity, (RemoteAgent, RemoteTeam))
 
 
 def _resolve_user(request: Request, client_user_id: str | None) -> str | None:

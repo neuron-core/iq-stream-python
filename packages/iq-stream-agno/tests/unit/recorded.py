@@ -6,12 +6,27 @@ import json
 from collections.abc import AsyncIterable
 from typing import Any, TypeVar
 
+import pytest
 from iq_stream import IQClient, IQError
 from iq_stream.testing import AsyncRecordingPublisher, RecordingPublisher
 
 T = TypeVar("T")
 
 SECRET = "test-app-secret-0123456789abcdef0123"
+
+
+def _has_cancelled_outcome() -> bool:
+    try:
+        from ag_ui.core import RunFinishedCancelledOutcome  # noqa: F401  # pyright: ignore[reportUnusedImport]
+    except ImportError:
+        return False
+    return True
+
+
+#: For the tests that read RUN_FINISHED's cancelled outcome, which ag-ui-protocol has since 1.0 (agno allows 0.1.15).
+needs_cancelled_outcome = pytest.mark.skipif(
+    not _has_cancelled_outcome(), reason="the installed ag-ui-protocol has no cancelled outcome on RUN_FINISHED"
+)
 
 
 class RecordingClient(IQClient):
@@ -47,7 +62,7 @@ async def collect(items: AsyncIterable[T]) -> list[T]:
 
 
 class Errors(list[IQError]):
-    """An ``on_error`` that keeps what it was given."""
+    """An ``on_dropped`` that keeps what it was given."""
 
     def __call__(self, error: IQError) -> None:
         self.append(error)

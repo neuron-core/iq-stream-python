@@ -6,7 +6,7 @@
 // The recording is {protocol, frames: [{id, event, data}], terminal: {event, data}}. Its frames are replayed into the
 // client's subscription through FakeEventSource, in the order and with the ids the server sent them:
 //   protocol "agno": frames() of ./client, the transport client alone, which is what Agno's native JSON needs;
-//   protocol "agui": StreamAgent of ./ag-ui driven by runAgent() of @ag-ui/client, as CopilotKit drives an agent.
+//   protocol "ag-ui": StreamAgent of ./ag-ui driven by runAgent() of @ag-ui/client, as CopilotKit drives an agent.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -102,5 +102,5 @@ async function agui() {
   };
 }
 
-const result = recording.protocol === 'agui' ? await agui() : await native();
+const result = recording.protocol === 'ag-ui' ? await agui() : await native();
 process.stdout.write(JSON.stringify(result));

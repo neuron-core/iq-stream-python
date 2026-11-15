@@ -17,11 +17,12 @@ from agno.run.agent import CustomEvent, ReasoningContentDeltaEvent, ReasoningSta
 from agno.tools import tool
 from agno.workflow import Step, Workflow
 from fastapi import FastAPI, Request, Response
+from iq_stream.testing import AsyncRecordingPublisher
 from pydantic import TypeAdapter
-from recorded import Errors, RecordingClient, names, payloads, types
+from recorded import Errors, RecordingClient, names, needs_cancelled_outcome, payloads, types
 from scripted_model import SLOW, ScriptedModel, weather_agent
 
-from iq_stream_agno import MASKED_ERROR, RunSummary
+from iq_stream_agno import MASKED_ERROR, RunSummary, StreamHandle
 from iq_stream_agno.os import IQStream
 
 TICKET = {"streamId", "token", "url", "expiresAt", "runId", "sessionId"}
@@ -43,6 +44,15 @@ def agui_input(**changes: Any) -> dict[str, Any]:
 class Mounted:
     def __init__(self, interface: IQStream, authorization: bool = False) -> None:
         self.interface = interface
+        # Every run's handle, by run id: a run leaves the interface's registry when its ending passes.
+        self.handles: dict[str, list[StreamHandle]] = {}
+        keep = interface._keep  # pyright: ignore[reportPrivateUsage]
+
+        def kept(handle: StreamHandle, user_id: str | None) -> None:
+            self.handles.setdefault(handle.run_id, []).append(handle)
+            keep(handle, user_id)
+
+        interface._keep = kept  # type: ignore[method-assign]
         self.app = FastAPI()
         self.app.include_router(interface.get_router())
         if authorization:
@@ -59,8 +69,7 @@ class Mounted:
             return await client.post(path, json=body, params=params)
 
     async def finished(self, run_id: str) -> RunSummary:
-        handle, _ = self.interface._runs[run_id]  # pyright: ignore[reportPrivateUsage]
-        return await asyncio.wait_for(handle.task, 10)
+        return await asyncio.wait_for(self.handles[run_id][-1].task, 10)
 
 
 async def test_post_runs_answers_with_a_ticket_and_publishes_the_run() -> None:
@@ -157,7 +166,7 @@ async def test_shutdown_cancels_the_runs_still_in_flight() -> None:
     interface = IQStream(client, agent=weather_agent(tool_name="slow_weather"), shutdown_timeout=0.2)
     mounted = Mounted(interface)
     ticket = (await mounted.post("/iq/runs", {"message": "Weather?"})).json()
-    handle, _ = interface._runs[ticket["runId"]]  # pyright: ignore[reportPrivateUsage]
+    (handle,) = mounted.handles[ticket["runId"]]
     await interface.aclose()
     assert handle.task.done() and client.recorders[0].outcome == "fail"
 
@@ -235,6 +244,7 @@ async def paused_over_agui(mounted: Mounted, client: RecordingClient, thread: st
     return first["runId"], call
 
 
+@needs_cancelled_outcome
 async def test_an_ag_ui_resume_is_published_and_cancelled_under_the_paused_run_s_id() -> None:
     SLOW["seconds"] = 1.0
     client = RecordingClient()
@@ -276,6 +286,7 @@ async def test_a_run_id_in_flight_is_refused_a_second_time() -> None:
     await mounted.finished("run-twice")
 
 
+@needs_cancelled_outcome
 async def test_post_agui_cancel_finishes_with_the_cancelled_outcome() -> None:
     SLOW["seconds"] = 1.0
     client = RecordingClient()
@@ -304,6 +315,7 @@ class Thinking(Agent):
         return events()
 
 
+@needs_cancelled_outcome
 async def test_a_shutdown_closes_what_is_open_and_finishes_the_ag_ui_run_as_cancelled() -> None:
     client = RecordingClient()
     interface = IQStream(client, agent=Thinking(id="thinker", model=None, telemetry=False), shutdown_timeout=0.1)
@@ -338,7 +350,7 @@ async def test_post_agui_skips_an_event_it_cannot_encode_and_the_run_completes()
     client = RecordingClient()
     errors = Errors()
     agent = Agent(model=ScriptedModel(tool_name="lookup"), tools=[lookup], db=InMemoryDb(), telemetry=False)
-    mounted = Mounted(IQStream(client, agent=agent, publish_options={"on_error": errors}))
+    mounted = Mounted(IQStream(client, agent=agent, publish_options={"on_dropped": errors}))
     await mounted.post("/iq/agui", agui_input(runId="run-agui-progress"))
     summary = await mounted.finished("run-agui-progress")
     (publisher,) = client.recorders
@@ -389,8 +401,8 @@ def payloads_of_paused(agent: Agent, run_id: str, session_id: str) -> list[dict[
 
 
 def test_bad_publish_options_are_refused_when_the_interface_is_made() -> None:
-    with pytest.raises(ValueError, match="cancelled"):
-        IQStream(RecordingClient(), agent=weather_agent(), publish_options={"cancelled": "End"})  # type: ignore[typeddict-item]
+    with pytest.raises(ValueError, match="close_on_cancel"):
+        IQStream(RecordingClient(), agent=weather_agent(), publish_options={"close_on_cancel": "End"})  # type: ignore[typeddict-item]
 
 
 async def test_post_agui_leaves_out_the_excluded_agno_events() -> None:
@@ -401,3 +413,207 @@ async def test_post_agui_leaves_out_the_excluded_agno_events() -> None:
     await mounted.finished("run-agui-exclude")
     (publisher,) = client.recorders
     assert "ModelRequestStarted" not in raw_names(publisher) and "RunStarted" in raw_names(publisher)
+
+
+class SlowClosingClient(RecordingClient):
+    """A client whose publishers hold the close line back until released, as the core holds it until the stream is
+    ``min_open`` old (3 s by default), while the frames go out at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    def apublisher(self, stream_id: str) -> Any:
+        release = self.release
+
+        class Held(AsyncRecordingPublisher):
+            async def close(self, outcome: Any = "end", timeout: float = 10.0) -> Any:
+                await release.wait()
+                return await super().close(outcome, timeout)
+
+        recorder = Held(stream_id)
+        self.recorders.append(recorder)
+        return recorder
+
+
+async def test_a_paused_run_is_continued_as_soon_as_the_browser_reads_the_pause() -> None:
+    client = SlowClosingClient()
+    agent = weather_agent(tool_name="book_trip", answer="Your trip is booked.", db=InMemoryDb())
+    mounted = Mounted(IQStream(client, agent=agent))
+    first = (await mounted.post("/iq/runs", {"message": "Book Paris", "session_id": "s-fast"})).json()
+    await until(lambda: "RunPaused" in names(client.recorders[0]))
+    tools = [{**tool, "confirmed": True} for tool in payloads(client.recorders[0])[-1]["tools"]]
+    # The first leg's close line is still held back: the continue must not be refused as a run in flight.
+    response = await mounted.post(f"/iq/runs/{first['runId']}/continue", {"session_id": "s-fast", "tools": tools})
+    assert response.status_code == 200 and client.recorders[0].outcome is None
+    client.release.set()
+    summaries = [await asyncio.wait_for(handle.task, 10) for handle in mounted.handles[first["runId"]]]
+    assert [summary.status for summary in summaries] == ["paused", "completed"]
+    assert [recorder.outcome for recorder in client.recorders] == ["end", "end"]
+
+
+async def test_an_ag_ui_resume_is_taken_as_soon_as_the_browser_reads_run_finished() -> None:
+    client = SlowClosingClient()
+    agent = weather_agent(tool_name="book_trip", answer="Your trip is booked.", db=InMemoryDb())
+    mounted = Mounted(IQStream(client, agent=agent))
+    first = (await mounted.post("/iq/agui", agui_input(threadId="t-fast", runId="t-fast-leg-1"))).json()
+    await until(lambda: "RUN_FINISHED" in types(client.recorders[0]))
+    call = next(row for row in payloads(client.recorders[0]) if row["type"] == "TOOL_CALL_START")
+    response = await mounted.post("/iq/agui", resume_input("t-fast-leg-2", call) | {"threadId": "t-fast"})
+    assert response.status_code == 200 and response.json()["runId"] == first["runId"]
+    # A cancel reaches the leg in flight, not the one that is closing.
+    assert len(mounted.interface._runs) == 1  # pyright: ignore[reportPrivateUsage]
+    client.release.set()
+    summaries = [await asyncio.wait_for(handle.task, 10) for handle in mounted.handles[first["runId"]]]
+    assert [summary.status for summary in summaries] == ["paused", "completed"]
+    assert types(client.recorders[1])[-1] == "RUN_FINISHED"
+
+
+async def test_a_shutdown_waits_for_a_stream_that_is_still_closing() -> None:
+    client = SlowClosingClient()
+    interface = IQStream(client, agent=weather_agent(), shutdown_timeout=5.0)
+    mounted = Mounted(interface)
+    ticket = (await mounted.post("/iq/runs", {"message": "Weather?"})).json()
+    await until(lambda: "RunCompleted" in names(client.recorders[0]))
+    assert interface._runs == {}  # pyright: ignore[reportPrivateUsage]
+    asyncio.get_running_loop().call_later(0.3, client.release.set)
+    await interface.aclose()
+    (handle,) = mounted.handles[ticket["runId"]]
+    assert handle.task.done() and client.recorders[0].outcome == "end"
+
+
+async def test_an_empty_ag_ui_run_id_is_replaced_as_agno_s_route_replaces_it() -> None:
+    client = RecordingClient()
+    mounted = Mounted(IQStream(client, agent=weather_agent(fail_on_turn=1, tool_name=None)))
+    ticket = (await mounted.post("/iq/agui", agui_input(runId=""))).json()
+    assert ticket["runId"]
+    summary = await mounted.finished(ticket["runId"])
+    (publisher,) = client.recorders
+    rows = payloads(publisher)
+    assert rows[0] == {"type": "RUN_STARTED", "threadId": "thread-1", "runId": ticket["runId"]}
+    assert {row["event"]["run_id"] for row in rows if row["type"] == "RAW"} == {ticket["runId"]}
+    # The failed run is the root's: RUN_ERROR, not a RUN_FINISHED made up for a run that never matched.
+    assert rows[-1]["type"] == "RUN_ERROR" and summary.status == "error" and publisher.outcome == "fail"
+    assert (await mounted.post("/iq/agui", agui_input(runId=""))).status_code == 200
+
+
+class Refusing(Agent):
+    """An agent whose ``arun()`` raises when it is called, as one with an ``input_schema`` given other text does."""
+
+    def arun(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        raise ValueError("secret input that does not match the schema")
+
+
+async def test_a_run_that_raises_when_started_still_sends_run_started_and_a_masked_run_error() -> None:
+    client = RecordingClient()
+    mounted = Mounted(IQStream(client, agent=Refusing(id="refusing", model=None, telemetry=False)))
+    ticket = (await mounted.post("/iq/agui", agui_input(runId="run-refused"))).json()
+    summary = await mounted.finished(ticket["runId"])
+    (publisher,) = client.recorders
+    assert types(publisher) == ["RUN_STARTED", "STATE_SNAPSHOT", "RUN_ERROR"]
+    assert payloads(publisher)[-1]["message"] == MASKED_ERROR and "secret" not in "".join(publisher.data)
+    assert summary.status == "error" and isinstance(summary.error, ValueError) and publisher.outcome == "fail"
+
+
+class Captured(Agent):
+    """An agent that records what ``arun()`` is given and answers in two events."""
+
+    calls: list[dict[str, Any]]
+
+    def arun(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        from agno.run.agent import RunCompletedEvent, RunStartedEvent
+
+        self.calls.append(kwargs)
+        run_id, session_id = kwargs["run_id"], kwargs["session_id"]
+
+        async def events() -> AsyncIterator[Any]:
+            yield RunStartedEvent(run_id=run_id, session_id=session_id)
+            yield RunCompletedEvent(run_id=run_id, session_id=session_id, content="Done.")
+
+        return events()
+
+
+def captured() -> Captured:
+    agent = Captured(id="captured", model=None, telemetry=False)
+    agent.calls = []
+    return agent
+
+
+FRONTEND_TOOL = {
+    "name": "change_color",
+    "description": "Change the page colour.",
+    "parameters": {"type": "object", "properties": {"color": {"type": "string"}}, "required": ["color"]},
+}
+
+
+async def test_post_agui_hands_arun_what_agno_s_own_route_reads_from_the_request() -> None:
+    client = RecordingClient()
+    agent = captured()
+    mounted = Mounted(IQStream(client, agent=agent))
+    body = agui_input(
+        runId="run-inputs",
+        threadId="t-inputs",
+        state={"cart": ["apple"]},
+        context=[{"description": "locale", "value": '"fr"'}],
+        tools=[FRONTEND_TOOL],
+        forwardedProps={"user_id": "ann"},
+        messages=[
+            {
+                "id": "m1",
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this picture?"},
+                    {"type": "image", "source": {"type": "url", "value": "https://example.com/cat.png"}},
+                ],
+            }
+        ],
+    )
+    assert (await mounted.post("/iq/agui", body)).status_code == 200
+    await mounted.finished("run-inputs")
+    (kwargs,) = agent.calls
+    context = kwargs["run_context"]
+    assert kwargs["user_id"] == context.user_id == "ann" and kwargs["session_id"] == "t-inputs"
+    assert kwargs["input"] == "What is in this picture?" and kwargs["run_id"] == context.run_id == "run-inputs"
+    assert [image.url for image in kwargs["images"]] == ["https://example.com/cat.png"]
+    assert context.dependencies == {"locale": "fr"} and kwargs["add_dependencies_to_context"] is True
+    assert [function.name for function in context.client_tools] == ["change_color"]
+    assert context.session_state == {"cart": ["apple"]}
+    (publisher,) = client.recorders
+    assert payloads(publisher)[:2] == [
+        {"type": "RUN_STARTED", "threadId": "t-inputs", "runId": "run-inputs"},
+        {"type": "STATE_SNAPSHOT", "snapshot": {"cart": ["apple"]}},
+    ]
+
+
+async def test_a_remote_agent_gets_the_state_and_context_as_fields_and_no_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agno.agent import RemoteAgent
+
+    client = RecordingClient()
+    agent = captured()
+    monkeypatch.setattr(agent, "__class__", type("RemoteCaptured", (Captured, RemoteAgent), {}))
+    mounted = Mounted(IQStream(client, agent=agent))
+    body = agui_input(
+        runId="run-remote",
+        state={"cart": ["apple"]},
+        context=[{"description": "locale", "value": '"fr"'}],
+        tools=[FRONTEND_TOOL],
+    )
+    assert (await mounted.post("/iq/agui", body)).status_code == 200
+    await mounted.finished("run-remote")
+    (kwargs,) = agent.calls
+    assert "run_context" not in kwargs and kwargs["run_id"] == "run-remote"
+    assert kwargs["session_state"] == {"cart": ["apple"]} and kwargs["dependencies"] == {"locale": "fr"}
+    assert client.recorders[0].outcome == "end"
+
+
+async def test_post_agui_frames_are_unnamed_when_the_native_routes_name_theirs() -> None:
+    client = RecordingClient()
+    mounted = Mounted(IQStream(client, agent=weather_agent(), publish_options={"event_names": True}))
+    await mounted.post("/iq/agui", agui_input(runId="run-agui-unnamed"))
+    await mounted.finished("run-agui-unnamed")
+    ticket = (await mounted.post("/iq/runs", {"message": "Weather?"})).json()
+    await mounted.finished(ticket["runId"])
+    agui, native = client.recorders
+    assert {frame.event for frame in agui.frames} == {None} and native.frames[0].event == "RunStarted"

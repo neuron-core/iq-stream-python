@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
@@ -74,14 +74,56 @@ async def test_a_task_cancelled_while_it_waits_for_the_next_event_fails_the_stre
     assert publisher.outcome == "fail" and publisher.close_calls == 1  # awaited: the close completed
 
 
-@pytest.mark.parametrize(("cancelled", "outcome"), [("fail", "fail"), ("end", "end")])
-async def test_cancel_run_during_a_tool_ends_with_run_cancelled(cancelled: Outcome, outcome: Outcome) -> None:
+async def test_a_cancelled_task_closes_with_close_on_cancel() -> None:
+    SLOW["seconds"] = 1.0
+    publisher = AsyncRecordingPublisher()
+    tool_started = asyncio.Event()
+
+    async def consume() -> None:
+        stream = weather_agent(tool_name="slow_weather").arun("Weather?", stream=True, stream_events=True)
+        async for event in apublish(stream, publisher, close_on_cancel="end"):
+            if event.event == "ToolCallStarted":
+                tool_started.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(tool_started.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert publisher.outcome == "end" and publisher.close_calls == 1
+
+
+def test_an_interrupted_process_closes_with_close_on_cancel() -> None:
+    publisher = RecordingPublisher()
+
+    def events() -> Iterator[Any]:
+        yield from weather_agent().run("Weather?", stream=True, stream_events=True)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        list(publish(events(), publisher, close_on_cancel="end"))
+    assert publisher.outcome == "end"
+
+
+def test_a_loop_left_early_closes_with_fail_whatever_close_on_cancel_says() -> None:
+    # A generator cannot tell a break from an exception raised in the loop's body, which must not end the stream.
+    publisher = RecordingPublisher()
+    stream = publish(weather_agent().run("Weather?", stream=True, stream_events=True), publisher, close_on_cancel="end")
+    for event in stream:
+        if event.event == "ToolCallStarted":
+            break
+    stream.close()
+    assert publisher.outcome == "fail"
+
+
+@pytest.mark.parametrize(("close_on_cancel", "outcome"), [("fail", "fail"), ("end", "end")])
+async def test_cancel_run_during_a_tool_ends_with_run_cancelled(close_on_cancel: Outcome, outcome: Outcome) -> None:
     SLOW["seconds"] = 0.3
     publisher = AsyncRecordingPublisher()
     agent = weather_agent(tool_name="slow_weather")
-    run_id = f"run-to-cancel-{cancelled}"
+    run_id = f"run-to-cancel-{close_on_cancel}"
     stream = agent.arun("Weather?", stream=True, stream_events=True, run_id=run_id)
-    async for event in apublish(stream, publisher, cancelled=cancelled):
+    async for event in apublish(stream, publisher, close_on_cancel=close_on_cancel):
         if event.event == "ToolCallStarted":
             assert Agent.cancel_run(run_id)
     assert "RunCancelled" in names(publisher) and names(publisher)[-1] in ("RunCancelled", "RunCompleted")

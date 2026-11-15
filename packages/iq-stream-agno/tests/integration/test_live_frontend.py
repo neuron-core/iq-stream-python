@@ -91,7 +91,7 @@ async def test_native_frames_of_a_failed_run_end_with_run_error_and_fail(
 async def test_ag_ui_frames_rebuild_the_messages_in_stream_agent(
     iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
 ) -> None:
-    seen = check(await published(iq_client, iq_servers, weather_agent(), "agui"), tmp_path)
+    seen = check(await published(iq_client, iq_servers, weather_agent(), "ag-ui"), tmp_path)
     assert seen["rejected"] is None and seen["failures"] == []
     assert seen["text"] == "Let me check the weather. " + ANSWER
     (call,) = seen["toolCalls"]
@@ -104,7 +104,7 @@ async def test_ag_ui_frames_rebuild_the_messages_in_stream_agent(
 async def test_ag_ui_frames_of_a_failed_run_end_in_run_error_without_a_second_error(
     iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
 ) -> None:
-    seen = check(await published(iq_client, iq_servers, weather_agent(fail_on_turn=2), "agui"), tmp_path)
+    seen = check(await published(iq_client, iq_servers, weather_agent(fail_on_turn=2), "ag-ui"), tmp_path)
     assert seen["last"]["type"] == "RUN_ERROR" and seen["last"]["message"] == MASKED_ERROR
     assert not any("stream failed" in failure for failure in seen["failures"])
     assert seen["text"].startswith("Let me check the weather.")
@@ -115,12 +115,12 @@ async def test_ag_ui_frames_of_a_cancelled_run_finish_with_the_cancelled_outcome
 ) -> None:
     SLOW["seconds"] = 0.3
     agent = weather_agent(tool_name="slow_weather")
-    seen = check(await published(iq_client, iq_servers, agent, "agui", cancel=True), tmp_path)
+    seen = check(await published(iq_client, iq_servers, agent, "ag-ui", cancel=True), tmp_path)
     assert seen["rejected"] is None and not any("stream failed" in failure for failure in seen["failures"])
     assert seen["last"]["type"] == "RUN_FINISHED" and seen["last"]["outcome"] == {"type": "cancelled"}
 
 
-@pytest.mark.parametrize("protocol", ["agno", "agui"])
+@pytest.mark.parametrize("protocol", ["agno", "ag-ui"])
 async def test_a_team_whose_member_speaks_first_and_whose_leader_fails_reaches_the_browser_as_failed(
     iq_client: IQClient, iq_servers: TestServers, tmp_path: Path, protocol: str
 ) -> None:
@@ -136,8 +136,8 @@ async def test_a_team_whose_member_speaks_first_and_whose_leader_fails_reaches_t
 async def test_a_start_run_stream_reaches_stream_agent(
     iq_client: IQClient, iq_servers: TestServers, tmp_path: Path
 ) -> None:
-    handle = start_run(iq_client, weather_agent(), "Weather in Paris?", protocol="agui")
+    handle = start_run(iq_client, weather_agent(), "Weather in Paris?", protocol="ag-ui")
     subscription = subscribe_in_background(handle.url)
     await handle.task
-    seen = check(recording(await asyncio.to_thread(subscription.result, 15), "agui"), tmp_path)
+    seen = check(recording(await asyncio.to_thread(subscription.result, 15), "ag-ui"), tmp_path)
     assert seen["text"] == "Let me check the weather. " + ANSWER and seen["last"]["type"] == "RUN_FINISHED"

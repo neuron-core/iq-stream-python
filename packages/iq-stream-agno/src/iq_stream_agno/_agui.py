@@ -27,6 +27,7 @@ from ._common import (
     Report,
     event_name,
     longest_prefix,
+    mask_errors,
 )
 
 try:  # ag-ui-protocol 1.0; agno's floor, 0.1.15, may not have it
@@ -124,9 +125,9 @@ class AguiFramer:
 
 
 def _masked(event: BaseRunOutputEvent) -> BaseRunOutputEvent:
-    """A copy of an error event, or of a failed tool's event, without the error's text: what the native encoder
-    masks, masked before the conversion, since Agno's converter copies the events it has no handler for into
-    ``RAW``."""
+    """A copy of an error event, or of a failed tool's event, without the error's text, for the handlers that read
+    it (``RUN_ERROR``, ``TOOL_CALL_RESULT``). The events Agno's converter copies whole into ``RAW`` or ``CUSTOM``,
+    nested runs included, are masked after the conversion (``_masked_copies``)."""
     name = event_name(event)
     field = ERROR_TEXT.get(name)
     tool: object = getattr(event, "tool", None)
@@ -142,6 +143,19 @@ def _masked(event: BaseRunOutputEvent) -> BaseRunOutputEvent:
     if failed_tool and dataclasses.is_dataclass(tool) and not isinstance(tool, type):
         setattr(event, "tool", dataclasses.replace(tool, result=MASKED_ERROR))  # noqa: B010
     return event
+
+
+def _masked_copies(events: list[BaseEvent]) -> list[BaseEvent]:
+    """The events with the Agno JSON that ``RAW`` and ``CUSTOM`` carry masked as the native protocol masks it: a team
+    member's or a workflow step's failed tool is in ``member_responses`` and ``step_executor_runs``."""
+    masked: list[BaseEvent] = []
+    for event in events:
+        if event.type == EventType.RAW:
+            event = event.model_copy(update={"event": mask_errors(getattr(event, "event", None))})
+        elif event.type == EventType.CUSTOM:
+            event = event.model_copy(update={"value": mask_errors(getattr(event, "value", None))})
+        masked.append(event)
+    return masked
 
 
 class AguiEncoder:
@@ -178,7 +192,7 @@ class AguiEncoder:
             self._terminal = event  # held, as Agno's own stream does, and converted when the run has ended
         else:
             events.extend(process_event(event, state))
-        return self._framer.frames(events)
+        return self._framer.frames(events if self._expose_errors else _masked_copies(events))
 
     def finish(
         self,
@@ -203,7 +217,7 @@ class AguiEncoder:
             if status in ("cancelled", "interrupted"):
                 finished = [cancelled(event) for event in finished]
             events.extend(finished)
-        return self._framer.frames(events)
+        return self._framer.frames(events if self._expose_errors else _masked_copies(events))
 
     def _error_event(
         self,

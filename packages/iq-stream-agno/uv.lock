@@ -8,8 +8,6 @@ resolution-markers = [
 
 [manifest]
 constraints = [
-    { name = "ag-ui-protocol", specifier = "==1.0.0" },
-    { name = "agno", specifier = "==3.2.0" },
     { name = "fastapi", marker = "python_full_version >= '3.11'", specifier = "==0.162.7" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "jsonpatch", marker = "python_full_version >= '3.11'", specifier = "==1.47" },
@@ -452,7 +450,7 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-agui = [
+ag-ui = [
     { name = "agno", extra = ["agui"] },
     { name = "fastapi", version = "0.162.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "fastapi", version = "0.162.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -463,7 +461,7 @@ os = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "iq-stream-agno", extra = ["agui", "os"] },
+    { name = "iq-stream-agno", extra = ["ag-ui", "os"] },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -473,16 +471,16 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "agno", specifier = ">=2.9,<4" },
-    { name = "agno", extras = ["agui"], marker = "extra == 'agui'", specifier = ">=2.9,<4" },
+    { name = "agno", extras = ["agui"], marker = "extra == 'ag-ui'", specifier = ">=2.9,<4" },
     { name = "agno", extras = ["os"], marker = "extra == 'os'", specifier = ">=2.9,<4" },
-    { name = "fastapi", marker = "extra == 'agui'" },
+    { name = "fastapi", marker = "extra == 'ag-ui'" },
     { name = "iq-stream", editable = "../iq-stream" },
 ]
-provides-extras = ["agui", "os"]
+provides-extras = ["ag-ui", "os"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "iq-stream-agno", extras = ["agui", "os"] },
+    { name = "iq-stream-agno", extras = ["ag-ui", "os"] },
     { name = "pyright" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1.0" },

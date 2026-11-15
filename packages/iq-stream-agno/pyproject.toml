@@ -32,7 +32,7 @@ dependencies = ["iq-stream>=0.1.0,<0.2", "agno>=2.9,<4"]
 [project.optional-dependencies]
 # Agno's own AG-UI converter and the ag-ui-protocol models it emits. The converter lives in agno.os, whose
 # package imports FastAPI.
-agui = ["agno[agui]>=2.9,<4", "fastapi"]
+ag-ui = ["agno[agui]>=2.9,<4", "fastapi"]
 # The AgentOS interface, iq_stream_agno.os.IQStream.
 os = ["agno[os]>=2.9,<4"]
 
@@ -43,7 +43,7 @@ Issues = "https://github.com/neuron-core/iq-stream-python/issues"
 
 [dependency-groups]
 dev = [
-    "iq-stream-agno[agui,os]",
+    "iq-stream-agno[ag-ui,os]",
     "pytest>=8",
     "pytest-asyncio>=1.0",
     "ruff",
@@ -52,10 +52,10 @@ dev = [
 
 [tool.uv]
 # The versions the plan (SDKs/agno.md) was researched and prototyped against; the ranges above stay wide. The
-# plan's jsonpatch, fastapi and starlette need Python 3.11, so 3.10 resolves the newest it can have.
+# plan's jsonpatch, fastapi and starlette need Python 3.11, so 3.10 resolves the newest it can have. agno 3.2.0 and
+# ag-ui-protocol 1.0.0 are held by the lockfile alone: uv pip reads these constraints too, and the floor run installs
+# agno 2.9.0 and ag-ui-protocol 0.1.15.
 constraint-dependencies = [
-    "agno==3.2.0",
-    "ag-ui-protocol==1.0.0",
     "jsonpatch==1.47 ; python_version >= '3.11'",
     "fastapi==0.162.7 ; python_version >= '3.11'",
     "starlette==1.10.0 ; python_version >= '3.11'",
@@ -66,6 +66,11 @@ constraint-dependencies = [
 
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
+
+[tool.iq-stream]
+# The lowest versions of the framework ranges declared above (ag-ui-protocol's is agno's agui extra's), which CI
+# runs the unit tests against on the lowest Python of the classifiers.
+floor = ["agno==2.9.0", "ag-ui-protocol==0.1.15"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iq_stream_agno"]
