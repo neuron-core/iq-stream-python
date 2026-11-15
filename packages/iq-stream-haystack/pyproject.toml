@@ -47,19 +47,6 @@ dev = [
     "pyright",
 ]
 
-[tool.uv]
-# The versions the plan (SDKs/haystack.md) was researched and prototyped against; the ranges above stay wide.
-# haystack-ai is capped rather than pinned: `uv pip install` in the package directory honours these constraints, and
-# the floor below must install over the lockfile. The lockfile holds 3.5.0, and on Python 3.10, which haystack-ai 3.4
-# and later do not support, 3.3.0.
-constraint-dependencies = [
-    "haystack-ai<=3.5.0",
-    "hayhooks==2.3.0",
-    "fastapi-openai-compat==1.4.0",
-    "ag-ui-protocol==1.0.0",
-    "httpx==0.28.1",
-]
-
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
 

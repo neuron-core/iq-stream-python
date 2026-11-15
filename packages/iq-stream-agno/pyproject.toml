@@ -50,20 +50,6 @@ dev = [
     "pyright",
 ]
 
-[tool.uv]
-# The versions the plan (SDKs/agno.md) was researched and prototyped against; the ranges above stay wide. The
-# plan's jsonpatch, fastapi and starlette need Python 3.11, so 3.10 resolves the newest it can have. agno 3.2.0 and
-# ag-ui-protocol 1.0.0 are held by the lockfile alone: uv pip reads these constraints too, and the floor run installs
-# agno 2.9.0 and ag-ui-protocol 0.1.15.
-constraint-dependencies = [
-    "jsonpatch==1.47 ; python_version >= '3.11'",
-    "fastapi==0.162.7 ; python_version >= '3.11'",
-    "starlette==1.10.0 ; python_version >= '3.11'",
-    "uvicorn==0.54.0",
-    "pydantic==2.14.3",
-    "httpx==0.28.1",
-]
-
 [tool.uv.sources]
 iq-stream = { path = "../iq-stream", editable = true }
 

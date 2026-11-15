@@ -10,15 +10,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[manifest]
-constraints = [
-    { name = "ag-ui-protocol", specifier = "==1.0.0" },
-    { name = "fastapi-openai-compat", specifier = "==1.4.0" },
-    { name = "hayhooks", specifier = "==2.3.0" },
-    { name = "haystack-ai", specifier = "<=3.5.0" },
-    { name = "httpx", specifier = "==0.28.1" },
-]
-
 [[package]]
 name = "ag-ui-protocol"
 version = "1.0.0"

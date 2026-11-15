@@ -6,16 +6,6 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
-[manifest]
-constraints = [
-    { name = "fastapi", marker = "python_full_version >= '3.11'", specifier = "==0.162.7" },
-    { name = "httpx", specifier = "==0.28.1" },
-    { name = "jsonpatch", marker = "python_full_version >= '3.11'", specifier = "==1.47" },
-    { name = "pydantic", specifier = "==2.14.3" },
-    { name = "starlette", marker = "python_full_version >= '3.11'", specifier = "==1.10.0" },
-    { name = "uvicorn", specifier = "==0.54.0" },
-]
-
 [[package]]
 name = "ag-ui-protocol"
 version = "1.0.0"
