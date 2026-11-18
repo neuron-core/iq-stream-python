@@ -181,7 +181,7 @@ A synchronous `Publisher` may be created, used and closed inside a running event
 | `trust_env` | auto | Whether httpx reads proxy settings from the environment. Off for loopback and private addresses and single-label host names, since a proxy would buffer the request body; `IQ_STREAM_TRUST_ENV=1` turns it on, `=0` off. The CA bundle that `SSL_CERT_FILE` or `SSL_CERT_DIR` names is used either way. |
 | `verify` | `True` | TLS verification, or an `ssl.SSLContext`. |
 
-`url` may be `http://`, `https://` (with a path prefix if the server sits behind one), or `http+unix:///path/to/iq.sock` for a server started with `SOCKET=`. Durations are seconds.
+`url` may be `http://` or `https://`, with a path prefix if the server sits behind one. Durations are seconds.
 
 ## Errors
 
@@ -211,7 +211,7 @@ with iq.publisher(iq.new_stream_id()) as publisher:
 
 ## Limits worth knowing
 
-- A frame is at most 65,536 bytes and a stream at most 10 MiB and 30 minutes, unless the app has limits of its own on the server.
+- A frame is at most 65,536 bytes and a stream at most 10 MiB and one hour, unless the app has limits of its own on the server.
 - httpx sends a request's whole body before it reads the answer. The publisher therefore looks at its connection's socket before every write, and every second while it waits, and stops writing as soon as the server has answered or dropped it. On TLS connections it cannot (TLS records arrive unasked), and an answer that comes while nothing is written is seen at the next write, keepalives included; the counting of frames makes up for what was written meanwhile.
 - A connection that stalls without being reset is noticed when the queue of unsent frames reaches `queue_bytes`, or when `close()` times out.
 - The writer of a synchronous publisher is a daemon thread: call `close()` (or use the `with` block) before the process exits. The `atexit` hook closes what is left with `fail`; a process killed outright closes nothing, and its subscribers get `iq:fail` with `publisher_idle` after the idle timeout.

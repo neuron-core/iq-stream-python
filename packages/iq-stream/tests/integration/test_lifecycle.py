@@ -1,5 +1,5 @@
-"""What surrounds a stream: reserving it, closing it from elsewhere, a Unix socket, a server that restarts under a
-publisher, a process that exits with a publisher open, cancellation, and handing the ticket to a browser."""
+"""What surrounds a stream: reserving it, closing it from elsewhere, a server that restarts under a publisher, a
+process that exits with a publisher open, cancellation, and handing the ticket to a browser."""
 
 from __future__ import annotations
 
@@ -9,10 +9,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
-from helpers import Proxy, Run, until
+from helpers import Run, until
 
 from iq_stream import IQClient, IQError, PublishResult
 from iq_stream.testing import StartedServer, Terminal, TestServers, start_server, subscribe, subscribe_in_background
@@ -65,32 +64,6 @@ async def test_close_stream_tells_subscribers_at_once_from_a_process_that_never_
     received = await subscription
     assert received.terminal == Terminal("iq:fail", {"reason": "publisher", "lastEventId": 0})
     assert time.monotonic() - started < 1
-
-
-async def test_an_http_unix_url_publishes_over_a_unix_socket(run: Run, tmp_path: Path) -> None:
-    # The servers listen on TCP, so a proxy on a socket path stands in for a server started with SOCKET=...
-    socket_proxy = Proxy(run.servers.default.url, str(tmp_path / "iq.sock"))
-    try:
-        iq = run.client(socket_proxy.url, public_url=run.servers.default.url)
-        assert iq.url.startswith("http+unix:///")
-        ticket = iq.ticket()
-        assert ticket.url.startswith(f"{run.servers.default.url}/{ticket.stream_id}?token=")
-        subscription = await asyncio.to_thread(subscribe_in_background, ticket.url)
-        assert (
-            iq.reserve(ticket.stream_id) if run.kind == "sync" else await iq.areserve(ticket.stream_id)
-        ).status == 200
-        pub = run.publisher(iq, ticket.stream_id)
-        pub.send("over")
-        pub.send("a socket", "token")
-        assert await run.close(pub) == PublishResult(200, last_event_id=2, closed=True, outcome="end")
-        assert pub.requests == 1
-        assert socket_proxy.connections >= 2, "the requests went through the socket"
-        received = await subscription
-        assert received.data == ["over", "a socket"]
-        assert received.terminal is not None and received.terminal.event == "iq:end"
-        assert run.errors == []
-    finally:
-        socket_proxy.close()
 
 
 @pytest.fixture

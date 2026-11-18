@@ -68,16 +68,10 @@ def _private_host(host: str) -> bool:
 
 
 def _bad_url() -> IQError:
-    return IQError("iq-stream: set url (or IQ_STREAM_URL) to http(s)://host[:port] or http+unix:///path/to/iq.sock.")
+    return IQError("iq-stream: set url (or IQ_STREAM_URL) to http(s)://host[:port].")
 
 
 def _connector(url: str, trust_env: bool | None, verify: bool | ssl.SSLContext) -> Connector:
-    for scheme in ("http+unix://", "unix://"):
-        if url.startswith(scheme):
-            path = url[len(scheme) :]
-            if not path.startswith("/") or len(path) < 2:
-                raise _bad_url()
-            return Connector("http://localhost", path, False, verify)
     parts = urlsplit(url)
     try:
         _ = parts.port  # raises for a port that is not a number
@@ -93,7 +87,7 @@ def _connector(url: str, trust_env: bool | None, verify: bool | ssl.SSLContext) 
             trust_env = False
         else:
             trust_env = not _private_host(parts.hostname)
-    return Connector(url, None, trust_env, verify)
+    return Connector(url, trust_env, verify)
 
 
 class IQClient:

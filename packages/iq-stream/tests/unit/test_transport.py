@@ -9,7 +9,6 @@ import threading
 import time
 from typing import ClassVar
 
-import httpx
 import pytest
 
 from iq_stream import AsyncPublisher, IQClient, IQError, new_stream_id
@@ -41,7 +40,7 @@ def test_a_watch_sees_a_dropped_connection() -> None:
     client, server = socket.socketpair()
     with client:
         watch = Watch()
-        watch.trace("connection.connect_unix_socket.complete", {"return_value": _Stream(client)})
+        watch.trace("connection.connect_tcp.complete", {"return_value": _Stream(client)})
         server.close()
         assert watch.answered() is True
 
@@ -87,14 +86,11 @@ def test_a_watch_destroyed_before_its_connection_opens_drops_it_as_it_opens() ->
 
 
 def test_the_connector_makes_clients_that_keep_no_connection() -> None:
-    connector = Connector("http://127.0.0.1:1", None, False, True)
+    connector = Connector("http://127.0.0.1:1", False, True)
     assert connector.url("abc") == "http://127.0.0.1:1/abc"
     assert connector.sync() is connector.sync(), "one transport shared by the synchronous publishers"
     with connector.sync_client() as client:
         assert client.trust_env is False
-    unix = Connector("http://localhost", "/tmp/iq.sock", False, True)
-    with unix.sync_client() as client:
-        assert isinstance(client, httpx.Client)
     assert USER_AGENT.startswith("iq-stream-python/")
 
 

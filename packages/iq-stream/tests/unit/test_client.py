@@ -141,8 +141,8 @@ def test_the_constructor_validates_its_options() -> None:
         {"url": "http://"},
         {"url": "http://iq.test:port"},
         {"url": "http://iq.test/?a=b"},
-        {"url": "unix://relative.sock"},
-        {"url": "http+unix://"},
+        {"url": "unix:///run/iq/iq.sock"},
+        {"url": "http+unix:///run/iq/iq.sock"},
         {"keepalive": 0},
         {"keepalive": -1},
         {"min_open": -1},
@@ -231,18 +231,14 @@ def test_the_ca_bundle_of_ssl_cert_file_counts_on_a_private_network_too(
         assert {"commonName": "iq-stream internal test CA"} in subjects, f"{url}, trust_env={iq.trust_env}"
 
 
-def test_a_unix_socket_url_needs_a_public_url_for_tickets() -> None:
-    for url in ("http+unix:///run/iq/iq.sock", "unix:///run/iq/iq.sock"):
-        iq = client(url=url)
-        assert iq.trust_env is False
-        assert iq._core.connector.uds == "/run/iq/iq.sock"  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(IQError, match="public_url"):
-            iq.subscribe_url(STREAM)
-        assert (
-            client(url=url, public_url="https://stream.example.com")
-            .subscribe_url(STREAM)
-            .startswith(f"https://stream.example.com/{STREAM}?token=")
-        )
+def test_a_public_url_that_is_not_an_http_address_is_refused_for_tickets() -> None:
+    with pytest.raises(IQError, match="public_url"):
+        client(public_url="stream.example.com").subscribe_url(STREAM)
+    assert (
+        client(public_url="https://stream.example.com")
+        .subscribe_url(STREAM)
+        .startswith(f"https://stream.example.com/{STREAM}?token=")
+    )
 
 
 def test_the_secret_does_not_show_when_the_client_is_printed() -> None:

@@ -208,7 +208,7 @@ The encoder you pass is copied (`copy.copy`) for each run, and its `start()` beg
 ## Limits worth knowing
 
 - One reader: a handler whose events something else read, or whose stream a generator of `stream_events()` that was not closed still holds, is refused with an error that says so, and the stream closes with `fail`.
-- The server's stream limits (10 MiB and 30 minutes by default) apply to a run waiting for a human too; `ctx.wait_for_event()` has its own timeout.
+- The server's stream limits (10 MiB and one hour by default) apply to a run waiting for a human too; `ctx.wait_for_event()` has its own timeout.
 - Tool arguments are published whole at `ToolCall`: LlamaIndex parses them before the step starts, so there is no argument stream to relay.
 - A `ReActAgent`'s text includes its `Thought:` and `Action:` scaffolding, as LlamaIndex streams it, and as its tool steps' `AgentOutput` carries it with `streaming=False`; its last answer is published without `Answer:`, as LlamaIndex saves it, unless it was streamed.
 - A workflow that a tool starts on its own (an agent used as a tool) has its own handler; its events are in the stream only if the tool forwards them with `ctx.write_event_to_stream()`.

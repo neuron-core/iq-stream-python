@@ -173,9 +173,8 @@ class Connector:
     """How this backend reaches the server: the address, and httpx clients configured for it, made on demand.
     Nothing is opened before the first request."""
 
-    def __init__(self, base: str, uds: str | None, trust_env: bool, verify: bool | ssl.SSLContext) -> None:
+    def __init__(self, base: str, trust_env: bool, verify: bool | ssl.SSLContext) -> None:
         self.base = base
-        self.uds = uds
         self.trust_env = trust_env
         self._verify = verify
         self._lock = threading.Lock()
@@ -196,13 +195,9 @@ class Connector:
             return self._context
 
     def sync_client(self) -> httpx.Client:
-        if self.uds is not None:
-            return httpx.Client(transport=httpx.HTTPTransport(uds=self.uds, limits=_LIMITS), trust_env=False)
         return httpx.Client(limits=_LIMITS, verify=self._ssl(), trust_env=self.trust_env)
 
     def async_client(self) -> httpx.AsyncClient:
-        if self.uds is not None:
-            return httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(uds=self.uds, limits=_LIMITS), trust_env=False)
         return httpx.AsyncClient(limits=_LIMITS, verify=self._ssl(), trust_env=self.trust_env)
 
     def sync(self) -> SyncHTTP:

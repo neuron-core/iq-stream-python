@@ -25,11 +25,10 @@ async def until(check: Callable[[], Any], what: str = "the condition", seconds: 
 
 
 class Proxy:
-    """A TCP proxy in front of a server, listening on a local port or on a Unix socket path. ``kill()`` drops
-    every connection through it, which is how a test loses a publisher's connection from the client side without
-    touching the server."""
+    """A TCP proxy in front of a server, listening on a local port. ``kill()`` drops every connection through
+    it, which is how a test loses a publisher's connection from the client side without touching the server."""
 
-    def __init__(self, target: str, path: str | None = None) -> None:
+    def __init__(self, target: str) -> None:
         parts = urlsplit(target)
         self._upstream = (parts.hostname or "127.0.0.1", parts.port or 80)
         self._lock = threading.Lock()
@@ -37,14 +36,8 @@ class Proxy:
         self._sockets: list[socket.socket] = []
         self._threads: list[threading.Thread] = []
         self.connections = 0
-        if path is None:
-            self._listener = socket.create_server(("127.0.0.1", 0))
-            self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
-        else:
-            self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._listener.bind(path)
-            self._listener.listen()
-            self.url = f"http+unix://{path}"
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self._listener.getsockname()[1]}"
         self._accepting = threading.Thread(target=self._accept, daemon=True)
         self._accepting.start()
 

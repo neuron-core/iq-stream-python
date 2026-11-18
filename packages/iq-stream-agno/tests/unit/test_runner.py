@@ -121,6 +121,8 @@ async def test_start_run_needs_a_running_loop_and_a_public_url() -> None:
 
     with pytest.raises(RuntimeError):
         await asyncio.to_thread(outside_a_loop)
-    socket_client = IQClient("http+unix:///tmp/iq.sock", "demo-app", "test-app-secret-0123456789abcdef0123")
+    client = IQClient(
+        "http://iq.internal:8080", "demo-app", "test-app-secret-0123456789abcdef0123", public_url="stream.example.com"
+    )
     with pytest.raises(Exception, match="public_url"):
-        start_run(socket_client, weather_agent(), "Weather?")
+        start_run(client, weather_agent(), "Weather?")
